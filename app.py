@@ -6,17 +6,14 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 import warnings
 warnings.filterwarnings("ignore")
-
 try:
     import nflreadpy as nfl
 except ImportError:
     st.error("nflreadpy is not installed. Run: pip install nflreadpy")
     st.stop()
-
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-
 # -----------------------------
 # PAGE CONFIG
 # -----------------------------
@@ -26,8 +23,7 @@ st.set_page_config(
     layout="wide"
 )
 st.title("🏈 NFL Betting Opportunity Scanner")
-st.caption("EPA + Rules + Rest + Weather + ML + Monte Carlo · Research tool only")
-
+st.caption("EPA + Rules + Rest + Weather + ML + Monte Carlo + Implied Totals + Form + Pace + Travel + Divisional · Research tool only")
 # -----------------------------
 # CONSTANTS
 # -----------------------------
@@ -46,7 +42,6 @@ TEAM_NAME_TO_ABBR = {
     "Washington Football Team": "WAS", "Oakland Raiders": "LV",
     "San Diego Chargers": "LAC", "St. Louis Rams": "LA",
 }
-
 STADIUM_COORDS = {
     "ARI": (33.5275, -112.2625), "ATL": (33.7554, -84.4010), "BAL": (39.2780, -76.6227),
     "BUF": (42.7738, -78.7870), "CAR": (35.2258, -80.8528), "CHI": (41.8623, -87.6167),
@@ -60,6 +55,30 @@ STADIUM_COORDS = {
     "SF": (37.4033, -121.9694), "SEA": (47.5952, -122.3316), "TB": (27.9759, -82.5033),
     "TEN": (36.1665, -86.7713), "WAS": (38.9077, -76.8645),
 }
+# Time zone offsets from UTC (standard; DST handled roughly via season)
+TEAM_TZ = {
+    "ARI": -7, "ATL": -5, "BAL": -5, "BUF": -5, "CAR": -5, "CHI": -6,
+    "CIN": -5, "CLE": -5, "DAL": -6, "DEN": -7, "DET": -5, "GB": -6,
+    "HOU": -6, "IND": -5, "JAX": -5, "KC": -6, "LAC": -8, "LA": -8,
+    "LV": -8, "MIA": -5, "MIN": -6, "NE": -5, "NO": -6, "NYG": -5,
+    "NYJ": -5, "PHI": -5, "PIT": -5, "SF": -8, "SEA": -8, "TB": -5,
+    "TEN": -6, "WAS": -5,
+}
+# NFL Divisions (stable alignment)
+DIVISIONS = {
+    "AFC East": {"BUF", "MIA", "NE", "NYJ"},
+    "AFC North": {"BAL", "CIN", "CLE", "PIT"},
+    "AFC South": {"HOU", "IND", "JAX", "TEN"},
+    "AFC West": {"DEN", "KC", "LAC", "LV"},
+    "NFC East": {"DAL", "NYG", "PHI", "WAS"},
+    "NFC North": {"CHI", "DET", "GB", "MIN"},
+    "NFC South": {"ATL", "CAR", "NO", "TB"},
+    "NFC West": {"ARI", "LA", "SF", "SEA"},
+}
+TEAM_TO_DIV = {}
+for div, teams in DIVISIONS.items():
+    for t in teams:
+        TEAM_TO_DIV[t] = div
 
 def to_abbr(name: str) -> Optional[str]:
     if not name or not isinstance(name, str):
@@ -71,13 +90,30 @@ def to_abbr(name: str) -> Optional[str]:
         return name
     return None
 
+def is_divisional(home: str, away: str) -> bool:
+    return TEAM_TO_DIV.get(home) == TEAM_TO_DIV.get(away) and home in TEAM_TO_DIV
+
+def timezone_diff(home: str, away: str) -> int:
+    """Absolute hours of timezone change for the away team traveling to home."""
+    h = TEAM_TZ.get(home, -5)
+    a = TEAM_TZ.get(away, -5)
+    return abs(h - a)
+
+def travel_direction(home: str, away: str) -> str:
+    """Rough direction of travel for away team: Eastbound, Westbound, or None."""
+    h = TEAM_TZ.get(home, -5)
+    a = TEAM_TZ.get(away, -5)
+    diff = h - a  # positive = away is traveling west (to earlier TZ)
+    if abs(diff) < 1:
+        return "None"
+    return "Westbound" if diff > 0 else "Eastbound"
 # -----------------------------
 # SIDEBAR
 # -----------------------------
 st.sidebar.header("Settings")
 api_key = st.sidebar.text_input("The Odds API Key", type="password")
 n_simulations = st.sidebar.slider("Monte Carlo simulations", 2000, 15000, 8000, 1000)
-
+form_window = st.sidebar.slider("Recent form window (games)", 4, 8, 6, 1)
 if st.sidebar.button("Clear all caches"):
     st.cache_data.clear()
     st.cache_resource.clear()
@@ -85,9 +121,7 @@ if st.sidebar.button("Clear all caches"):
         if "weather" in k.lower():
             del st.session_state[k]
     st.rerun()
-
 st.sidebar.caption("Weather is unique per stadium + kickoff.")
-
 # -----------------------------
 # DATA FUNCTIONS
 # -----------------------------
@@ -119,6 +153,93 @@ def get_team_epa(seasons: Optional[List[int]] = None) -> pd.DataFrame:
         return off.merge(deff, on="team", how="outer").set_index("team")
     except Exception:
         return pd.DataFrame()
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def get_team_pace(seasons: Optional[List[int]] = None) -> pd.DataFrame:
+    """Plays per game (offense + defense snaps approx via play counts)."""
+    try:
+        if seasons is None:
+            current = int(nfl.get_current_season())
+            seasons = [current - 1, current]
+        pbp = nfl.load_pbp(seasons=seasons)
+        if hasattr(pbp, "to_pandas"):
+            pbp = pbp.to_pandas()
+        if pbp is None or pbp.empty:
+            return pd.DataFrame()
+        # Count offensive plays per team per game
+        plays = pbp[
+            (pbp["play_type"].isin(["pass", "run"])) &
+            (pbp["posteam"].notna())
+        ].copy()
+        if plays.empty:
+            return pd.DataFrame()
+        # Group by game_id + posteam
+        g = plays.groupby(["game_id", "posteam"]).size().reset_index(name="off_plays")
+        # Average plays per game (offense)
+        pace = g.groupby("posteam")["off_plays"].mean().reset_index()
+        pace.columns = ["team", "plays_per_game"]
+        return pace.set_index("team")
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def get_recent_form(seasons: Optional[List[int]] = None, n_games: int = 6) -> Dict[str, Dict]:
+    """
+    Last N completed games: average EPA (off - def) and average margin (points).
+    Returns dict[team] = {"form_epa": float, "form_margin": float, "n": int}
+    """
+    try:
+        if seasons is None:
+            current = int(nfl.get_current_season())
+            seasons = [current - 1, current]
+        sched = nfl.load_schedules(seasons=seasons)
+        if hasattr(sched, "to_pandas"):
+            sched = sched.to_pandas()
+        if sched is None or sched.empty:
+            return {}
+        # Completed games only
+        completed = sched[
+            sched["result"].notna() &
+            sched["home_score"].notna() &
+            sched["away_score"].notna()
+        ].copy()
+        if completed.empty:
+            return {}
+        completed["gameday"] = pd.to_datetime(completed["gameday"])
+        completed = completed.sort_values("gameday")
+        # Also need EPA if possible – fallback to margin only if EPA unavailable
+        epa_df = get_team_epa(seasons)
+        form = {}
+        all_teams = set(completed["home_team"].unique()) | set(completed["away_team"].unique())
+        for team in all_teams:
+            mask = (completed["home_team"] == team) | (completed["away_team"] == team)
+            team_games = completed.loc[mask].tail(n_games)
+            if team_games.empty:
+                continue
+            margins = []
+            epas = []
+            for _, row in team_games.iterrows():
+                if row["home_team"] == team:
+                    margin = float(row["home_score"]) - float(row["away_score"])
+                else:
+                    margin = float(row["away_score"]) - float(row["home_score"])
+                margins.append(margin)
+                # Approximate recent EPA differential if available
+                if not epa_df.empty and team in epa_df.index:
+                    opp = row["away_team"] if row["home_team"] == team else row["home_team"]
+                    if opp in epa_df.index:
+                        # crude: team's off EPA vs opp def EPA
+                        team_off = float(epa_df.loc[team, "off_epa"])
+                        opp_def = float(epa_df.loc[opp, "def_epa"])
+                        epas.append(team_off - opp_def)
+            form[team] = {
+                "form_margin": float(np.mean(margins)) if margins else 0.0,
+                "form_epa": float(np.mean(epas)) if epas else 0.0,
+                "n": len(margins)
+            }
+        return form
+    except Exception:
+        return {}
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_schedules(seasons: Optional[List[int]] = None) -> pd.DataFrame:
@@ -208,6 +329,16 @@ def get_roof(schedules: pd.DataFrame, home: str, game_date: str) -> str:
         pass
     return "outdoors"
 
+def implied_team_totals(spread: float, total: float) -> Tuple[float, float]:
+    """
+    spread = home team line (negative if home favorite).
+    Returns (home_implied, away_implied).
+    """
+    # Standard: home_implied = (total - spread) / 2
+    # away_implied = (total + spread) / 2
+    home_imp = (total - spread) / 2.0
+    away_imp = (total + spread) / 2.0
+    return home_imp, away_imp
 # -----------------------------
 # WEATHER
 # -----------------------------
@@ -216,7 +347,6 @@ def fetch_weather_api(lat: float, lon: float, kickoff_iso: str) -> Dict[str, Any
     try:
         if not kickoff_iso or len(kickoff_iso) < 10:
             kickoff_iso = datetime.utcnow().strftime("%Y-%m-%dT17:00")
-
         r = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
@@ -232,24 +362,20 @@ def fetch_weather_api(lat: float, lon: float, kickoff_iso: str) -> Dict[str, Any
         )
         if r.status_code != 200:
             return {"temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0, "source": f"http_{r.status_code}"}
-
         data = r.json()
         hourly = data.get("hourly", {})
         times = hourly.get("time", [])
         temps = hourly.get("temperature_2m", [])
         winds = hourly.get("wind_speed_10m", [])
         precs = hourly.get("precipitation_probability", [])
-
         if not times or not temps:
             return {"temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0, "source": "empty"}
-
         try:
             kick = pd.to_datetime(kickoff_iso)
             if kick.tzinfo is None:
                 kick = kick.tz_localize("UTC")
         except Exception:
             kick = pd.Timestamp.utcnow()
-
         best_idx = 0
         best_diff = float("inf")
         for i, t in enumerate(times):
@@ -263,7 +389,6 @@ def fetch_weather_api(lat: float, lon: float, kickoff_iso: str) -> Dict[str, Any
                     best_idx = i
             except Exception:
                 continue
-
         return {
             "temp_f": float(temps[best_idx]),
             "wind_mph": float(winds[best_idx]) if best_idx < len(winds) else 5.0,
@@ -285,25 +410,20 @@ def build_weather_cache(odds_data: List, schedules: pd.DataFrame) -> Dict[str, D
     real_count = 0
     fallback_count = 0
     samples = []
-
     if not odds_data:
         return cache
-
     progress = st.progress(0, text="Fetching unique weather for each outdoor stadium...")
     total = len(odds_data)
-
     for idx, game in enumerate(odds_data):
         try:
             home_full = game.get("home_team")
             home = to_abbr(home_full)
             if not home or home not in STADIUM_COORDS:
                 continue
-
             commence_raw = game.get("commence_time") or ""
             game_date = commence_raw[:10] if len(commence_raw) >= 10 else datetime.now().strftime("%Y-%m-%d")
             roof = get_roof(schedules, home, game_date)
             key = make_weather_key(home, commence_raw)
-
             if roof in ("dome", "closed"):
                 cache[key] = {
                     "temp_f": 72.0, "wind_mph": 0.0, "precip_prob": 0.0,
@@ -315,7 +435,6 @@ def build_weather_cache(odds_data: List, schedules: pd.DataFrame) -> Dict[str, D
                 wx["roof"] = roof
                 wx["home"] = home
                 cache[key] = wx
-
                 if wx.get("source") == "open-meteo":
                     real_count += 1
                     if len(samples) < 8:
@@ -329,11 +448,8 @@ def build_weather_cache(odds_data: List, schedules: pd.DataFrame) -> Dict[str, D
                     fallback_count += 1
         except Exception:
             continue
-
         progress.progress((idx + 1) / total, text=f"Weather {idx+1}/{total}")
-
     progress.empty()
-
     st.session_state["weather_debug"] = {
         "real": real_count,
         "fallback": fallback_count,
@@ -348,28 +464,23 @@ def weather_adjustments(roof: str, weather: Dict) -> Dict[str, Any]:
             "total_adj": 0.0, "noise_extra": 0.0, "under_bias": 0.0,
             "rule_pts": 0.0, "label": "Dome / Closed"
         }
-
     temp = float(weather.get("temp_f", 70))
     wind = float(weather.get("wind_mph", 5))
     precip = float(weather.get("precip_prob", 10))
-
     total_adj = noise_extra = under_bias = rule_pts = 0.0
     labels = []
-
     if wind >= 20:
         total_adj -= 3.5; noise_extra += 2.5; under_bias += 0.04; rule_pts += 1.4
         labels.append(f"High wind {wind:.0f} mph")
     elif wind >= 15:
         total_adj -= 2.0; noise_extra += 1.5; under_bias += 0.025; rule_pts += 0.9
         labels.append(f"Wind {wind:.0f} mph")
-
     if precip >= 60:
         total_adj -= 2.5; noise_extra += 2.0; under_bias += 0.03; rule_pts += 1.1
         labels.append(f"Precip {precip:.0f}%")
     elif precip >= 40:
         total_adj -= 1.2; noise_extra += 1.0; under_bias += 0.015; rule_pts += 0.6
         labels.append(f"Precip {precip:.0f}%")
-
     if temp <= 25:
         total_adj -= 2.0; noise_extra += 1.5; rule_pts += 0.7
         labels.append(f"Very cold {temp:.0f}°F")
@@ -379,13 +490,11 @@ def weather_adjustments(roof: str, weather: Dict) -> Dict[str, Any]:
     elif temp >= 95:
         total_adj -= 1.0; noise_extra += 1.0; rule_pts += 0.4
         labels.append(f"Hot {temp:.0f}°F")
-
     label = " • ".join(labels) if labels else f"Outdoor {temp:.0f}°F / {wind:.0f} mph"
     return {
         "total_adj": total_adj, "noise_extra": noise_extra,
         "under_bias": under_bias, "rule_pts": rule_pts, "label": label
     }
-
 # -----------------------------
 # ML + MONTE CARLO
 # -----------------------------
@@ -452,20 +561,18 @@ def train_ats_model(seasons: List[int]):
 def monte_carlo_game(
     home_off, home_def, away_off, away_def,
     spread, total_line, n_sims=8000,
-    total_adj=0.0, noise_extra=0.0, under_bias=0.0
+    total_adj=0.0, noise_extra=0.0, under_bias=0.0,
+    pace_adj=0.0, form_margin_adj=0.0
 ):
-    expected_margin = (home_off - away_def - (away_off - home_def)) * 35.0 + 1.2
+    expected_margin = (home_off - away_def - (away_off - home_def)) * 35.0 + 1.2 + form_margin_adj
     sim_margins = np.random.normal(expected_margin, 11.5 + noise_extra, n_sims)
-    expected_total = 44.0 + (home_off + away_off - home_def - away_def) * 22.0 + total_adj
+    expected_total = 44.0 + (home_off + away_off - home_def - away_def) * 22.0 + total_adj + pace_adj
     sim_totals = np.random.normal(expected_total, 13.5 + noise_extra * 0.8, n_sims)
-
     home_cover = float(np.mean(sim_margins > spread))
     over_p = float(np.mean(sim_totals > total_line)) if total_line else 0.5
     over_p = max(0.05, min(0.95, over_p - under_bias))
-
     home_ev = home_cover * 100 / 110 - (1 - home_cover)
     away_ev = (1 - home_cover) * 100 / 110 - home_cover
-
     return {
         "home_cover_prob": home_cover,
         "over_prob": over_p,
@@ -473,7 +580,6 @@ def monte_carlo_game(
         "home_ev": float(home_ev),
         "away_ev": float(away_ev)
     }
-
 # -----------------------------
 # TABS
 # -----------------------------
@@ -483,13 +589,13 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "🎯 Player Props",
     "📊 Backtest"
 ])
-
 # ========== TAB 1 ==========
 with tab1:
     st.subheader("Ranked Opportunities")
-
-    with st.spinner("Loading EPA, Odds and unique weather..."):
+    with st.spinner("Loading EPA, Pace, Form, Odds and unique weather..."):
         team_epa = get_team_epa()
+        team_pace = get_team_pace()
+        recent_form = get_recent_form(n_games=form_window)
         schedules = load_schedules()
         odds_data, odds_status = fetch_nfl_odds(api_key) if api_key else (None, "No API key entered")
         try:
@@ -498,13 +604,12 @@ with tab1:
             current_season = 2025
         model_bundle = train_ats_model(list(range(current_season - 4, current_season)))
         weather_cache = build_weather_cache(odds_data or [], schedules)
-
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("EPA teams", 0 if team_epa.empty else len(team_epa))
     c2.metric("Odds events", 0 if not odds_data else len(odds_data))
     c3.metric("Model", "Ready" if model_bundle else "Missing")
     c4.metric("Weather keys", len(weather_cache))
-
+    c5.metric("Form teams", len(recent_form))
     debug = st.session_state.get("weather_debug", {})
     if debug:
         st.info(
@@ -514,43 +619,35 @@ with tab1:
         if debug.get("samples"):
             st.caption("Sample real weather (should differ by stadium):")
             st.dataframe(pd.DataFrame(debug["samples"]), use_container_width=True, hide_index=True)
-
     st.caption(odds_status)
-
     opportunities = []
     skipped = []
-
     if odds_data and not team_epa.empty:
         model = model_bundle[0] if model_bundle else None
         feature_cols = model_bundle[1] if model_bundle else None
-
+        league_avg_pace = float(team_pace["plays_per_game"].mean()) if not team_pace.empty else 65.0
         for game in odds_data:
             try:
                 home_full = game.get("home_team", "")
                 away_full = game.get("away_team", "")
                 home = to_abbr(home_full)
                 away = to_abbr(away_full)
-
                 if not home or not away:
                     skipped.append(f"Unmapped: {away_full} @ {home_full}")
                     continue
                 if home not in team_epa.index or away not in team_epa.index:
                     skipped.append(f"No EPA for {away} @ {home}")
                     continue
-
                 commence_raw = game.get("commence_time") or ""
                 commence = commence_raw[:16].replace("T", " ") if commence_raw else ""
                 game_date = commence[:10] if commence else datetime.now().strftime("%Y-%m-%d")
-
                 roof = get_roof(schedules, home, game_date)
                 wx_key = make_weather_key(home, commence_raw)
                 weather = weather_cache.get(wx_key) or {
                     "temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0,
                     "roof": roof, "source": "missing"
                 }
-
                 wx_adj = weather_adjustments(roof, weather)
-
                 spreads, totals = [], []
                 for book in game.get("bookmakers", []):
                     for market in book.get("markets", []):
@@ -562,20 +659,40 @@ with tab1:
                             for o in market.get("outcomes", []):
                                 if o.get("name") == "Over":
                                     totals.append(o.get("point"))
-
                 avg_spread = float(np.mean(spreads)) if spreads else None
                 avg_total = float(np.mean(totals)) if totals else 45.0
-
                 home_off = float(team_epa.loc[home, "off_epa"])
                 home_def = float(team_epa.loc[home, "def_epa"])
                 away_off = float(team_epa.loc[away, "off_epa"])
                 away_def = float(team_epa.loc[away, "def_epa"])
                 epa_edge = (home_off - away_def) - (away_off - home_def)
-
                 rest_diff = get_rest_days(schedules, home, game_date) - get_rest_days(schedules, away, game_date)
-
+                # ---- NEW SIGNALS ----
+                # 1. Implied Team Totals
+                if avg_spread is not None:
+                    home_imp, away_imp = implied_team_totals(avg_spread, avg_total)
+                else:
+                    home_imp, away_imp = avg_total / 2, avg_total / 2
+                # 2. Recent Form
+                home_form = recent_form.get(home, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
+                away_form = recent_form.get(away, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
+                form_margin_diff = home_form["form_margin"] - away_form["form_margin"]
+                form_epa_diff = home_form["form_epa"] - away_form["form_epa"]
+                # 3. Pace
+                home_pace = float(team_pace.loc[home, "plays_per_game"]) if (not team_pace.empty and home in team_pace.index) else league_avg_pace
+                away_pace = float(team_pace.loc[away, "plays_per_game"]) if (not team_pace.empty and away in team_pace.index) else league_avg_pace
+                combined_pace = (home_pace + away_pace) / 2.0
+                pace_vs_avg = combined_pace - league_avg_pace
+                # Pace adjustment to total: ~0.4 pts per extra play above average
+                pace_adj = pace_vs_avg * 0.35
+                # 4. Travel / Time-zone
+                tz_diff = timezone_diff(home, away)
+                travel_dir = travel_direction(home, away)
+                # 5. Divisional
+                div_flag = is_divisional(home, away)
                 signals = []
                 rule_score = 0.0
+                # Existing EPA / spread / rest / weather signals
                 if epa_edge > 0.08:
                     signals.append(f"Home EPA +{epa_edge:.3f}"); rule_score += 2.2
                 elif epa_edge < -0.08:
@@ -592,7 +709,46 @@ with tab1:
                     signals.append(f"Away rest {rest_diff}d"); rule_score += 1.0
                 if wx_adj["rule_pts"] > 0:
                     signals.append(wx_adj["label"]); rule_score += wx_adj["rule_pts"]
-
+                # NEW: Implied Team Totals signals (high value)
+                if home_imp >= 27.5:
+                    signals.append(f"High Home Imp {home_imp:.1f}"); rule_score += 1.5
+                elif home_imp <= 17.5:
+                    signals.append(f"Low Home Imp {home_imp:.1f}"); rule_score += 1.2
+                if away_imp >= 27.5:
+                    signals.append(f"High Away Imp {away_imp:.1f}"); rule_score += 1.4
+                elif away_imp <= 17.5:
+                    signals.append(f"Low Away Imp {away_imp:.1f}"); rule_score += 1.1
+                # Implied total vs market total mismatch (value for totals)
+                model_total_est = home_imp + away_imp  # should equal avg_total, but used for framing
+                if avg_total >= 48 and (home_imp + away_imp) < 46:
+                    signals.append("Implied soft total"); rule_score += 0.8
+                # NEW: Recent Form
+                if form_margin_diff >= 7:
+                    signals.append(f"Home form +{form_margin_diff:.1f}"); rule_score += 1.6
+                elif form_margin_diff <= -7:
+                    signals.append(f"Away form {form_margin_diff:.1f}"); rule_score += 1.5
+                if form_epa_diff > 0.12:
+                    signals.append(f"Home form EPA +{form_epa_diff:.3f}"); rule_score += 1.3
+                elif form_epa_diff < -0.12:
+                    signals.append(f"Away form EPA {form_epa_diff:.3f}"); rule_score += 1.2
+                # NEW: Pace
+                if pace_vs_avg >= 4.0:
+                    signals.append(f"Fast pace +{pace_vs_avg:.1f}"); rule_score += 1.0
+                elif pace_vs_avg <= -4.0:
+                    signals.append(f"Slow pace {pace_vs_avg:.1f}"); rule_score += 0.9
+                # NEW: Travel / TZ
+                if tz_diff >= 3:
+                    if travel_dir == "Westbound":
+                        signals.append(f"Away TZ -{tz_diff}h West"); rule_score += 1.1
+                    else:
+                        signals.append(f"Away TZ -{tz_diff}h East"); rule_score += 0.9
+                elif tz_diff == 2:
+                    signals.append(f"Away TZ -{tz_diff}h"); rule_score += 0.5
+                # NEW: Divisional
+                if div_flag:
+                    signals.append("Divisional"); rule_score += 0.7
+                # Form adjustment for Monte Carlo (scaled)
+                form_margin_adj = form_margin_diff * 0.15  # soft contribution
                 ml_home = 0.5
                 if model is not None and avg_spread is not None and feature_cols is not None:
                     feat = pd.DataFrame([{
@@ -602,22 +758,21 @@ with tab1:
                         "abs_spread": abs(avg_spread), "total_line": avg_total
                     }])[feature_cols]
                     ml_home = float(model.predict_proba(feat)[0, 1])
-
                 mc = monte_carlo_game(
                     home_off, home_def, away_off, away_def,
                     avg_spread if avg_spread is not None else 0.0,
                     avg_total, n_sims=n_simulations,
                     total_adj=wx_adj["total_adj"],
                     noise_extra=wx_adj["noise_extra"],
-                    under_bias=wx_adj["under_bias"]
+                    under_bias=wx_adj["under_bias"],
+                    pace_adj=pace_adj,
+                    form_margin_adj=form_margin_adj
                 )
-
                 ml_edge = abs(ml_home - 0.5) * 4.0
                 mc_edge = max(mc["home_ev"], mc["away_ev"]) * 8.0
                 agree = 1.5 if ((ml_home > 0.5 and mc["home_cover_prob"] > 0.52) or
                                 (ml_home < 0.5 and mc["home_cover_prob"] < 0.48)) else 0.0
                 total_score = rule_score + ml_edge + mc_edge + agree
-
                 if mc["home_ev"] > 0.03 and ml_home > 0.53:
                     rec = "Lean Home ATS"
                 elif mc["away_ev"] > 0.03 and ml_home < 0.47:
@@ -628,7 +783,6 @@ with tab1:
                     rec = "Lean Under"
                 else:
                     rec = "No strong lean"
-
                 # Clearer weather display
                 if roof in ("dome", "closed"):
                     wx_str = "Dome"
@@ -636,7 +790,6 @@ with tab1:
                     wx_str = (f"{weather.get('temp_f', 70):.0f}°F / "
                               f"{weather.get('wind_mph', 5):.0f} mph / "
                               f"{weather.get('precip_prob', 10):.0f}%")
-
                 if signals or total_score > 2.0:
                     opportunities.append({
                         "Game": f"{away_full} @ {home_full}",
@@ -645,7 +798,13 @@ with tab1:
                         "Weather": wx_str,
                         "Spread": f"{avg_spread:+.1f}" if avg_spread is not None else "—",
                         "Total": f"{avg_total:.1f}",
+                        "Home Imp": f"{home_imp:.1f}",
+                        "Away Imp": f"{away_imp:.1f}",
                         "EPA Edge": f"{epa_edge:+.3f}",
+                        "Form Δ": f"{form_margin_diff:+.1f}",
+                        "Pace": f"{combined_pace:.1f}",
+                        "TZ Diff": f"{tz_diff}h" if tz_diff else "0",
+                        "Div": "Yes" if div_flag else "No",
                         "ML Home %": f"{ml_home*100:.1f}%",
                         "MC Home %": f"{mc['home_cover_prob']*100:.1f}%",
                         "MC Over %": f"{mc['over_prob']*100:.1f}%",
@@ -656,10 +815,12 @@ with tab1:
             except Exception as e:
                 skipped.append(f"Error: {e}")
                 continue
-
         if opportunities:
             df = pd.DataFrame(opportunities).sort_values("Score", ascending=False)
             st.dataframe(df, use_container_width=True, hide_index=True)
+            # Quick summary of top signals
+            st.markdown("#### Top Signal Summary")
+            st.caption("Implied Team Totals, Recent Form, Pace, Travel/TZ and Divisional are now folded into Score + Signals.")
         else:
             st.warning("No opportunities matched the filters.")
             if skipped:
@@ -673,7 +834,6 @@ with tab1:
             st.error(f"Could not load odds: {odds_status}")
         else:
             st.error("Could not load EPA data.")
-
 # ========== TAB 2 ==========
 with tab2:
     st.subheader("Upcoming Games")
@@ -695,11 +855,27 @@ with tab2:
                         for o in m.get("outcomes", []):
                             if o.get("name") == "Over":
                                 total = f"{o.get('point', 0):.1f}"
-            rows.append({"Away": away, "Home": home, "Kickoff": commence, "Spread": spread, "Total": total})
+            # Add implied + divisional for richer view
+            home_a = to_abbr(home)
+            away_a = to_abbr(away)
+            imp_h = imp_a = "—"
+            if spread != "—" and total != "—":
+                try:
+                    s = float(spread)
+                    t = float(total)
+                    ih, ia = implied_team_totals(s, t)
+                    imp_h, imp_a = f"{ih:.1f}", f"{ia:.1f}"
+                except Exception:
+                    pass
+            div = "Yes" if (home_a and away_a and is_divisional(home_a, away_a)) else "No"
+            rows.append({
+                "Away": away, "Home": home, "Kickoff": commence,
+                "Spread": spread, "Total": total,
+                "Home Imp": imp_h, "Away Imp": imp_a, "Divisional": div
+            })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
         st.info(odds_status if api_key else "Enter API key")
-
 # ========== TAB 3 ==========
 with tab3:
     st.subheader("Player Props")
@@ -735,14 +911,12 @@ with tab3:
                     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
                 else:
                     st.warning("No props returned.")
-
 # ========== TAB 4 ==========
 with tab4:
     st.subheader("Simple Backtest")
     min_edge = st.slider("Minimum EPA edge", 0.03, 0.20, 0.05, 0.01)
     eval_seasons = st.multiselect("Evaluation seasons", [2021, 2022, 2023, 2024, 2025], default=[2023, 2024, 2025])
     train_seasons = st.multiselect("Train seasons", [2019, 2020, 2021, 2022, 2023, 2024], default=[2020, 2021, 2022])
-
     if st.button("Run Backtest"):
         with st.spinner("Training & evaluating..."):
             try:
