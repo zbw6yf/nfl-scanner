@@ -317,11 +317,37 @@ def _to_pandas(obj) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_schedules_from_nflverse_release() -> pd.DataFrame:
+    """
+    Load the full multi-season schedule CSV published by nflverse.
+    Most reliable source for complete 2026 weeks/dates/times (NE@JAX, PHI@CHI, etc.).
+    """
+    urls = [
+        "https://github.com/nflverse/nflverse-data/releases/download/schedules/games.csv",
+        "https://github.com/nflverse/nfldata/raw/master/data/games.csv",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=25)
+            if r.status_code != 200 or not r.text or "game_id" not in r.text[:800]:
+                continue
+            from io import StringIO
+            df = pd.read_csv(StringIO(r.text))
+            if not df.empty and "home_team" in df.columns and "gameday" in df.columns:
+                return df
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_schedules(seasons: Optional[List[int]] = None) -> pd.DataFrame:
     """
     Load NFL schedules robustly.
-    Tries the requested seasons; if empty, expands to nearby years so 2026 data
-    still appears even when nfl.get_current_season() lags.
+
+    Priority:
+      1) Official nflverse release CSV (complete weeks/dates/times, including 2026)
+      2) nflreadpy package per-season loads
     """
     try:
         if seasons is None:
@@ -329,10 +355,25 @@ def load_schedules(seasons: Optional[List[int]] = None) -> pd.DataFrame:
                 current = int(nfl.get_current_season())
             except Exception:
                 current = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
-            # Include next year in case package still reports previous season
+            # Always include the calendar NFL year (e.g. 2026 in Sep 2026) even if package lags
+            cal_year = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
+            current = max(current, cal_year)
             seasons = list(range(current - 3, current + 2))
-        # Deduplicate while preserving order
         seasons = list(dict.fromkeys(int(s) for s in seasons))
+
+        # 1) Preferred: full release CSV
+        release = load_schedules_from_nflverse_release()
+        if not release.empty:
+            if "season" in release.columns:
+                filtered = release[release["season"].isin(seasons)]
+                if not filtered.empty:
+                    release = filtered
+            if not release.empty:
+                if "game_id" in release.columns:
+                    release = release.drop_duplicates(subset=["game_id"], keep="last")
+                return release.reset_index(drop=True)
+
+        # 2) Fallback: nflreadpy package
         frames = []
         for yr in seasons:
             try:
@@ -343,7 +384,6 @@ def load_schedules(seasons: Optional[List[int]] = None) -> pd.DataFrame:
             except Exception:
                 continue
         if not frames:
-            # Last-resort single call with the full list
             try:
                 raw = nfl.load_schedules(seasons=seasons)
                 pdf = _to_pandas(raw)
@@ -354,7 +394,6 @@ def load_schedules(seasons: Optional[List[int]] = None) -> pd.DataFrame:
         if not frames:
             return pd.DataFrame()
         sched = pd.concat(frames, ignore_index=True)
-        # Drop exact duplicate game rows if any
         if "game_id" in sched.columns:
             sched = sched.drop_duplicates(subset=["game_id"], keep="last")
         return sched
