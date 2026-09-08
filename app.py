@@ -817,9 +817,12 @@ def build_upcoming_from_odds(odds_data, schedules: pd.DataFrame) -> List[Dict]:
     return games
 
 
+
 def build_upcoming_games(schedules: pd.DataFrame, odds_data: Optional[List], days_ahead: int = 90) -> List[Dict]:
     """
     Prefer official schedule for complete weeks/dates/times.
+    Ensures each upcoming week has the full slate (e.g. Week 3 = 16 games)
+    by merging ESPN week payloads when counts are short.
     Fall back to Odds API list if schedule yields no rows.
     """
     games: List[Dict] = []
@@ -837,117 +840,226 @@ def build_upcoming_games(schedules: pd.DataFrame, odds_data: Optional[List], day
             if commence:
                 odds_by_date_teams[(commence, h, a)] = ev
 
+    try:
+        current = int(nfl.get_current_season())
+    except Exception:
+        current = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
+    cal_year = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
+    current = max(current, cal_year)
+
     sched_ok = schedules is not None and isinstance(schedules, pd.DataFrame) and not schedules.empty
-
+    sched = pd.DataFrame()
     if sched_ok:
-        try:
+        sched = schedules.copy()
+        if "season" in sched.columns:
+            years = {current, current + 1, current - 1, cal_year}
+            sched_year = sched[sched["season"].isin(list(years))]
+            if not sched_year.empty:
+                sched = sched_year
+        if "game_type" in sched.columns:
+            reg = sched[sched["game_type"].astype(str).str.upper() == "REG"]
+            if not reg.empty:
+                sched = reg
+
+    # Always pull ESPN for current season weeks in the near window so counts are complete
+    try:
+        espn_sched = load_schedules_from_espn(season=current, max_week=10)
+        if not espn_sched.empty:
+            if sched.empty:
+                sched = espn_sched
+            else:
+                # Merge: ESPN fills gaps
+                sched = pd.concat([espn_sched, sched], ignore_index=True, sort=False)
+    except Exception:
+        pass
+
+    if sched is None or sched.empty:
+        if odds_data:
+            return build_upcoming_from_odds(odds_data, schedules if sched_ok else pd.DataFrame())
+        return []
+
+    # Normalize teams
+    for col in ("home_team", "away_team"):
+        if col in sched.columns:
+            sched[col] = sched[col].astype(str).map(_normalize_team_abbr)
+
+    today = pd.Timestamp.now().normalize()
+    cutoff = today + pd.Timedelta(days=max(days_ahead, 90))
+
+    if "gameday" in sched.columns:
+        sched = sched.copy()
+        sched["_gd"] = pd.to_datetime(sched["gameday"], errors="coerce")
+        sched = sched[sched["_gd"].notna()]
+        # Keep a wide window so full weeks (Thu–Mon) stay intact
+        sched = sched[(sched["_gd"] >= today - pd.Timedelta(days=3)) & (sched["_gd"] <= cutoff)]
+
+    # Keep unplayed games when possible
+    if "result" in sched.columns and not sched.empty:
+        unplayed = sched[sched["result"].isna()]
+        if not unplayed.empty:
+            sched = unplayed
+        elif "home_score" in sched.columns:
+            no_score = sched[sched["home_score"].isna()]
+            if not no_score.empty:
+                sched = no_score
+
+    # Dedupe by week + matchup (not gameday) so timezone variants don't drop games
+    if not sched.empty and "week" in sched.columns and "home_team" in sched.columns and "away_team" in sched.columns:
+        sched = sched.drop_duplicates(subset=["week", "home_team", "away_team"], keep="first")
+
+    # If any week in range has fewer than 14 REG games, re-fetch that week from ESPN and top up
+    if "week" in sched.columns and not sched.empty:
+        for wk in sorted(sched["week"].dropna().unique()):
             try:
-                current = int(nfl.get_current_season())
+                wk = int(wk)
             except Exception:
-                current = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
-
-            sched = schedules.copy()
-
-            if "season" in sched.columns:
-                years = {current, current + 1, current - 1}
-                sched_year = sched[sched["season"].isin(list(years))]
-                if not sched_year.empty:
-                    sched = sched_year
-
-            if "game_type" in sched.columns:
-                reg = sched[sched["game_type"].astype(str).str.upper() == "REG"]
-                if not reg.empty:
-                    sched = reg
-
-            today = pd.Timestamp.now().normalize()
-            cutoff = today + pd.Timedelta(days=max(days_ahead, 90))
-
-            if "gameday" in sched.columns:
-                sched = sched.copy()
-                sched["_gd"] = pd.to_datetime(sched["gameday"], errors="coerce")
-                sched = sched[sched["_gd"].notna()]
-                sched = sched[(sched["_gd"] >= today - pd.Timedelta(days=3)) & (sched["_gd"] <= cutoff)]
-
-            if "result" in sched.columns and not sched.empty:
-                unplayed = sched[sched["result"].isna()]
-                if not unplayed.empty:
-                    sched = unplayed
-                elif "home_score" in sched.columns:
-                    no_score = sched[sched["home_score"].isna()]
-                    if not no_score.empty:
-                        sched = no_score
-
-            for _, row in sched.iterrows():
-                home = _normalize_team_abbr(row.get("home_team", ""))
-                away = _normalize_team_abbr(row.get("away_team", ""))
-                if not home or not away:
+                continue
+            if wk < 1 or wk > 18:
+                continue
+            week_rows = sched[sched["week"] == wk]
+            if len(week_rows) >= 14:
+                continue
+            try:
+                url = (
+                    "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+                    f"?seasontype=2&week={wk}&dates={current}"
+                )
+                r = requests.get(url, timeout=15)
+                if r.status_code != 200:
                     continue
+                data = r.json()
+                extra = []
+                for ev in data.get("events") or []:
+                    comps = ev.get("competitions") or []
+                    if not comps:
+                        continue
+                    comp = comps[0]
+                    competitors = comp.get("competitors") or []
+                    home = next((c for c in competitors if c.get("homeAway") == "home"), None)
+                    away = next((c for c in competitors if c.get("homeAway") == "away"), None)
+                    if not home or not away:
+                        continue
+                    home_abbr = _normalize_team_abbr((home.get("team") or {}).get("abbreviation") or "")
+                    away_abbr = _normalize_team_abbr((away.get("team") or {}).get("abbreviation") or "")
+                    if not home_abbr or not away_abbr:
+                        continue
+                    # Skip if already present
+                    exists = (
+                        (sched["week"] == wk)
+                        & (sched["home_team"] == home_abbr)
+                        & (sched["away_team"] == away_abbr)
+                    ).any()
+                    if exists:
+                        continue
+                    date_iso = ev.get("date") or ""
+                    gameday, gametime = "", ""
+                    if date_iso:
+                        try:
+                            ts = pd.to_datetime(date_iso, utc=True)
+                            try:
+                                from zoneinfo import ZoneInfo
+                                ts_et = ts.tz_convert(ZoneInfo("America/New_York"))
+                            except Exception:
+                                ts_et = ts.tz_convert(None) - pd.Timedelta(hours=4)
+                            gameday = ts_et.strftime("%Y-%m-%d")
+                            gametime = ts_et.strftime("%H:%M")
+                        except Exception:
+                            gameday = date_iso[:10]
+                    extra.append({
+                        "game_id": f"{current}_{wk:02d}_{away_abbr}_{home_abbr}",
+                        "season": current,
+                        "game_type": "REG",
+                        "week": wk,
+                        "gameday": gameday,
+                        "gametime": gametime,
+                        "away_team": away_abbr,
+                        "home_team": home_abbr,
+                        "result": None,
+                        "roof": "outdoors",
+                    })
+                if extra:
+                    sched = pd.concat([sched, pd.DataFrame(extra)], ignore_index=True, sort=False)
+                    sched = sched.drop_duplicates(subset=["week", "home_team", "away_team"], keep="first")
+            except Exception:
+                continue
 
-                gameday = str(row.get("gameday", ""))[:10]
-                gametime = row.get("gametime")
-                week = row.get("week")
-                try:
-                    week = int(week) if pd.notna(week) else None
-                except Exception:
-                    week = None
-                roof = str(row.get("roof", "outdoors") or "outdoors").lower().strip()
+    for _, row in sched.iterrows():
+        home = _normalize_team_abbr(row.get("home_team", ""))
+        away = _normalize_team_abbr(row.get("away_team", ""))
+        if not home or not away:
+            continue
 
-                odds_ev = None
-                if gameday:
-                    odds_ev = odds_by_date_teams.get((gameday, home, away))
-                if odds_ev is None:
-                    odds_ev = odds_by_matchup.get((home, away))
-
-                commence_raw = (odds_ev.get("commence_time") if odds_ev else "") or ""
-                if gametime and str(gametime) not in ("None", "nan", ""):
-                    kickoff = format_schedule_kickoff(gameday, gametime)
-                elif commence_raw:
-                    kickoff = format_kickoff(commence_raw)
-                else:
-                    kickoff = format_schedule_kickoff(gameday, None)
-
-                avg_spread, avg_total = _extract_odds_lines(odds_ev, home)
-                if avg_spread is None and pd.notna(row.get("spread_line")):
-                    try:
-                        avg_spread = float(row["spread_line"])
-                    except Exception:
-                        pass
-                if avg_total is None and pd.notna(row.get("total_line")):
-                    try:
-                        avg_total = float(row["total_line"])
-                    except Exception:
-                        pass
-                if avg_total is None:
-                    avg_total = 45.0
-
-                if week is None and gameday:
-                    week = estimate_week_from_date(gameday)
-
-                games.append({
-                    "week": week,
-                    "gameday": gameday,
-                    "gametime": gametime,
-                    "kickoff": kickoff,
-                    "home": home,
-                    "away": away,
-                    "home_full": full_name(home),
-                    "away_full": full_name(away),
-                    "roof": roof,
-                    "avg_spread": avg_spread,
-                    "avg_total": avg_total,
-                    "odds_event": odds_ev,
-                    "commence_raw": commence_raw or (f"{gameday}T{(str(gametime) if gametime else '17:00')}:00Z" if gameday else ""),
-                    "game_id": row.get("game_id"),
-                })
+        gameday = str(row.get("gameday", ""))[:10]
+        gametime = row.get("gametime")
+        week = row.get("week")
+        try:
+            week = int(week) if pd.notna(week) else None
         except Exception:
-            games = []
+            week = None
+        roof = str(row.get("roof", "outdoors") or "outdoors").lower().strip()
 
-    # Fallback to Odds API if schedule produced nothing
+        odds_ev = None
+        if gameday:
+            odds_ev = odds_by_date_teams.get((gameday, home, away))
+        if odds_ev is None:
+            odds_ev = odds_by_matchup.get((home, away))
+
+        commence_raw = (odds_ev.get("commence_time") if odds_ev else "") or ""
+        if gametime and str(gametime) not in ("None", "nan", ""):
+            kickoff = format_schedule_kickoff(gameday, gametime)
+        elif commence_raw:
+            kickoff = format_kickoff(commence_raw)
+        else:
+            kickoff = format_schedule_kickoff(gameday, None)
+
+        avg_spread, avg_total = _extract_odds_lines(odds_ev, home)
+        if avg_spread is None and pd.notna(row.get("spread_line")):
+            try:
+                avg_spread = float(row["spread_line"])
+            except Exception:
+                pass
+        if avg_total is None and pd.notna(row.get("total_line")):
+            try:
+                avg_total = float(row["total_line"])
+            except Exception:
+                pass
+        if avg_total is None:
+            avg_total = 45.0
+
+        if week is None and gameday:
+            week = estimate_week_from_date(gameday)
+
+        games.append({
+            "week": week,
+            "gameday": gameday,
+            "gametime": gametime,
+            "kickoff": kickoff,
+            "home": home,
+            "away": away,
+            "home_full": full_name(home),
+            "away_full": full_name(away),
+            "roof": roof,
+            "avg_spread": avg_spread,
+            "avg_total": avg_total,
+            "odds_event": odds_ev,
+            "commence_raw": commence_raw or (f"{gameday}T{(str(gametime) if gametime else '17:00')}:00Z" if gameday else ""),
+            "game_id": row.get("game_id"),
+        })
+
     if not games and odds_data:
         games = build_upcoming_from_odds(odds_data, schedules if sched_ok else pd.DataFrame())
 
-    games.sort(key=lambda g: (g.get("gameday") or "", str(g.get("gametime") or ""), g.get("kickoff") or ""))
-    return games
+    # Final dedupe by week+matchup
+    seen = set()
+    unique = []
+    for g in games:
+        key = (g.get("week"), g.get("home"), g.get("away"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(g)
+    unique.sort(key=lambda g: (g.get("gameday") or "", str(g.get("gametime") or ""), g.get("kickoff") or ""))
+    return unique
 
 
 # -----------------------------
@@ -1591,7 +1703,13 @@ with tab2:
             except Exception:
                 pass
         st.dataframe(games_df, use_container_width=True, hide_index=True)
-        st.caption(f"{len(games_df)} games shown · Week numbers and times come from the official NFL schedule.")
+        # Per-week counts so users can verify full slates (Week 3 should be 16)
+        if "Week" in games_df.columns:
+            counts = games_df[games_df["Week"] != "—"].groupby("Week").size().sort_index()
+            count_str = " · ".join([f"W{int(w)}:{int(n)}" for w, n in counts.items()])
+            st.caption(f"{len(games_df)} games shown · {count_str} · Official schedule (ESPN + nflverse)")
+        else:
+            st.caption(f"{len(games_df)} games shown · Week numbers and times come from the official NFL schedule.")
     else:
         st.info(odds_status if api_key else "Schedule data unavailable or no upcoming games found.")
 
