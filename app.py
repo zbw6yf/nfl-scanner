@@ -50,20 +50,26 @@ TEAM_NAME_MAP = {
 def to_abbr(name):
     return TEAM_NAME_MAP.get(name, name)
 
-def get_current_nfl_season():
-    """Return the correct current NFL season year."""
-    today = datetime.now()
-    # NFL season year is the year the regular season starts (Sept)
-    if today.month < 3:          # Jan & Feb still belong to previous season
-        return today.year - 1
-    return today.year
+def get_latest_available_season():
+    """Return the most recent season that actually has data (currently 2025)."""
+    # Try current calendar year first, then fall back
+    for year in [2026, 2025, 2024]:
+        try:
+            # Quick test load
+            test = nfl.load_schedules(seasons=[year])
+            if test is not None and (hasattr(test, "height") and test.height > 0 or len(test) > 0):
+                return year
+        except Exception:
+            continue
+    return 2025  # safe fallback
 
 @st.cache_data(ttl=3600 * 6)
 def get_advanced_team_metrics(seasons=None):
     try:
         if seasons is None:
-            current = get_current_nfl_season()
-            seasons = [current - 1, current]
+            latest = get_latest_available_season()
+            seasons = [latest - 1, latest]
+
         pbp = nfl.load_pbp(seasons=seasons)
         if hasattr(pbp, "to_pandas"):
             pbp = pbp.to_pandas()
@@ -102,8 +108,8 @@ def get_advanced_team_metrics(seasons=None):
 def load_schedules(seasons=None):
     try:
         if seasons is None:
-            current = get_current_nfl_season()
-            seasons = list(range(current - 3, current + 1))
+            latest = get_latest_available_season()
+            seasons = list(range(latest - 3, latest + 1))
         sched = nfl.load_schedules(seasons=seasons)
         return sched.to_pandas() if hasattr(sched, "to_pandas") else sched
     except Exception:
@@ -112,8 +118,8 @@ def load_schedules(seasons=None):
 @st.cache_data(ttl=3600)
 def load_current_schedule():
     try:
-        current = get_current_nfl_season()   # This now correctly returns 2026
-        sched = nfl.load_schedules(seasons=[current])
+        latest = get_latest_available_season()
+        sched = nfl.load_schedules(seasons=[latest])
         return sched.to_pandas() if hasattr(sched, "to_pandas") else sched
     except Exception:
         return pd.DataFrame()
@@ -174,8 +180,8 @@ def get_rest_days(schedules, team, game_date):
 @st.cache_data(ttl=3600 * 4)
 def load_recent_player_stats():
     try:
-        current = get_current_nfl_season()
-        stats = nfl.load_player_stats(seasons=[current - 1, current], summary_level="week")
+        latest = get_latest_available_season()
+        stats = nfl.load_player_stats(seasons=[latest - 1, latest], summary_level="week")
         if hasattr(stats, "to_pandas"):
             stats = stats.to_pandas()
         return stats
@@ -246,8 +252,8 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 with tab1:
     st.subheader("Advanced Opportunities")
 
-    current_season = get_current_nfl_season()
-    st.caption(f"Currently showing **{current_season}** season")
+    latest_season = get_latest_available_season()
+    st.caption(f"Using latest available data: **{latest_season}** season (2026 data not published yet)")
 
     selected_week = st.selectbox(
         "Select Week / Round",
@@ -255,17 +261,17 @@ with tab1:
         index=0
     )
 
-    with st.spinner("Loading 2026 schedule and advanced metrics..."):
+    with st.spinner(f"Loading {latest_season} schedule and advanced metrics..."):
         metrics = get_advanced_team_metrics()
         full_schedule = load_current_schedule()
         week_games = filter_schedule_by_week(full_schedule, selected_week)
         odds_data = fetch_nfl_odds(api_key) if api_key else None
         all_schedules = load_schedules()
 
-    st.markdown(f"### {selected_week} ({current_season})")
+    st.markdown(f"### {selected_week} ({latest_season})")
 
     if week_games.empty:
-        st.info(f"No games found for {selected_week} in the {current_season} season yet.")
+        st.info(f"No games found for {selected_week} in the {latest_season} season.")
     else:
         odds_lookup = {}
         if odds_data:
@@ -499,7 +505,7 @@ with tab3:
 with tab4:
     st.subheader("Improved Backtest – EPA Edge")
     min_edge = st.slider("Minimum EPA edge", 0.03, 0.20, 0.06, 0.01)
-    seasons_back = st.multiselect("Seasons", [2022, 2023, 2024, 2025, 2026], default=[2024, 2025, 2026])
+    seasons_back = st.multiselect("Seasons", [2022, 2023, 2024, 2025], default=[2023, 2024, 2025])
 
     if st.button("Run Backtest"):
         with st.spinner("Running backtest..."):
@@ -543,4 +549,4 @@ with tab5:
     """)
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Full version • 2026 season • Week selector + Player Props")
+st.sidebar.caption("Full version • Auto-fallback to latest available season")
