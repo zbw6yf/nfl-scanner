@@ -1,0 +1,5 @@
+streamlit>=1.28.0  
+pandas>=2.0.0  
+numpy>=1.24.0  
+requests>=2.31.0  
+nflreadpy>=0.1.0  
