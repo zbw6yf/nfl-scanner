@@ -622,7 +622,7 @@ with tab4:
 # ========== TAB 5: DEPLOY ==========
 with tab5:
     st.subheader("Deploy / Update your app")
-    st.markdown("""
+    st.markdown(""")
     After making changes:
     1. Upload the new `app.py` to your GitHub repo
     2. Make sure `requirements.txt` contains:
