@@ -90,6 +90,28 @@ def to_abbr(name: str) -> Optional[str]:
         return name
     return None
 
+
+def format_kickoff(commence_raw: str) -> str:
+    """
+    Convert Odds API commence_time (UTC ISO) to US/Eastern for display.
+    Avoids evening games rolling to the next calendar day in UTC.
+    """
+    if not commence_raw:
+        return ""
+    try:
+        ts = pd.to_datetime(commence_raw, utc=True)
+        # Prefer zoneinfo; fall back to fixed -4/-5 if unavailable
+        try:
+            from zoneinfo import ZoneInfo
+            ts_et = ts.tz_convert(ZoneInfo("America/New_York"))
+        except Exception:
+            # Rough EDT offset (season is mostly EDT Sep–Oct)
+            ts_et = ts.tz_convert(None) - pd.Timedelta(hours=4)
+            return ts_et.strftime("%Y-%m-%d %H:%M ET")
+        return ts_et.strftime("%Y-%m-%d %H:%M ET")
+    except Exception:
+        return (commence_raw[:16].replace("T", " ") if len(commence_raw) >= 16 else commence_raw)
+
 def is_divisional(home: str, away: str) -> bool:
     return TEAM_TO_DIV.get(home) == TEAM_TO_DIV.get(away) and home in TEAM_TO_DIV
 
@@ -391,14 +413,20 @@ def estimate_week_from_date(game_date: str) -> Optional[int]:
 
 def get_week(schedules: pd.DataFrame, home: str, away: str, game_date: str) -> Optional[int]:
     """
-    Look up NFL week from schedules (current season, abbr aliases, tight dates).
-    Falls back to calendar estimate so Top-5-by-Week never goes blank.
+    Assign NFL week for an upcoming game.
+
+    Priority:
+      1) Current-season schedule match within ±2 days of kickoff (home/away + aliases)
+      2) Calendar estimate from kickoff date (reliable for regular season)
+      3) If schedule week and estimate disagree by >= 1, prefer the estimate
+         (avoids historical / wrong-week schedule rows polluting Week 1)
     """
+    est = estimate_week_from_date(game_date)
     try:
         gd = str(game_date)[:10]
         target = pd.to_datetime(gd, errors="coerce")
         if pd.isna(target):
-            return estimate_week_from_date(game_date)
+            return est
 
         try:
             current = int(nfl.get_current_season())
@@ -411,11 +439,12 @@ def get_week(schedules: pd.DataFrame, home: str, away: str, game_date: str) -> O
             if not sched_cur.empty:
                 sched = sched_cur
 
+        sched_week = None
         if not sched.empty and "week" in sched.columns and "home_team" in sched.columns:
             home_set = _expand_team(home)
             away_set = _expand_team(away)
 
-            def _week_if_close(rows: pd.DataFrame, max_days: int = 3) -> Optional[int]:
+            def _week_if_close(rows: pd.DataFrame, max_days: int = 2) -> Optional[int]:
                 if rows.empty:
                     return None
                 tmp = rows.copy()
@@ -430,29 +459,25 @@ def get_week(schedules: pd.DataFrame, home: str, away: str, game_date: str) -> O
                 w = tmp.iloc[0]["week"]
                 return int(w) if pd.notna(w) else None
 
+            # Exact matchup, tight date window only
             mask = sched["home_team"].isin(home_set) & sched["away_team"].isin(away_set)
-            week = _week_if_close(sched.loc[mask], max_days=3)
-            if week is not None:
-                return week
+            sched_week = _week_if_close(sched.loc[mask], max_days=2)
+            if sched_week is None:
+                mask_flip = sched["home_team"].isin(away_set) & sched["away_team"].isin(home_set)
+                sched_week = _week_if_close(sched.loc[mask_flip], max_days=2)
 
-            mask_flip = sched["home_team"].isin(away_set) & sched["away_team"].isin(home_set)
-            week = _week_if_close(sched.loc[mask_flip], max_days=3)
-            if week is not None:
-                return week
-
-            mask2 = sched["home_team"].isin(home_set)
-            week = _week_if_close(sched.loc[mask2], max_days=1)
-            if week is not None:
-                return week
-
-            mask3 = sched["gameday"].astype(str).str[:10] == gd
-            rows3 = sched.loc[mask3]
-            if not rows3.empty and pd.notna(rows3.iloc[0].get("week")):
-                return int(rows3.iloc[0]["week"])
-
-        return estimate_week_from_date(game_date)
+        # Prefer schedule only when it agrees with the calendar estimate (or estimate missing)
+        if sched_week is not None and est is not None:
+            if sched_week == est:
+                return sched_week
+            # Disagreement → trust kickoff date (fixes mislabeled Week 1/2 games)
+            return est
+        if sched_week is not None:
+            return sched_week
+        return est
     except Exception:
-        return estimate_week_from_date(game_date)
+        return est
+
 
 def implied_team_totals(spread: float, total: float) -> Tuple[float, float]:
     """
@@ -764,7 +789,7 @@ with tab1:
                     skipped.append(f"No EPA for {away} @ {home}")
                     continue
                 commence_raw = game.get("commence_time") or ""
-                commence = commence_raw[:16].replace("T", " ") if commence_raw else ""
+                commence = format_kickoff(commence_raw) if commence_raw else ""
                 game_date = commence[:10] if commence else datetime.now().strftime("%Y-%m-%d")
                 roof = get_roof(schedules, home, game_date)
                 wx_key = make_weather_key(home, commence_raw)
@@ -1075,7 +1100,7 @@ with tab2:
         for g in odds_data:
             home = g.get("home_team", "")
             away = g.get("away_team", "")
-            commence = (g.get("commence_time") or "")[:16].replace("T", " ")
+            commence = format_kickoff(g.get("commence_time") or "")
             spread = total = "—"
             books = g.get("bookmakers") or []
             if books:
