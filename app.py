@@ -213,7 +213,7 @@ with st.spinner("Processing stats, power ratings, and historical simulations..."
     schedules, pbp = load_data(LOOKBACK_YEARS, current_season)
     ratings = build_power_ratings(schedules, current_season, SEASON_HALF_LIFE)
     epa_metrics = build_epa_metrics(pbp, current_season, SEASON_HALF_LIFE)
-    models = train_models(schedules, epa_metrics, ratings, current_season, HALF_LIFE=SEASON_HALF_LIFE)
+    models = train_models(schedules, epa_metrics, ratings, current_season, half_life=SEASON_HALF_LIFE)
 
 odds_data = fetch_nfl_odds(api_key)
 
@@ -229,39 +229,45 @@ upcoming_games = schedules[
 if upcoming_games.empty:
     st.warning("No upcoming games found for the current season schedule.")
 else:
-    odds_lookup = {(g.get("away_team"), g.get("home_team")): g for g in odds_data} if odds_data else {}
+    # Key odds lookup by standardized team abbreviations
+    odds_lookup = {}
+    if odds_data:
+        for g in odds_data:
+            a_abbr = to_abbr(g.get("away_team"))
+            h_abbr = to_abbr(g.get("home_team"))
+            odds_lookup[(a_abbr, h_abbr)] = g
+
     table_rows = []
 
     for _, row in upcoming_games.iterrows():
-        home_full, away_full = row["home_team"], row["away_team"]
-        home, away = to_abbr(home_full), to_abbr(away_full)
+        home_abbr, away_abbr = row["home_team"], row["away_team"]
 
-        if home not in ratings or away not in ratings or home not in epa_metrics.index or away not in epa_metrics.index:
+        if home_abbr not in ratings or away_abbr not in ratings or home_abbr not in epa_metrics.index or away_abbr not in epa_metrics.index:
             continue
 
-        pass_edge = (epa_metrics.loc[home, "off_pass_epa"] - epa_metrics.loc[away, "def_pass_epa"]) - \
-                    (epa_metrics.loc[away, "off_pass_epa"] - epa_metrics.loc[home, "def_pass_epa"])
-        rush_edge = (epa_metrics.loc[home, "off_rush_epa"] - epa_metrics.loc[away, "def_rush_epa"]) - \
-                    (epa_metrics.loc[away, "off_rush_epa"] - epa_metrics.loc[home, "def_rush_epa"])
-        rating_diff = ratings[home] - ratings[away]
+        pass_edge = (epa_metrics.loc[home_abbr, "off_pass_epa"] - epa_metrics.loc[away_abbr, "def_pass_epa"]) - \
+                    (epa_metrics.loc[away_abbr, "off_pass_epa"] - epa_metrics.loc[home_abbr, "def_pass_epa"])
+        rush_edge = (epa_metrics.loc[home_abbr, "off_rush_epa"] - epa_metrics.loc[away_abbr, "def_rush_epa"]) - \
+                    (epa_metrics.loc[away_abbr, "off_rush_epa"] - epa_metrics.loc[home_abbr, "def_rush_epa"])
+        rating_diff = ratings[home_abbr] - ratings[away_abbr]
 
         features = [rating_diff, pass_edge, rush_edge]
 
         # Extract market lines
-        game_odds = odds_lookup.get((away_full, home_full))
+        game_odds = odds_lookup.get((away_abbr, home_abbr))
         market_spread, market_total, home_ml, away_ml = None, None, None, None
 
         if game_odds:
             for book in game_odds.get("bookmakers", []):
                 for mk in book.get("markets", []):
                     if mk["key"] == "spreads" and market_spread is None:
-                        market_spread = next((o.get("point") for o in mk["outcomes"] if o["name"] == home_full), None)
+                        market_spread = next((o.get("point") for o in mk["outcomes"] if to_abbr(o["name"]) == home_abbr), None)
                     if mk["key"] == "totals" and market_total is None:
                         market_total = next((o.get("point") for o in mk["outcomes"] if o["name"] == "Over"), None)
                     if mk["key"] == "h2h":
                         for o in mk["outcomes"]:
-                            if o["name"] == home_full and home_ml is None: home_ml = o.get("price")
-                            if o["name"] == away_full and away_ml is None: away_ml = o.get("price")
+                            if to_abbr(o["name"]) == home_abbr and home_ml is None: home_ml = o.get("price")
+                            if to_abbr(o["name"]) == away_abbr and away_ml is None: away_ml = o.get("price")
 
         sim = run_monte_carlo(models, features, N_SIMS, market_spread, market_total)
 
@@ -271,12 +277,13 @@ else:
         edges = {}
         if market_home_prob:
             ml_edge = sim["home_win_prob"] - market_home_prob
-            edges[f"Moneyline ({home_full} {home_ml:+d})"] = ml_edge if ml_edge > 0 else (sim["home_win_prob"] - 1 + market_away_prob)
+            ml_label = f"Moneyline ({home_abbr} {int(home_ml):+d})" if home_ml is not None else f"Moneyline ({home_abbr})"
+            edges[ml_label] = ml_edge if ml_edge > 0 else (sim["home_win_prob"] - 1 + market_away_prob)
             
-        if sim["cover_prob"] is not None:
-            edges[f"Spread ({home_full} {market_spread:+.1f})"] = sim["cover_prob"] - 0.524  # Standard -110 breakeven
+        if sim["cover_prob"] is not None and market_spread is not None:
+            edges[f"Spread ({home_abbr} {market_spread:+.1f})"] = sim["cover_prob"] - 0.524  # Standard -110 breakeven
             
-        if sim["over_prob"] is not None:
+        if sim["over_prob"] is not None and market_total is not None:
             edges[f"Total Over {market_total}"] = sim["over_prob"] - 0.524
             edges[f"Total Under {market_total}"] = sim["under_prob"] - 0.524
 
@@ -288,9 +295,9 @@ else:
 
         table_rows.append({
             "Date": str(row.get("gameday", ""))[:10],
-            "Matchup": f"{away_full} @ {home_full}",
-            "Model Win Prob": f"{sim['home_win_prob']*100:.1f}% ({home})",
-            "Market Lines (Spd / Tot / ML)": f"{market_spread if market_spread else '—'} | {market_total if market_total else '—'} | {home_ml if home_ml else '—'}",
+            "Matchup": f"{away_abbr} @ {home_abbr}",
+            "Model Win Prob": f"{sim['home_win_prob']*100:.1f}% ({home_abbr})",
+            "Market Lines (Spd / Tot / ML)": f"{market_spread if market_spread is not None else '—'} | {market_total if market_total is not None else '—'} | {home_ml if home_ml is not None else '—'}",
             "Best Edge Market": best_bet,
             "Edge Value": f"{best_edge_val*100:+.1f}%" if edges else "—",
             "_sort": abs(best_edge_val)
