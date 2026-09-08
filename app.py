@@ -49,10 +49,14 @@ def to_abbr(name):
 def normalize_team(abbr):
     return TEAM_ALIAS.get(abbr, abbr)
 
-def get_current_nfl_season():
-    today = datetime.now()
-    season = today.year - 1 if today.month < 3 else today.year
-    return min(season, today.year)
+def get_max_nfl_season():
+    """Dynamically get maximum season allowed by nflreadpy."""
+    try:
+        from nflreadpy.helpers import get_current_season
+        return int(get_current_season())
+    except Exception:
+        today = datetime.now()
+        return today.year - 1 if today.month < 3 else today.year
 
 def american_to_prob(odds):
     try:
@@ -75,8 +79,8 @@ def season_weight(season, current_season, half_life):
 # =========================================================
 @st.cache_data(ttl=3600 * 6)
 def load_data(years_back, current_season):
-    max_valid_season = datetime.now().year
-    end_season = min(current_season, max_valid_season)
+    max_allowed = get_max_nfl_season()
+    end_season = min(current_season, max_allowed)
     start_season = max(1999, end_season - years_back + 1)
     
     seasons = list(range(start_season, end_season + 1))
@@ -87,17 +91,27 @@ def load_data(years_back, current_season):
     sched["home_team"] = sched["home_team"].apply(normalize_team)
     sched["away_team"] = sched["away_team"].apply(normalize_team)
 
-    # Load Play-by-Play for EPA
-    pbp = nfl.load_pbp(seasons=seasons)
-    pbp = pbp.to_pandas() if hasattr(pbp, "to_pandas") else pbp
-    pbp = pbp[
-        (pbp["play_type"].isin(["pass", "run"])) &
-        (pbp["epa"].notna()) &
-        (pbp["posteam"].notna()) &
-        (pbp["defteam"].notna())
-    ].copy()
-    pbp["posteam"] = pbp["posteam"].apply(normalize_team)
-    pbp["defteam"] = pbp["defteam"].apply(normalize_team)
+    # Load Play-by-Play safely with year fallback
+    pbp = None
+    while seasons and pbp is None:
+        try:
+            pbp = nfl.load_pbp(seasons=seasons)
+        except ValueError:
+            # Drop the latest season if nflreadpy has not published data for it yet
+            seasons.pop()
+
+    if pbp is None:
+        pbp = pd.DataFrame()
+    else:
+        pbp = pbp.to_pandas() if hasattr(pbp, "to_pandas") else pbp
+        pbp = pbp[
+            (pbp["play_type"].isin(["pass", "run"])) &
+            (pbp["epa"].notna()) &
+            (pbp["posteam"].notna()) &
+            (pbp["defteam"].notna())
+        ].copy()
+        pbp["posteam"] = pbp["posteam"].apply(normalize_team)
+        pbp["defteam"] = pbp["defteam"].apply(normalize_team)
 
     return sched, pbp
 
@@ -212,7 +226,7 @@ def run_monte_carlo(models, features, n_sims, spread, total):
 # =========================================================
 # MAIN APP EXECUTION
 # =========================================================
-current_season = get_current_nfl_season()
+current_season = get_max_nfl_season()
 
 with st.spinner("Processing stats, power ratings, and historical simulations..."):
     schedules, pbp = load_data(LOOKBACK_YEARS, current_season)
