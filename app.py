@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 import warnings
 warnings.filterwarnings("ignore")
@@ -42,6 +42,18 @@ TEAM_NAME_TO_ABBR = {
     "Washington Football Team": "WAS", "Oakland Raiders": "LV",
     "San Diego Chargers": "LAC", "St. Louis Rams": "LA",
 }
+# Reverse map for display names
+ABBR_TO_FULL = {v: k for k, v in TEAM_NAME_TO_ABBR.items() if k not in (
+    "Washington Football Team", "Oakland Raiders", "San Diego Chargers", "St. Louis Rams"
+)}
+# Prefer modern names
+ABBR_TO_FULL.update({
+    "WAS": "Washington Commanders",
+    "LV": "Las Vegas Raiders",
+    "LAC": "Los Angeles Chargers",
+    "LA": "Los Angeles Rams",
+})
+
 STADIUM_COORDS = {
     "ARI": (33.5275, -112.2625), "ATL": (33.7554, -84.4010), "BAL": (39.2780, -76.6227),
     "BUF": (42.7738, -78.7870), "CAR": (35.2258, -80.8528), "CHI": (41.8623, -87.6167),
@@ -90,6 +102,9 @@ def to_abbr(name: str) -> Optional[str]:
         return name
     return None
 
+def full_name(abbr: str) -> str:
+    return ABBR_TO_FULL.get(abbr, abbr)
+
 
 def format_kickoff(commence_raw: str) -> str:
     """
@@ -100,17 +115,32 @@ def format_kickoff(commence_raw: str) -> str:
         return ""
     try:
         ts = pd.to_datetime(commence_raw, utc=True)
-        # Prefer zoneinfo; fall back to fixed -4/-5 if unavailable
         try:
             from zoneinfo import ZoneInfo
             ts_et = ts.tz_convert(ZoneInfo("America/New_York"))
         except Exception:
-            # Rough EDT offset (season is mostly EDT Sep–Oct)
             ts_et = ts.tz_convert(None) - pd.Timedelta(hours=4)
             return ts_et.strftime("%Y-%m-%d %H:%M ET")
         return ts_et.strftime("%Y-%m-%d %H:%M ET")
     except Exception:
         return (commence_raw[:16].replace("T", " ") if len(commence_raw) >= 16 else commence_raw)
+
+
+def format_schedule_kickoff(gameday: str, gametime: Optional[str]) -> str:
+    """Build display kickoff from schedule gameday + gametime (local ET style)."""
+    if not gameday:
+        return ""
+    gd = str(gameday)[:10]
+    gt = (str(gametime).strip() if gametime and str(gametime) not in ("None", "nan") else "")
+    if gt:
+        # gametime is usually "13:00" or "20:15" in Eastern
+        try:
+            hh, mm = gt.split(":")[:2]
+            return f"{gd} {int(hh):02d}:{mm} ET"
+        except Exception:
+            return f"{gd} {gt} ET"
+    return f"{gd} ET"
+
 
 def is_divisional(home: str, away: str) -> bool:
     return TEAM_TO_DIV.get(home) == TEAM_TO_DIV.get(away) and home in TEAM_TO_DIV
@@ -188,16 +218,13 @@ def get_team_pace(seasons: Optional[List[int]] = None) -> pd.DataFrame:
             pbp = pbp.to_pandas()
         if pbp is None or pbp.empty:
             return pd.DataFrame()
-        # Count offensive plays per team per game
         plays = pbp[
             (pbp["play_type"].isin(["pass", "run"])) &
             (pbp["posteam"].notna())
         ].copy()
         if plays.empty:
             return pd.DataFrame()
-        # Group by game_id + posteam
         g = plays.groupby(["game_id", "posteam"]).size().reset_index(name="off_plays")
-        # Average plays per game (offense)
         pace = g.groupby("posteam")["off_plays"].mean().reset_index()
         pace.columns = ["team", "plays_per_game"]
         return pace.set_index("team")
@@ -219,7 +246,6 @@ def get_recent_form(seasons: Optional[List[int]] = None, n_games: int = 6) -> Di
             sched = sched.to_pandas()
         if sched is None or sched.empty:
             return {}
-        # Completed games only
         completed = sched[
             sched["result"].notna() &
             sched["home_score"].notna() &
@@ -229,7 +255,6 @@ def get_recent_form(seasons: Optional[List[int]] = None, n_games: int = 6) -> Di
             return {}
         completed["gameday"] = pd.to_datetime(completed["gameday"])
         completed = completed.sort_values("gameday")
-        # Also need EPA if possible – fallback to margin only if EPA unavailable
         epa_df = get_team_epa(seasons)
         form = {}
         all_teams = set(completed["home_team"].unique()) | set(completed["away_team"].unique())
@@ -246,11 +271,9 @@ def get_recent_form(seasons: Optional[List[int]] = None, n_games: int = 6) -> Di
                 else:
                     margin = float(row["away_score"]) - float(row["home_score"])
                 margins.append(margin)
-                # Approximate recent EPA differential if available
                 if not epa_df.empty and team in epa_df.index:
                     opp = row["away_team"] if row["home_team"] == team else row["home_team"]
                     if opp in epa_df.index:
-                        # crude: team's off EPA vs opp def EPA
                         team_off = float(epa_df.loc[team, "off_epa"])
                         opp_def = float(epa_df.loc[opp, "def_epa"])
                         epas.append(team_off - opp_def)
@@ -268,6 +291,7 @@ def load_schedules(seasons: Optional[List[int]] = None) -> pd.DataFrame:
     try:
         if seasons is None:
             current = int(nfl.get_current_season())
+            # Prefer current + previous so early-season form / EPA still work
             seasons = list(range(current - 3, current + 1))
         sched = nfl.load_schedules(seasons=seasons)
         if hasattr(sched, "to_pandas"):
@@ -275,6 +299,7 @@ def load_schedules(seasons: Optional[List[int]] = None) -> pd.DataFrame:
         return sched if isinstance(sched, pd.DataFrame) else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
+
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_nfl_odds(api_key: str) -> Tuple[Optional[List], str]:
@@ -379,8 +404,6 @@ def estimate_week_from_date(game_date: str) -> Optional[int]:
     NFL weeks run roughly Thursday → following Wednesday (MNF included).
     Week 1 anchor = first Thursday on/after Sept 4 of the season year.
     Games 1–3 days before that Thursday (Wed openers) still count as Week 1.
-    Example 2026: Thu Sep 10 is Week 1 anchor → Mon Sep 14/15 MNF is still Week 1;
-    Week 2 starts Thu Sep 17.
     """
     try:
         target = pd.to_datetime(str(game_date)[:10], errors="coerce")
@@ -389,19 +412,16 @@ def estimate_week_from_date(game_date: str) -> Optional[int]:
         target = pd.Timestamp(year=target.year, month=target.month, day=target.day)
         year = target.year if target.month >= 3 else target.year - 1
 
-        # First Thursday on or after Sept 4
         week1_thu = pd.Timestamp(year=year, month=9, day=4)
         while week1_thu.weekday() != 3:  # Thursday = 3
             week1_thu += pd.Timedelta(days=1)
 
-        # Allow Wed (and early) openers up to 3 days before Week 1 Thursday
         if target < week1_thu - pd.Timedelta(days=3):
             if target < week1_thu - pd.Timedelta(days=10):
                 return None
             return 1
 
         days_since_thu = (target - week1_thu).days
-        # Thu=0 .. Wed=6 → same week; next Thu=7 → next week
         week = days_since_thu // 7 + 1
         if week < 1:
             return 1
@@ -417,9 +437,8 @@ def get_week(schedules: pd.DataFrame, home: str, away: str, game_date: str) -> O
 
     Priority:
       1) Current-season schedule match within ±2 days of kickoff (home/away + aliases)
-      2) Calendar estimate from kickoff date (reliable for regular season)
+      2) Calendar estimate from kickoff date
       3) If schedule week and estimate disagree by >= 1, prefer the estimate
-         (avoids historical / wrong-week schedule rows polluting Week 1)
     """
     est = estimate_week_from_date(game_date)
     try:
@@ -459,18 +478,15 @@ def get_week(schedules: pd.DataFrame, home: str, away: str, game_date: str) -> O
                 w = tmp.iloc[0]["week"]
                 return int(w) if pd.notna(w) else None
 
-            # Exact matchup, tight date window only
             mask = sched["home_team"].isin(home_set) & sched["away_team"].isin(away_set)
             sched_week = _week_if_close(sched.loc[mask], max_days=2)
             if sched_week is None:
                 mask_flip = sched["home_team"].isin(away_set) & sched["away_team"].isin(home_set)
                 sched_week = _week_if_close(sched.loc[mask_flip], max_days=2)
 
-        # Prefer schedule only when it agrees with the calendar estimate (or estimate missing)
         if sched_week is not None and est is not None:
             if sched_week == est:
                 return sched_week
-            # Disagreement → trust kickoff date (fixes mislabeled Week 1/2 games)
             return est
         if sched_week is not None:
             return sched_week
@@ -484,11 +500,165 @@ def implied_team_totals(spread: float, total: float) -> Tuple[float, float]:
     spread = home team line (negative if home favorite).
     Returns (home_implied, away_implied).
     """
-    # Standard: home_implied = (total - spread) / 2
-    # away_implied = (total + spread) / 2
     home_imp = (total - spread) / 2.0
     away_imp = (total + spread) / 2.0
     return home_imp, away_imp
+
+
+# -----------------------------
+# BUILD MASTER GAME LIST FROM SCHEDULE (source of truth for weeks / dates)
+# -----------------------------
+def build_upcoming_games(schedules: pd.DataFrame, odds_data: Optional[List], days_ahead: int = 45) -> List[Dict]:
+    """
+    Return a list of upcoming REG games driven by the official schedule.
+    Each entry has correct week, gameday, gametime, and optional odds overlay.
+    This guarantees every week shows every game (e.g. Week 3 NE @ JAX).
+    """
+    games = []
+    if schedules is None or schedules.empty:
+        return games
+
+    try:
+        current = int(nfl.get_current_season())
+    except Exception:
+        current = datetime.now().year if datetime.now().month >= 8 else datetime.now().year - 1
+
+    sched = schedules.copy()
+    if "season" in sched.columns:
+        sched = sched[sched["season"] == current]
+    if "game_type" in sched.columns:
+        sched = sched[sched["game_type"] == "REG"]
+
+    today = pd.Timestamp.now().normalize()
+    cutoff = today + pd.Timedelta(days=days_ahead)
+
+    # Only future / today games that still have no final result
+    if "gameday" in sched.columns:
+        sched["_gd"] = pd.to_datetime(sched["gameday"], errors="coerce")
+        sched = sched[sched["_gd"].notna()]
+        # Keep games from a couple days ago (in case of late-night) through cutoff
+        sched = sched[(sched["_gd"] >= today - pd.Timedelta(days=2)) & (sched["_gd"] <= cutoff)]
+    if "result" in sched.columns:
+        # Keep unplayed games (result is null)
+        sched = sched[sched["result"].isna()]
+
+    # Index odds by (home_abbr, away_abbr) and by commence date for matching
+    odds_by_matchup: Dict[Tuple[str, str], Dict] = {}
+    odds_by_date_teams: Dict[Tuple[str, str, str], Dict] = {}
+    if odds_data:
+        for ev in odds_data:
+            h = to_abbr(ev.get("home_team", ""))
+            a = to_abbr(ev.get("away_team", ""))
+            if not h or not a:
+                continue
+            commence = (ev.get("commence_time") or "")[:10]
+            odds_by_matchup[(h, a)] = ev
+            if commence:
+                odds_by_date_teams[(commence, h, a)] = ev
+
+    for _, row in sched.iterrows():
+        home = str(row.get("home_team", "")).strip()
+        away = str(row.get("away_team", "")).strip()
+        if not home or not away:
+            continue
+        # Normalize aliases
+        if home in ("LAR", "STL"):
+            home = "LA"
+        if away in ("LAR", "STL"):
+            away = "LA"
+        if home in ("WSH", "WFT"):
+            home = "WAS"
+        if away in ("WSH", "WFT"):
+            away = "WAS"
+        if home == "JAC":
+            home = "JAX"
+        if away == "JAC":
+            away = "JAX"
+
+        gameday = str(row.get("gameday", ""))[:10]
+        gametime = row.get("gametime")
+        week = row.get("week")
+        try:
+            week = int(week) if pd.notna(week) else None
+        except Exception:
+            week = None
+        roof = str(row.get("roof", "outdoors") or "outdoors").lower().strip()
+
+        # Match odds: prefer exact date + teams, else just teams
+        odds_ev = None
+        if gameday:
+            odds_ev = odds_by_date_teams.get((gameday, home, away))
+        if odds_ev is None:
+            odds_ev = odds_by_matchup.get((home, away))
+
+        commence_raw = ""
+        if odds_ev:
+            commence_raw = odds_ev.get("commence_time") or ""
+
+        # Kickoff display: prefer schedule time (authoritative), fall back to odds
+        if gametime and str(gametime) not in ("None", "nan", ""):
+            kickoff = format_schedule_kickoff(gameday, gametime)
+        elif commence_raw:
+            kickoff = format_kickoff(commence_raw)
+        else:
+            kickoff = format_schedule_kickoff(gameday, None)
+
+        # Spreads / totals from odds if present, else schedule lines if available
+        avg_spread = None
+        avg_total = None
+        if odds_ev:
+            spreads, totals = [], []
+            home_full = odds_ev.get("home_team", full_name(home))
+            for book in odds_ev.get("bookmakers", []):
+                for market in book.get("markets", []):
+                    if market.get("key") == "spreads":
+                        for o in market.get("outcomes", []):
+                            if o.get("name") == home_full:
+                                spreads.append(o.get("point"))
+                    elif market.get("key") == "totals":
+                        for o in market.get("outcomes", []):
+                            if o.get("name") == "Over":
+                                totals.append(o.get("point"))
+            if spreads:
+                avg_spread = float(np.mean(spreads))
+            if totals:
+                avg_total = float(np.mean(totals))
+
+        if avg_spread is None and pd.notna(row.get("spread_line")):
+            try:
+                avg_spread = float(row["spread_line"])
+            except Exception:
+                pass
+        if avg_total is None and pd.notna(row.get("total_line")):
+            try:
+                avg_total = float(row["total_line"])
+            except Exception:
+                pass
+        if avg_total is None:
+            avg_total = 45.0
+
+        games.append({
+            "week": week,
+            "gameday": gameday,
+            "gametime": gametime,
+            "kickoff": kickoff,
+            "home": home,
+            "away": away,
+            "home_full": full_name(home),
+            "away_full": full_name(away),
+            "roof": roof,
+            "avg_spread": avg_spread,
+            "avg_total": avg_total,
+            "odds_event": odds_ev,
+            "commence_raw": commence_raw or (f"{gameday}T{(gametime or '17:00')}:00Z" if gameday else ""),
+            "game_id": row.get("game_id"),
+        })
+
+    # Sort by date then time
+    games.sort(key=lambda g: (g.get("gameday") or "", str(g.get("gametime") or "")))
+    return games
+
+
 # -----------------------------
 # WEATHER
 # -----------------------------
@@ -555,25 +725,24 @@ def make_weather_key(home: str, commence_raw: str) -> str:
         return f"{home}_{commence_raw[:10]}"
     return f"{home}_{datetime.now().strftime('%Y-%m-%d')}"
 
-def build_weather_cache(odds_data: List, schedules: pd.DataFrame) -> Dict[str, Dict]:
+def build_weather_cache_from_games(games: List[Dict]) -> Dict[str, Dict]:
     cache = {}
     real_count = 0
     fallback_count = 0
     samples = []
-    if not odds_data:
+    if not games:
         return cache
     progress = st.progress(0, text="Fetching unique weather for each outdoor stadium...")
-    total = len(odds_data)
-    for idx, game in enumerate(odds_data):
+    total = len(games)
+    for idx, g in enumerate(games):
         try:
-            home_full = game.get("home_team")
-            home = to_abbr(home_full)
+            home = g["home"]
             if not home or home not in STADIUM_COORDS:
                 continue
-            commence_raw = game.get("commence_time") or ""
-            game_date = commence_raw[:10] if len(commence_raw) >= 10 else datetime.now().strftime("%Y-%m-%d")
-            roof = get_roof(schedules, home, game_date)
-            key = make_weather_key(home, commence_raw)
+            commence_raw = g.get("commence_raw") or ""
+            game_date = g.get("gameday") or (commence_raw[:10] if len(commence_raw) >= 10 else datetime.now().strftime("%Y-%m-%d"))
+            roof = g.get("roof") or "outdoors"
+            key = make_weather_key(home, commence_raw or game_date)
             if roof in ("dome", "closed"):
                 cache[key] = {
                     "temp_f": 72.0, "wind_mph": 0.0, "precip_prob": 0.0,
@@ -742,7 +911,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # ========== TAB 1 ==========
 with tab1:
     st.subheader("Ranked Opportunities")
-    with st.spinner("Loading EPA, Pace, Form, Odds and unique weather..."):
+    with st.spinner("Loading EPA, Pace, Form, Schedule, Odds and unique weather..."):
         team_epa = get_team_epa()
         team_pace = get_team_pace()
         recent_form = get_recent_form(n_games=form_window)
@@ -751,12 +920,15 @@ with tab1:
         try:
             current_season = int(nfl.get_current_season())
         except Exception:
-            current_season = 2025
+            current_season = datetime.now().year if datetime.now().month >= 8 else datetime.now().year - 1
         model_bundle = train_ats_model(list(range(current_season - 4, current_season)))
-        weather_cache = build_weather_cache(odds_data or [], schedules)
+        # Source of truth: schedule-driven game list (includes every week 1–18 game)
+        upcoming = build_upcoming_games(schedules, odds_data, days_ahead=60)
+        weather_cache = build_weather_cache_from_games(upcoming)
+
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("EPA teams", 0 if team_epa.empty else len(team_epa))
-    c2.metric("Odds events", 0 if not odds_data else len(odds_data))
+    c2.metric("Schedule games", len(upcoming))
     c3.metric("Model", "Ready" if model_bundle else "Missing")
     c4.metric("Weather keys", len(weather_cache))
     c5.metric("Form teams", len(recent_form))
@@ -769,80 +941,60 @@ with tab1:
         if debug.get("samples"):
             st.caption("Sample real weather (should differ by stadium):")
             st.dataframe(pd.DataFrame(debug["samples"]), use_container_width=True, hide_index=True)
-    st.caption(odds_status)
+    st.caption(odds_status + f" · Schedule provides full slate ({len(upcoming)} upcoming games)")
     opportunities = []
     skipped = []
-    if odds_data and not team_epa.empty:
+    if upcoming and not team_epa.empty:
         model = model_bundle[0] if model_bundle else None
         feature_cols = model_bundle[1] if model_bundle else None
         league_avg_pace = float(team_pace["plays_per_game"].mean()) if not team_pace.empty else 65.0
-        for game in odds_data:
+        for g in upcoming:
             try:
-                home_full = game.get("home_team", "")
-                away_full = game.get("away_team", "")
-                home = to_abbr(home_full)
-                away = to_abbr(away_full)
-                if not home or not away:
-                    skipped.append(f"Unmapped: {away_full} @ {home_full}")
-                    continue
+                home = g["home"]
+                away = g["away"]
+                home_full = g["home_full"]
+                away_full = g["away_full"]
                 if home not in team_epa.index or away not in team_epa.index:
                     skipped.append(f"No EPA for {away} @ {home}")
                     continue
-                commence_raw = game.get("commence_time") or ""
-                commence = format_kickoff(commence_raw) if commence_raw else ""
-                game_date = commence[:10] if commence else datetime.now().strftime("%Y-%m-%d")
-                roof = get_roof(schedules, home, game_date)
-                wx_key = make_weather_key(home, commence_raw)
+                commence_raw = g.get("commence_raw") or ""
+                commence = g.get("kickoff") or ""
+                game_date = g.get("gameday") or (commence[:10] if commence else datetime.now().strftime("%Y-%m-%d"))
+                roof = g.get("roof") or "outdoors"
+                wx_key = make_weather_key(home, commence_raw or game_date)
                 weather = weather_cache.get(wx_key) or {
                     "temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0,
                     "roof": roof, "source": "missing"
                 }
                 wx_adj = weather_adjustments(roof, weather)
-                spreads, totals = [], []
-                for book in game.get("bookmakers", []):
-                    for market in book.get("markets", []):
-                        if market.get("key") == "spreads":
-                            for o in market.get("outcomes", []):
-                                if o.get("name") == home_full:
-                                    spreads.append(o.get("point"))
-                        elif market.get("key") == "totals":
-                            for o in market.get("outcomes", []):
-                                if o.get("name") == "Over":
-                                    totals.append(o.get("point"))
-                avg_spread = float(np.mean(spreads)) if spreads else None
-                avg_total = float(np.mean(totals)) if totals else 45.0
+                avg_spread = g.get("avg_spread")
+                avg_total = g.get("avg_total") if g.get("avg_total") is not None else 45.0
+
                 home_off = float(team_epa.loc[home, "off_epa"])
                 home_def = float(team_epa.loc[home, "def_epa"])
                 away_off = float(team_epa.loc[away, "off_epa"])
                 away_def = float(team_epa.loc[away, "def_epa"])
                 epa_edge = (home_off - away_def) - (away_off - home_def)
                 rest_diff = get_rest_days(schedules, home, game_date) - get_rest_days(schedules, away, game_date)
-                # ---- NEW SIGNALS ----
-                # 1. Implied Team Totals
+                # ---- SIGNALS ----
                 if avg_spread is not None:
                     home_imp, away_imp = implied_team_totals(avg_spread, avg_total)
                 else:
                     home_imp, away_imp = avg_total / 2, avg_total / 2
-                # 2. Recent Form
                 home_form = recent_form.get(home, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
                 away_form = recent_form.get(away, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
                 form_margin_diff = home_form["form_margin"] - away_form["form_margin"]
                 form_epa_diff = home_form["form_epa"] - away_form["form_epa"]
-                # 3. Pace
                 home_pace = float(team_pace.loc[home, "plays_per_game"]) if (not team_pace.empty and home in team_pace.index) else league_avg_pace
                 away_pace = float(team_pace.loc[away, "plays_per_game"]) if (not team_pace.empty and away in team_pace.index) else league_avg_pace
                 combined_pace = (home_pace + away_pace) / 2.0
                 pace_vs_avg = combined_pace - league_avg_pace
-                # Pace adjustment to total: ~0.4 pts per extra play above average
                 pace_adj = pace_vs_avg * 0.35
-                # 4. Travel / Time-zone
                 tz_diff = timezone_diff(home, away)
                 travel_dir = travel_direction(home, away)
-                # 5. Divisional
                 div_flag = is_divisional(home, away)
                 signals = []
                 rule_score = 0.0
-                # Existing EPA / spread / rest / weather signals
                 if epa_edge > 0.08:
                     signals.append(f"Home EPA +{epa_edge:.3f}"); rule_score += 2.2
                 elif epa_edge < -0.08:
@@ -859,7 +1011,6 @@ with tab1:
                     signals.append(f"Away rest {rest_diff}d"); rule_score += 1.0
                 if wx_adj["rule_pts"] > 0:
                     signals.append(wx_adj["label"]); rule_score += wx_adj["rule_pts"]
-                # NEW: Implied Team Totals signals (high value)
                 if home_imp >= 27.5:
                     signals.append(f"High Home Imp {home_imp:.1f}"); rule_score += 1.5
                 elif home_imp <= 17.5:
@@ -868,11 +1019,8 @@ with tab1:
                     signals.append(f"High Away Imp {away_imp:.1f}"); rule_score += 1.4
                 elif away_imp <= 17.5:
                     signals.append(f"Low Away Imp {away_imp:.1f}"); rule_score += 1.1
-                # Implied total vs market total mismatch (value for totals)
-                model_total_est = home_imp + away_imp  # should equal avg_total, but used for framing
                 if avg_total >= 48 and (home_imp + away_imp) < 46:
                     signals.append("Implied soft total"); rule_score += 0.8
-                # NEW: Recent Form
                 if form_margin_diff >= 7:
                     signals.append(f"Home form +{form_margin_diff:.1f}"); rule_score += 1.6
                 elif form_margin_diff <= -7:
@@ -881,12 +1029,10 @@ with tab1:
                     signals.append(f"Home form EPA +{form_epa_diff:.3f}"); rule_score += 1.3
                 elif form_epa_diff < -0.12:
                     signals.append(f"Away form EPA {form_epa_diff:.3f}"); rule_score += 1.2
-                # NEW: Pace
                 if pace_vs_avg >= 4.0:
                     signals.append(f"Fast pace +{pace_vs_avg:.1f}"); rule_score += 1.0
                 elif pace_vs_avg <= -4.0:
                     signals.append(f"Slow pace {pace_vs_avg:.1f}"); rule_score += 0.9
-                # NEW: Travel / TZ
                 if tz_diff >= 3:
                     if travel_dir == "Westbound":
                         signals.append(f"Away TZ -{tz_diff}h West"); rule_score += 1.1
@@ -894,11 +1040,9 @@ with tab1:
                         signals.append(f"Away TZ -{tz_diff}h East"); rule_score += 0.9
                 elif tz_diff == 2:
                     signals.append(f"Away TZ -{tz_diff}h"); rule_score += 0.5
-                # NEW: Divisional
                 if div_flag:
                     signals.append("Divisional"); rule_score += 0.7
-                # Form adjustment for Monte Carlo (scaled)
-                form_margin_adj = form_margin_diff * 0.15  # soft contribution
+                form_margin_adj = form_margin_diff * 0.15
                 ml_home = 0.5
                 if model is not None and avg_spread is not None and feature_cols is not None:
                     feat = pd.DataFrame([{
@@ -933,14 +1077,15 @@ with tab1:
                     rec = "Lean Under"
                 else:
                     rec = "No strong lean"
-                # Clearer weather display
                 if roof in ("dome", "closed"):
                     wx_str = "Dome"
                 else:
                     wx_str = (f"{weather.get('temp_f', 70):.0f}°F / "
                               f"{weather.get('wind_mph', 5):.0f} mph / "
                               f"{weather.get('precip_prob', 10):.0f}%")
-                week_num = get_week(schedules, home, away, game_date)
+                week_num = g.get("week")
+                if week_num is None:
+                    week_num = get_week(schedules, home, away, game_date)
                 if signals or total_score > 2.0:
                     opportunities.append({
                         "Week": week_num if week_num is not None else "—",
@@ -983,7 +1128,6 @@ with tab1:
                     key="opp_min_score",
                 )
             with f2:
-                # Map friendly labels to substrings in Recommendation
                 rec_options = {
                     "Home ATS": "Lean Home ATS",
                     "Away ATS": "Lean Away ATS",
@@ -1008,7 +1152,6 @@ with tab1:
                     key="opp_week_filter",
                 )
 
-            # Apply filters
             filtered = df[df["Score"] >= min_score].copy()
             if selected_recs:
                 allowed = {rec_options[r] for r in selected_recs if r in rec_options}
@@ -1026,7 +1169,6 @@ with tab1:
                 + (f", Week filter: {selected_week_filter}" if selected_week_filter != "All weeks" else "")
                 + ")"
             )
-            # Drop helper col before display
             display_df = filtered.drop(columns=["_Week_num"], errors="ignore")
             st.dataframe(display_df, use_container_width=True, hide_index=True)
 
@@ -1035,7 +1177,7 @@ with tab1:
             st.subheader("🏆 Top 5 Signaled Games by Week")
             st.caption(
                 "Select a week from the dropdown to see its 5 highest-Score opportunities. "
-                "Only weeks present in the current odds feed are listed."
+                "Every scheduled game for that week is considered (schedule is source of truth)."
             )
             df_week = df.copy()
             df_week["Week_num"] = pd.to_numeric(df_week["Week"], errors="coerce")
@@ -1047,7 +1189,6 @@ with tab1:
             if not df_known.empty:
                 weeks_sorted = sorted(df_known["Week_num"].unique())
                 week_labels = {int(w): f"Week {int(w)}" for w in weeks_sorted}
-                # Default to the earliest upcoming week
                 default_idx = 0
                 selected_label = st.selectbox(
                     "Select week",
@@ -1055,7 +1196,6 @@ with tab1:
                     index=default_idx,
                     key="top5_week_select",
                 )
-                # Map label back to week number
                 selected_week = next(
                     int(w) for w, lab in week_labels.items() if lab == selected_label
                 )
@@ -1076,9 +1216,8 @@ with tab1:
                 cols = [c for c in display_cols if c in top5.columns]
                 st.dataframe(top5[cols], use_container_width=True, hide_index=True)
 
-            # Quick summary of top signals
             st.markdown("#### Top Signal Summary")
-            st.caption("Implied Team Totals, Recent Form, Pace, Travel/TZ and Divisional are now folded into Score + Signals.")
+            st.caption("Implied Team Totals, Recent Form, Pace, Travel/TZ and Divisional are folded into Score + Signals. Schedule is the source of truth for weeks and kickoff times.")
         else:
             st.warning("No opportunities matched the filters.")
             if skipped:
@@ -1086,61 +1225,69 @@ with tab1:
                     for s in skipped:
                         st.text(s)
     else:
-        if not api_key:
-            st.info("Enter your The Odds API key in the sidebar.")
-        elif not odds_data:
-            st.error(f"Could not load odds: {odds_status}")
+        if not api_key and not upcoming:
+            st.info("Enter your The Odds API key in the sidebar (optional for odds) and ensure nflreadpy schedule data is available.")
+        elif not upcoming:
+            st.error("Could not load upcoming games from schedule.")
         else:
             st.error("Could not load EPA data.")
+
 # ========== TAB 2 ==========
 with tab2:
-    st.subheader("Upcoming Games")
-    if odds_data:
+    st.subheader("Upcoming Games (full schedule)")
+    st.caption("All regular-season games from the official schedule. Odds columns fill in when The Odds API has the event.")
+    if upcoming:
         rows = []
-        for g in odds_data:
-            home = g.get("home_team", "")
-            away = g.get("away_team", "")
-            commence = format_kickoff(g.get("commence_time") or "")
-            spread = total = "—"
-            books = g.get("bookmakers") or []
-            if books:
-                for m in books[0].get("markets", []):
-                    if m.get("key") == "spreads":
-                        for o in m.get("outcomes", []):
-                            if o.get("name") == home:
-                                spread = f"{o.get('point', 0):+.1f}"
-                    if m.get("key") == "totals":
-                        for o in m.get("outcomes", []):
-                            if o.get("name") == "Over":
-                                total = f"{o.get('point', 0):.1f}"
-            # Add implied + divisional for richer view
-            home_a = to_abbr(home)
-            away_a = to_abbr(away)
+        for g in upcoming:
+            spread = f"{g['avg_spread']:+.1f}" if g.get("avg_spread") is not None else "—"
+            total = f"{g['avg_total']:.1f}" if g.get("avg_total") is not None else "—"
+            home_a, away_a = g["home"], g["away"]
             imp_h = imp_a = "—"
-            if spread != "—" and total != "—":
+            if g.get("avg_spread") is not None and g.get("avg_total") is not None:
                 try:
-                    s = float(spread)
-                    t = float(total)
-                    ih, ia = implied_team_totals(s, t)
+                    ih, ia = implied_team_totals(g["avg_spread"], g["avg_total"])
                     imp_h, imp_a = f"{ih:.1f}", f"{ia:.1f}"
                 except Exception:
                     pass
-            div = "Yes" if (home_a and away_a and is_divisional(home_a, away_a)) else "No"
+            div = "Yes" if is_divisional(home_a, away_a) else "No"
             rows.append({
-                "Away": away, "Home": home, "Kickoff": commence,
-                "Spread": spread, "Total": total,
-                "Home Imp": imp_h, "Away Imp": imp_a, "Divisional": div
+                "Week": g.get("week") if g.get("week") is not None else "—",
+                "Away": g["away_full"],
+                "Home": g["home_full"],
+                "Kickoff": g.get("kickoff") or "",
+                "Spread": spread,
+                "Total": total,
+                "Home Imp": imp_h,
+                "Away Imp": imp_a,
+                "Divisional": div,
+                "Roof": (g.get("roof") or "").title(),
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        games_df = pd.DataFrame(rows)
+        # Week filter for this tab
+        weeks_present = sorted([w for w in games_df["Week"].unique() if w != "—"])
+        week_filter = st.selectbox(
+            "Filter by week",
+            options=["All weeks"] + [f"Week {w}" for w in weeks_present],
+            key="tab2_week_filter",
+        )
+        if week_filter != "All weeks":
+            try:
+                wk = int(week_filter.replace("Week ", ""))
+                games_df = games_df[games_df["Week"] == wk]
+            except Exception:
+                pass
+        st.dataframe(games_df, use_container_width=True, hide_index=True)
+        st.caption(f"{len(games_df)} games shown · Week numbers and times come from the official NFL schedule.")
     else:
-        st.info(odds_status if api_key else "Enter API key")
+        st.info(odds_status if api_key else "Schedule data unavailable or no upcoming games found.")
+
 # ========== TAB 3 ==========
 with tab3:
     st.subheader("Player Props")
     if not api_key:
         st.warning("Enter API key first.")
     elif not odds_data:
-        st.info("No games available.")
+        st.info("No games with live odds available.")
     else:
         options = {f"{g.get('away_team')} @ {g.get('home_team')}": g.get("id") for g in odds_data}
         selected = st.selectbox("Select game", list(options.keys()))
@@ -1169,6 +1316,7 @@ with tab3:
                     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
                 else:
                     st.warning("No props returned.")
+
 # ========== TAB 4 ==========
 with tab4:
     st.subheader("Simple Backtest")
@@ -1221,4 +1369,3 @@ with tab4:
                         st.warning("No games met the filters.")
             except Exception as e:
                 st.error(f"Backtest error: {e}")
-
