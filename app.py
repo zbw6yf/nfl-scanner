@@ -329,6 +329,32 @@ def get_roof(schedules: pd.DataFrame, home: str, game_date: str) -> str:
         pass
     return "outdoors"
 
+def get_week(schedules: pd.DataFrame, home: str, away: str, game_date: str) -> Optional[int]:
+    """Look up NFL week number from schedules for a given matchup/date."""
+    try:
+        if schedules.empty or "week" not in schedules.columns:
+            return None
+        gd = str(game_date)[:10]
+        mask = (
+            (schedules["home_team"] == home) &
+            (schedules["away_team"] == away) &
+            (schedules["gameday"].astype(str).str[:10] == gd)
+        )
+        rows = schedules.loc[mask]
+        if not rows.empty and pd.notna(rows.iloc[0]["week"]):
+            return int(rows.iloc[0]["week"])
+        # Fallback: any game on that date for home team
+        mask2 = (
+            (schedules["home_team"] == home) &
+            (schedules["gameday"].astype(str).str[:10] == gd)
+        )
+        rows2 = schedules.loc[mask2]
+        if not rows2.empty and pd.notna(rows2.iloc[0]["week"]):
+            return int(rows2.iloc[0]["week"])
+    except Exception:
+        pass
+    return None
+
 def implied_team_totals(spread: float, total: float) -> Tuple[float, float]:
     """
     spread = home team line (negative if home favorite).
@@ -790,8 +816,10 @@ with tab1:
                     wx_str = (f"{weather.get('temp_f', 70):.0f}°F / "
                               f"{weather.get('wind_mph', 5):.0f} mph / "
                               f"{weather.get('precip_prob', 10):.0f}%")
+                week_num = get_week(schedules, home, away, game_date)
                 if signals or total_score > 2.0:
                     opportunities.append({
+                        "Week": week_num if week_num is not None else "—",
                         "Game": f"{away_full} @ {home_full}",
                         "Kickoff": commence,
                         "Roof": roof.title(),
@@ -818,6 +846,37 @@ with tab1:
         if opportunities:
             df = pd.DataFrame(opportunities).sort_values("Score", ascending=False)
             st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # ---- TOP 5 SIGNALED GAMES BY WEEK ----
+            st.markdown("---")
+            st.subheader("🏆 Top 5 Signaled Games by Week")
+            st.caption("Highest-scoring opportunities grouped by NFL week (sorted by Score).")
+            # Normalize Week for grouping
+            df_week = df.copy()
+            df_week["Week_num"] = pd.to_numeric(df_week["Week"], errors="coerce")
+            has_weeks = df_week["Week_num"].notna().any()
+            if has_weeks:
+                weeks_sorted = sorted(df_week["Week_num"].dropna().unique())
+                for w in weeks_sorted:
+                    week_df = df_week[df_week["Week_num"] == w].sort_values("Score", ascending=False).head(5)
+                    display_cols = [
+                        "Game", "Kickoff", "Spread", "Total", "Home Imp", "Away Imp",
+                        "EPA Edge", "Form Δ", "Recommendation", "Score", "Signals"
+                    ]
+                    display_cols = [c for c in display_cols if c in week_df.columns]
+                    st.markdown(f"**Week {int(w)}**")
+                    st.dataframe(week_df[display_cols], use_container_width=True, hide_index=True)
+            else:
+                # Fallback when week lookup fails: show overall top 5
+                st.markdown("**Overall Top 5** (week numbers unavailable)")
+                top5 = df.head(5)
+                display_cols = [
+                    "Game", "Kickoff", "Spread", "Total", "Home Imp", "Away Imp",
+                    "EPA Edge", "Form Δ", "Recommendation", "Score", "Signals"
+                ]
+                display_cols = [c for c in display_cols if c in top5.columns]
+                st.dataframe(top5[display_cols], use_container_width=True, hide_index=True)
+
             # Quick summary of top signals
             st.markdown("#### Top Signal Summary")
             st.caption("Implied Team Totals, Recent Form, Pace, Travel/TZ and Divisional are now folded into Score + Signals.")
