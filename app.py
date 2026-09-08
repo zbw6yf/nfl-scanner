@@ -166,16 +166,13 @@ def get_team_pace(seasons: Optional[List[int]] = None) -> pd.DataFrame:
             pbp = pbp.to_pandas()
         if pbp is None or pbp.empty:
             return pd.DataFrame()
-        # Count offensive plays per team per game
         plays = pbp[
             (pbp["play_type"].isin(["pass", "run"])) &
             (pbp["posteam"].notna())
         ].copy()
         if plays.empty:
             return pd.DataFrame()
-        # Group by game_id + posteam
         g = plays.groupby(["game_id", "posteam"]).size().reset_index(name="off_plays")
-        # Average plays per game (offense)
         pace = g.groupby("posteam")["off_plays"].mean().reset_index()
         pace.columns = ["team", "plays_per_game"]
         return pace.set_index("team")
@@ -197,7 +194,6 @@ def get_recent_form(seasons: Optional[List[int]] = None, n_games: int = 6) -> Di
             sched = sched.to_pandas()
         if sched is None or sched.empty:
             return {}
-        # Completed games only
         completed = sched[
             sched["result"].notna() &
             sched["home_score"].notna() &
@@ -207,7 +203,6 @@ def get_recent_form(seasons: Optional[List[int]] = None, n_games: int = 6) -> Di
             return {}
         completed["gameday"] = pd.to_datetime(completed["gameday"])
         completed = completed.sort_values("gameday")
-        # Also need EPA if possible – fallback to margin only if EPA unavailable
         epa_df = get_team_epa(seasons)
         form = {}
         all_teams = set(completed["home_team"].unique()) | set(completed["away_team"].unique())
@@ -224,11 +219,9 @@ def get_recent_form(seasons: Optional[List[int]] = None, n_games: int = 6) -> Di
                 else:
                     margin = float(row["away_score"]) - float(row["home_score"])
                 margins.append(margin)
-                # Approximate recent EPA differential if available
                 if not epa_df.empty and team in epa_df.index:
                     opp = row["away_team"] if row["home_team"] == team else row["home_team"]
                     if opp in epa_df.index:
-                        # crude: team's off EPA vs opp def EPA
                         team_off = float(epa_df.loc[team, "off_epa"])
                         opp_def = float(epa_df.loc[opp, "def_epa"])
                         epas.append(team_off - opp_def)
@@ -330,11 +323,15 @@ def get_roof(schedules: pd.DataFrame, home: str, game_date: str) -> str:
     return "outdoors"
 
 def get_week(schedules: pd.DataFrame, home: str, away: str, game_date: str) -> Optional[int]:
-    """Look up NFL week number from schedules for a given matchup/date."""
+    """
+    Look up NFL week number from schedules for a given matchup/date.
+    Multiple fallbacks so upcoming games still resolve correctly.
+    """
     try:
         if schedules.empty or "week" not in schedules.columns:
             return None
         gd = str(game_date)[:10]
+        # 1) Exact home + away + date
         mask = (
             (schedules["home_team"] == home) &
             (schedules["away_team"] == away) &
@@ -343,14 +340,29 @@ def get_week(schedules: pd.DataFrame, home: str, away: str, game_date: str) -> O
         rows = schedules.loc[mask]
         if not rows.empty and pd.notna(rows.iloc[0]["week"]):
             return int(rows.iloc[0]["week"])
-        # Fallback: any game on that date for home team
+        # 2) Home + away only – pick the game whose gameday is closest to requested date
         mask2 = (
+            (schedules["home_team"] == home) &
+            (schedules["away_team"] == away)
+        )
+        rows2 = schedules.loc[mask2].copy()
+        if not rows2.empty:
+            rows2["_gd"] = pd.to_datetime(rows2["gameday"], errors="coerce")
+            target = pd.to_datetime(gd, errors="coerce")
+            if pd.notna(target):
+                rows2["_diff"] = (rows2["_gd"] - target).abs()
+                rows2 = rows2.sort_values("_diff")
+            best = rows2.iloc[0]
+            if pd.notna(best["week"]):
+                return int(best["week"])
+        # 3) Any game on that calendar date for the home team
+        mask3 = (
             (schedules["home_team"] == home) &
             (schedules["gameday"].astype(str).str[:10] == gd)
         )
-        rows2 = schedules.loc[mask2]
-        if not rows2.empty and pd.notna(rows2.iloc[0]["week"]):
-            return int(rows2.iloc[0]["week"])
+        rows3 = schedules.loc[mask3]
+        if not rows3.empty and pd.notna(rows3.iloc[0]["week"]):
+            return int(rows3.iloc[0]["week"])
     except Exception:
         pass
     return None
@@ -360,8 +372,6 @@ def implied_team_totals(spread: float, total: float) -> Tuple[float, float]:
     spread = home team line (negative if home favorite).
     Returns (home_implied, away_implied).
     """
-    # Standard: home_implied = (total - spread) / 2
-    # away_implied = (total + spread) / 2
     home_imp = (total - spread) / 2.0
     away_imp = (total + spread) / 2.0
     return home_imp, away_imp
@@ -693,32 +703,25 @@ with tab1:
                 away_def = float(team_epa.loc[away, "def_epa"])
                 epa_edge = (home_off - away_def) - (away_off - home_def)
                 rest_diff = get_rest_days(schedules, home, game_date) - get_rest_days(schedules, away, game_date)
-                # ---- NEW SIGNALS ----
-                # 1. Implied Team Totals
+                # ---- SIGNALS ----
                 if avg_spread is not None:
                     home_imp, away_imp = implied_team_totals(avg_spread, avg_total)
                 else:
                     home_imp, away_imp = avg_total / 2, avg_total / 2
-                # 2. Recent Form
                 home_form = recent_form.get(home, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
                 away_form = recent_form.get(away, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
                 form_margin_diff = home_form["form_margin"] - away_form["form_margin"]
                 form_epa_diff = home_form["form_epa"] - away_form["form_epa"]
-                # 3. Pace
                 home_pace = float(team_pace.loc[home, "plays_per_game"]) if (not team_pace.empty and home in team_pace.index) else league_avg_pace
                 away_pace = float(team_pace.loc[away, "plays_per_game"]) if (not team_pace.empty and away in team_pace.index) else league_avg_pace
                 combined_pace = (home_pace + away_pace) / 2.0
                 pace_vs_avg = combined_pace - league_avg_pace
-                # Pace adjustment to total: ~0.4 pts per extra play above average
                 pace_adj = pace_vs_avg * 0.35
-                # 4. Travel / Time-zone
                 tz_diff = timezone_diff(home, away)
                 travel_dir = travel_direction(home, away)
-                # 5. Divisional
                 div_flag = is_divisional(home, away)
                 signals = []
                 rule_score = 0.0
-                # Existing EPA / spread / rest / weather signals
                 if epa_edge > 0.08:
                     signals.append(f"Home EPA +{epa_edge:.3f}"); rule_score += 2.2
                 elif epa_edge < -0.08:
@@ -735,7 +738,6 @@ with tab1:
                     signals.append(f"Away rest {rest_diff}d"); rule_score += 1.0
                 if wx_adj["rule_pts"] > 0:
                     signals.append(wx_adj["label"]); rule_score += wx_adj["rule_pts"]
-                # NEW: Implied Team Totals signals (high value)
                 if home_imp >= 27.5:
                     signals.append(f"High Home Imp {home_imp:.1f}"); rule_score += 1.5
                 elif home_imp <= 17.5:
@@ -744,11 +746,8 @@ with tab1:
                     signals.append(f"High Away Imp {away_imp:.1f}"); rule_score += 1.4
                 elif away_imp <= 17.5:
                     signals.append(f"Low Away Imp {away_imp:.1f}"); rule_score += 1.1
-                # Implied total vs market total mismatch (value for totals)
-                model_total_est = home_imp + away_imp  # should equal avg_total, but used for framing
                 if avg_total >= 48 and (home_imp + away_imp) < 46:
                     signals.append("Implied soft total"); rule_score += 0.8
-                # NEW: Recent Form
                 if form_margin_diff >= 7:
                     signals.append(f"Home form +{form_margin_diff:.1f}"); rule_score += 1.6
                 elif form_margin_diff <= -7:
@@ -757,12 +756,10 @@ with tab1:
                     signals.append(f"Home form EPA +{form_epa_diff:.3f}"); rule_score += 1.3
                 elif form_epa_diff < -0.12:
                     signals.append(f"Away form EPA {form_epa_diff:.3f}"); rule_score += 1.2
-                # NEW: Pace
                 if pace_vs_avg >= 4.0:
                     signals.append(f"Fast pace +{pace_vs_avg:.1f}"); rule_score += 1.0
                 elif pace_vs_avg <= -4.0:
                     signals.append(f"Slow pace {pace_vs_avg:.1f}"); rule_score += 0.9
-                # NEW: Travel / TZ
                 if tz_diff >= 3:
                     if travel_dir == "Westbound":
                         signals.append(f"Away TZ -{tz_diff}h West"); rule_score += 1.1
@@ -770,11 +767,9 @@ with tab1:
                         signals.append(f"Away TZ -{tz_diff}h East"); rule_score += 0.9
                 elif tz_diff == 2:
                     signals.append(f"Away TZ -{tz_diff}h"); rule_score += 0.5
-                # NEW: Divisional
                 if div_flag:
                     signals.append("Divisional"); rule_score += 0.7
-                # Form adjustment for Monte Carlo (scaled)
-                form_margin_adj = form_margin_diff * 0.15  # soft contribution
+                form_margin_adj = form_margin_diff * 0.15
                 ml_home = 0.5
                 if model is not None and avg_spread is not None and feature_cols is not None:
                     feat = pd.DataFrame([{
@@ -809,7 +804,6 @@ with tab1:
                     rec = "Lean Under"
                 else:
                     rec = "No strong lean"
-                # Clearer weather display
                 if roof in ("dome", "closed"):
                     wx_str = "Dome"
                 else:
@@ -850,34 +844,41 @@ with tab1:
             # ---- TOP 5 SIGNALED GAMES BY WEEK ----
             st.markdown("---")
             st.subheader("🏆 Top 5 Signaled Games by Week")
-            st.caption("Highest-scoring opportunities grouped by NFL week (sorted by Score).")
-            # Normalize Week for grouping
+            st.caption(
+                "Shows the 5 highest-Score opportunities for each NFL week separately "
+                "(Week 1 top 5, then Week 2 top 5, etc.). Only weeks that appear in the current odds feed are listed."
+            )
             df_week = df.copy()
             df_week["Week_num"] = pd.to_numeric(df_week["Week"], errors="coerce")
-            has_weeks = df_week["Week_num"].notna().any()
-            if has_weeks:
-                weeks_sorted = sorted(df_week["Week_num"].dropna().unique())
+            df_known = df_week[df_week["Week_num"].notna()].copy()
+            if not df_known.empty:
+                weeks_sorted = sorted(df_known["Week_num"].unique())
+                display_cols = [
+                    "Game", "Kickoff", "Spread", "Total", "Home Imp", "Away Imp",
+                    "EPA Edge", "Form Δ", "Recommendation", "Score", "Signals"
+                ]
                 for w in weeks_sorted:
-                    week_df = df_week[df_week["Week_num"] == w].sort_values("Score", ascending=False).head(5)
-                    display_cols = [
-                        "Game", "Kickoff", "Spread", "Total", "Home Imp", "Away Imp",
-                        "EPA Edge", "Form Δ", "Recommendation", "Score", "Signals"
-                    ]
-                    display_cols = [c for c in display_cols if c in week_df.columns]
-                    st.markdown(f"**Week {int(w)}**")
-                    st.dataframe(week_df[display_cols], use_container_width=True, hide_index=True)
+                    week_df = (
+                        df_known[df_known["Week_num"] == w]
+                        .sort_values("Score", ascending=False)
+                        .head(5)
+                    )
+                    cols = [c for c in display_cols if c in week_df.columns]
+                    st.markdown(f"### Week {int(w)}")
+                    st.dataframe(week_df[cols], use_container_width=True, hide_index=True)
             else:
-                # Fallback when week lookup fails: show overall top 5
-                st.markdown("**Overall Top 5** (week numbers unavailable)")
+                st.warning(
+                    "Could not resolve NFL week numbers from the schedule. "
+                    "Showing overall Top 5 instead."
+                )
                 top5 = df.head(5)
                 display_cols = [
                     "Game", "Kickoff", "Spread", "Total", "Home Imp", "Away Imp",
                     "EPA Edge", "Form Δ", "Recommendation", "Score", "Signals"
                 ]
-                display_cols = [c for c in display_cols if c in top5.columns]
-                st.dataframe(top5[display_cols], use_container_width=True, hide_index=True)
+                cols = [c for c in display_cols if c in top5.columns]
+                st.dataframe(top5[cols], use_container_width=True, hide_index=True)
 
-            # Quick summary of top signals
             st.markdown("#### Top Signal Summary")
             st.caption("Implied Team Totals, Recent Form, Pace, Travel/TZ and Divisional are now folded into Score + Signals.")
         else:
@@ -914,7 +915,6 @@ with tab2:
                         for o in m.get("outcomes", []):
                             if o.get("name") == "Over":
                                 total = f"{o.get('point', 0):.1f}"
-            # Add implied + divisional for richer view
             home_a = to_abbr(home)
             away_a = to_abbr(away)
             imp_h = imp_a = "—"
