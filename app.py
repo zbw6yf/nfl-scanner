@@ -51,7 +51,8 @@ def normalize_team(abbr):
 
 def get_current_nfl_season():
     today = datetime.now()
-    return today.year - 1 if today.month < 3 else today.year
+    season = today.year - 1 if today.month < 3 else today.year
+    return min(season, today.year)
 
 def american_to_prob(odds):
     try:
@@ -74,7 +75,11 @@ def season_weight(season, current_season, half_life):
 # =========================================================
 @st.cache_data(ttl=3600 * 6)
 def load_data(years_back, current_season):
-    seasons = list(range(current_season - years_back + 1, current_season + 1))
+    max_valid_season = datetime.now().year
+    end_season = min(current_season, max_valid_season)
+    start_season = max(1999, end_season - years_back + 1)
+    
+    seasons = list(range(start_season, end_season + 1))
     
     # Load Schedules
     sched = nfl.load_schedules(seasons=seasons)
