@@ -353,23 +353,34 @@ def _expand_team(t: str) -> set:
 def estimate_week_from_date(game_date: str) -> Optional[int]:
     """
     Estimate NFL week from calendar date when schedule lookup fails.
-    Week 1 ≈ first Thursday on/after Sept 4, with a few days of buffer for Wed openers.
+
+    NFL weeks run roughly Thursday → following Wednesday (MNF included).
+    Week 1 anchor = first Thursday on/after Sept 4 of the season year.
+    Games 1–3 days before that Thursday (Wed openers) still count as Week 1.
+    Example 2026: Thu Sep 10 is Week 1 anchor → Mon Sep 14/15 MNF is still Week 1;
+    Week 2 starts Thu Sep 17.
     """
     try:
         target = pd.to_datetime(str(game_date)[:10], errors="coerce")
         if pd.isna(target):
             return None
+        target = pd.Timestamp(year=target.year, month=target.month, day=target.day)
         year = target.year if target.month >= 3 else target.year - 1
-        start = pd.Timestamp(year=year, month=9, day=4)
-        while start.weekday() != 3:  # Thursday
-            start += pd.Timedelta(days=1)
-        week1_start = start - pd.Timedelta(days=3)
-        if target < week1_start - pd.Timedelta(days=7):
-            return None
-        days_since = (target - week1_start).days
-        if days_since < 0:
+
+        # First Thursday on or after Sept 4
+        week1_thu = pd.Timestamp(year=year, month=9, day=4)
+        while week1_thu.weekday() != 3:  # Thursday = 3
+            week1_thu += pd.Timedelta(days=1)
+
+        # Allow Wed (and early) openers up to 3 days before Week 1 Thursday
+        if target < week1_thu - pd.Timedelta(days=3):
+            if target < week1_thu - pd.Timedelta(days=10):
+                return None
             return 1
-        week = days_since // 7 + 1
+
+        days_since_thu = (target - week1_thu).days
+        # Thu=0 .. Wed=6 → same week; next Thu=7 → next week
+        week = days_since_thu // 7 + 1
         if week < 1:
             return 1
         if week > 22:
