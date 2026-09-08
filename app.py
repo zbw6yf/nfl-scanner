@@ -82,11 +82,11 @@ if st.sidebar.button("Clear all caches"):
     st.cache_data.clear()
     st.cache_resource.clear()
     for k in list(st.session_state.keys()):
-        if "weather" in k.lower() or "cache" in k.lower():
+        if "weather" in k.lower():
             del st.session_state[k]
     st.rerun()
 
-st.sidebar.caption("Weather is unique per stadium + kickoff time.")
+st.sidebar.caption("Weather is unique per stadium + kickoff.")
 
 # -----------------------------
 # DATA FUNCTIONS
@@ -209,13 +209,11 @@ def get_roof(schedules: pd.DataFrame, home: str, game_date: str) -> str:
     return "outdoors"
 
 # -----------------------------
-# WEATHER – FIXED & DIAGNOSTIC
+# WEATHER
 # -----------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_weather_api(lat: float, lon: float, kickoff_iso: str) -> Dict[str, Any]:
-    """Fetch real forecast. Returns source='open-meteo' on success."""
     try:
-        # Clean the kickoff string
         if not kickoff_iso or len(kickoff_iso) < 10:
             kickoff_iso = datetime.utcnow().strftime("%Y-%m-%dT17:00")
 
@@ -233,10 +231,7 @@ def fetch_weather_api(lat: float, lon: float, kickoff_iso: str) -> Dict[str, Any
             timeout=10,
         )
         if r.status_code != 200:
-            return {
-                "temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0,
-                "source": f"http_{r.status_code}"
-            }
+            return {"temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0, "source": f"http_{r.status_code}"}
 
         data = r.json()
         hourly = data.get("hourly", {})
@@ -248,7 +243,6 @@ def fetch_weather_api(lat: float, lon: float, kickoff_iso: str) -> Dict[str, Any
         if not times or not temps:
             return {"temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0, "source": "empty"}
 
-        # Find closest hour
         try:
             kick = pd.to_datetime(kickoff_iso)
             if kick.tzinfo is None:
@@ -275,24 +269,18 @@ def fetch_weather_api(lat: float, lon: float, kickoff_iso: str) -> Dict[str, Any
             "wind_mph": float(winds[best_idx]) if best_idx < len(winds) else 5.0,
             "precip_prob": float(precs[best_idx]) if best_idx < len(precs) else 10.0,
             "source": "open-meteo",
-            "matched_time": times[best_idx] if best_idx < len(times) else None,
         }
     except Exception as e:
-        return {
-            "temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0,
-            "source": f"error:{type(e).__name__}"
-        }
+        return {"temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0, "source": f"error:{type(e).__name__}"}
 
 def make_weather_key(home: str, commence_raw: str) -> str:
-    """Very unique key per game."""
     if commence_raw and len(commence_raw) >= 16:
-        return f"{home}_{commence_raw[:16]}"  # includes minutes
+        return f"{home}_{commence_raw[:16]}"
     if commence_raw and len(commence_raw) >= 10:
         return f"{home}_{commence_raw[:10]}"
     return f"{home}_{datetime.now().strftime('%Y-%m-%d')}"
 
 def build_weather_cache(odds_data: List, schedules: pd.DataFrame) -> Dict[str, Dict]:
-    """Build weather for every game with real API calls + diagnostics."""
     cache = {}
     real_count = 0
     fallback_count = 0
@@ -326,23 +314,19 @@ def build_weather_cache(odds_data: List, schedules: pd.DataFrame) -> Dict[str, D
                 wx = fetch_weather_api(lat, lon, commence_raw or f"{game_date}T17:00:00Z")
                 wx["roof"] = roof
                 wx["home"] = home
-                wx["lat"] = lat
-                wx["lon"] = lon
                 cache[key] = wx
 
                 if wx.get("source") == "open-meteo":
                     real_count += 1
-                    if len(samples) < 6:
+                    if len(samples) < 8:
                         samples.append({
                             "team": home,
-                            "temp": wx["temp_f"],
-                            "wind": wx["wind_mph"],
-                            "precip": wx["precip_prob"],
-                            "key": key
+                            "temp": round(wx["temp_f"]),
+                            "wind": round(wx["wind_mph"]),
+                            "precip": round(wx["precip_prob"]),
                         })
                 else:
                     fallback_count += 1
-
         except Exception:
             continue
 
@@ -350,7 +334,6 @@ def build_weather_cache(odds_data: List, schedules: pd.DataFrame) -> Dict[str, D
 
     progress.empty()
 
-    # Store diagnostics
     st.session_state["weather_debug"] = {
         "real": real_count,
         "fallback": fallback_count,
@@ -505,7 +488,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
 with tab1:
     st.subheader("Ranked Opportunities")
 
-    with st.spinner("Loading EPA, Odds and unique weather for each stadium..."):
+    with st.spinner("Loading EPA, Odds and unique weather..."):
         team_epa = get_team_epa()
         schedules = load_schedules()
         odds_data, odds_status = fetch_nfl_odds(api_key) if api_key else (None, "No API key entered")
@@ -514,26 +497,22 @@ with tab1:
         except Exception:
             current_season = 2025
         model_bundle = train_ats_model(list(range(current_season - 4, current_season)))
-
-        # Build weather with progress bar and diagnostics
         weather_cache = build_weather_cache(odds_data or [], schedules)
 
-    # Status + Weather diagnostics
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("EPA teams", 0 if team_epa.empty else len(team_epa))
     c2.metric("Odds events", 0 if not odds_data else len(odds_data))
     c3.metric("Model", "Ready" if model_bundle else "Missing")
     c4.metric("Weather keys", len(weather_cache))
 
-    # Show weather debug info
     debug = st.session_state.get("weather_debug", {})
     if debug:
         st.info(
-            f"Weather fetch results → Real Open-Meteo: **{debug.get('real', 0)}** | "
-            f"Fallbacks: **{debug.get('fallback', 0)}** | Total keys: {debug.get('total_keys', 0)}"
+            f"Weather → Real Open-Meteo: **{debug.get('real', 0)}** | "
+            f"Fallbacks: **{debug.get('fallback', 0)}** | Keys: {debug.get('total_keys', 0)}"
         )
         if debug.get("samples"):
-            st.write("Sample real weather pulls (should be different):")
+            st.caption("Sample real weather (should differ by stadium):")
             st.dataframe(pd.DataFrame(debug["samples"]), use_container_width=True, hide_index=True)
 
     st.caption(odds_status)
@@ -565,17 +544,13 @@ with tab1:
 
                 roof = get_roof(schedules, home, game_date)
                 wx_key = make_weather_key(home, commence_raw)
-                weather = weather_cache.get(wx_key)
-
-                if weather is None:
-                    weather = {
-                        "temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0,
-                        "roof": roof, "source": "missing_key"
-                    }
+                weather = weather_cache.get(wx_key) or {
+                    "temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0,
+                    "roof": roof, "source": "missing"
+                }
 
                 wx_adj = weather_adjustments(roof, weather)
 
-                # lines
                 spreads, totals = [], []
                 for book in game.get("bookmakers", []):
                     for market in book.get("markets", []):
@@ -654,11 +629,13 @@ with tab1:
                 else:
                     rec = "No strong lean"
 
+                # Clearer weather display
                 if roof in ("dome", "closed"):
                     wx_str = "Dome"
                 else:
-                    src = weather.get("source", "?")
-                    wx_str = f"{weather.get('temp_f', 70):.0f}°F / {weather.get('wind_mph', 5):.0f} mph / {weather.get('precip_prob', 10):.0f}% ({src})"
+                    wx_str = (f"{weather.get('temp_f', 70):.0f}°F / "
+                              f"{weather.get('wind_mph', 5):.0f} mph / "
+                              f"{weather.get('precip_prob', 10):.0f}%")
 
                 if signals or total_score > 2.0:
                     opportunities.append({
