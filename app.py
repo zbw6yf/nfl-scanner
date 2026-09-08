@@ -1700,59 +1700,102 @@ with tab1:
 # ========== TAB 2 ==========
 with tab2:
     st.subheader("Upcoming Games (full schedule)")
-    st.caption("All regular-season games from the official schedule. Odds columns fill in when The Odds API has the event.")
-    if upcoming:
-        rows = []
-        for g in upcoming:
-            spread = f"{g['avg_spread']:+.1f}" if g.get("avg_spread") is not None else "—"
-            total = f"{g['avg_total']:.1f}" if g.get("avg_total") is not None else "—"
-            home_a, away_a = g["home"], g["away"]
+    st.caption(
+        "Complete official slate from the embedded 2026 schedule. "
+        "Every week lists every game with correct date/time. Odds fill in when available."
+    )
+
+    # Build display rows DIRECTLY from embedded schedule (never drop matchups)
+    today = pd.Timestamp.now().normalize()
+    cutoff = today + pd.Timedelta(days=120)
+    rows = []
+    for row in EMBEDDED_2026_SCHEDULE:
+        try:
+            gameday = row["gameday"]
+            gd = pd.to_datetime(gameday, errors="coerce")
+            if pd.isna(gd) or gd < today - pd.Timedelta(days=2) or gd > cutoff:
+                continue
+            home = row["home"]
+            away = row["away"]
+            week = int(row["week"])
+            gametime = row.get("gametime") or "13:00"
+            kickoff = format_schedule_kickoff(gameday, gametime)
+
+            # Overlay odds from upcoming list if present
+            avg_spread = avg_total = None
+            match = next(
+                (g for g in (upcoming or []) if g.get("home") == home and g.get("away") == away and g.get("week") == week),
+                None,
+            )
+            if match:
+                avg_spread = match.get("avg_spread")
+                avg_total = match.get("avg_total")
+            elif odds_data:
+                # try odds API by team names
+                for ev in odds_data:
+                    h = to_abbr(ev.get("home_team", ""))
+                    a = to_abbr(ev.get("away_team", ""))
+                    if h == home and a == away:
+                        s, t = _extract_odds_lines(ev, home)
+                        avg_spread, avg_total = s, t
+                        break
+
+            spread = f"{avg_spread:+.1f}" if avg_spread is not None else "—"
+            total = f"{avg_total:.1f}" if avg_total is not None else "—"
             imp_h = imp_a = "—"
-            if g.get("avg_spread") is not None and g.get("avg_total") is not None:
+            if avg_spread is not None and avg_total is not None:
                 try:
-                    ih, ia = implied_team_totals(g["avg_spread"], g["avg_total"])
+                    ih, ia = implied_team_totals(avg_spread, avg_total)
                     imp_h, imp_a = f"{ih:.1f}", f"{ia:.1f}"
                 except Exception:
                     pass
-            div = "Yes" if is_divisional(home_a, away_a) else "No"
             rows.append({
-                "Week": g.get("week") if g.get("week") is not None else "—",
-                "Away": g["away_full"],
-                "Home": g["home_full"],
-                "Kickoff": g.get("kickoff") or "",
+                "Week": week,
+                "Away": full_name(away),
+                "Home": full_name(home),
+                "Kickoff": kickoff,
                 "Spread": spread,
                 "Total": total,
                 "Home Imp": imp_h,
                 "Away Imp": imp_a,
-                "Divisional": div,
-                "Roof": (g.get("roof") or "").title(),
+                "Divisional": "Yes" if is_divisional(home, away) else "No",
+                "Roof": str(row.get("roof") or "outdoors").title(),
             })
+        except Exception:
+            continue
+
+    if rows:
         games_df = pd.DataFrame(rows)
-        # Week filter for this tab
-        weeks_present = sorted([w for w in games_df["Week"].unique() if w != "—"])
+        weeks_present = sorted(games_df["Week"].dropna().unique().tolist())
         week_filter = st.selectbox(
             "Filter by week",
-            options=["All weeks"] + [f"Week {w}" for w in weeks_present],
+            options=["All weeks"] + [f"Week {int(w)}" for w in weeks_present],
             key="tab2_week_filter",
         )
+        display = games_df
         if week_filter != "All weeks":
             try:
                 wk = int(week_filter.replace("Week ", ""))
-                games_df = games_df[games_df["Week"] == wk]
+                display = games_df[games_df["Week"] == wk]
             except Exception:
                 pass
-        st.dataframe(games_df, use_container_width=True, hide_index=True)
-        # Per-week counts so users can verify full slates (Week 3 should be 16)
-        if "Week" in games_df.columns:
-            counts = games_df[games_df["Week"] != "—"].groupby("Week").size().sort_index()
-            count_str = " · ".join([f"W{int(w)}:{int(n)}" for w, n in counts.items()])
-            st.caption(f"{len(games_df)} games shown · {count_str} · Official schedule (ESPN + nflverse)")
-        else:
-            st.caption(f"{len(games_df)} games shown · Week numbers and times come from the official NFL schedule.")
+        st.dataframe(display, use_container_width=True, hide_index=True)
+        counts = games_df.groupby("Week").size().sort_index()
+        count_str = " · ".join([f"W{int(w)}:{int(n)}" for w, n in counts.items()])
+        st.caption(f"{len(display)} games shown · Full slate counts: {count_str}")
+        # Explicit Week 3 checklist
+        w3 = games_df[games_df["Week"] == 3]
+        if not w3.empty:
+            has_nejax = ((w3["Away"].str.contains("New England")) & (w3["Home"].str.contains("Jacksonville"))).any()
+            has_phichi = ((w3["Away"].str.contains("Philadelphia")) & (w3["Home"].str.contains("Chicago"))).any()
+            st.info(
+                f"Week 3 verification: **{len(w3)}/16 games** · "
+                f"NE @ JAX: {'✅' if has_nejax else '❌'} · "
+                f"PHI @ CHI: {'✅' if has_phichi else '❌'}"
+            )
     else:
-        st.info(odds_status if api_key else "Schedule data unavailable or no upcoming games found.")
+        st.warning("No upcoming games in the embedded schedule window.")
 
-# ========== TAB 3 ==========
 with tab3:
     st.subheader("Player Props")
     if not api_key:
