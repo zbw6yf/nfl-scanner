@@ -50,11 +50,19 @@ TEAM_NAME_MAP = {
 def to_abbr(name):
     return TEAM_NAME_MAP.get(name, name)
 
+def get_current_nfl_season():
+    """Return the correct current NFL season year."""
+    today = datetime.now()
+    # NFL season year is the year the regular season starts (Sept)
+    if today.month < 3:          # Jan & Feb still belong to previous season
+        return today.year - 1
+    return today.year
+
 @st.cache_data(ttl=3600 * 6)
 def get_advanced_team_metrics(seasons=None):
     try:
         if seasons is None:
-            current = nfl.get_current_season()
+            current = get_current_nfl_season()
             seasons = [current - 1, current]
         pbp = nfl.load_pbp(seasons=seasons)
         if hasattr(pbp, "to_pandas"):
@@ -94,7 +102,7 @@ def get_advanced_team_metrics(seasons=None):
 def load_schedules(seasons=None):
     try:
         if seasons is None:
-            current = nfl.get_current_season()
+            current = get_current_nfl_season()
             seasons = list(range(current - 3, current + 1))
         sched = nfl.load_schedules(seasons=seasons)
         return sched.to_pandas() if hasattr(sched, "to_pandas") else sched
@@ -104,7 +112,7 @@ def load_schedules(seasons=None):
 @st.cache_data(ttl=3600)
 def load_current_schedule():
     try:
-        current = nfl.get_current_season()
+        current = get_current_nfl_season()   # This now correctly returns 2026
         sched = nfl.load_schedules(seasons=[current])
         return sched.to_pandas() if hasattr(sched, "to_pandas") else sched
     except Exception:
@@ -166,7 +174,7 @@ def get_rest_days(schedules, team, game_date):
 @st.cache_data(ttl=3600 * 4)
 def load_recent_player_stats():
     try:
-        current = nfl.get_current_season()
+        current = get_current_nfl_season()
         stats = nfl.load_player_stats(seasons=[current - 1, current], summary_level="week")
         if hasattr(stats, "to_pandas"):
             stats = stats.to_pandas()
@@ -203,7 +211,6 @@ MARKET_TO_STAT = {
     "player_reception_tds": "receiving_tds",
 }
 
-# Week options
 WEEK_OPTIONS = [f"Week {i}" for i in range(1, 19)] + [
     "Wild Card", "Divisional", "Conference Championship", "Super Bowl"
 ]
@@ -235,9 +242,12 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🚀 Deploy"
 ])
 
-# ========== TAB 1: OPPORTUNITIES WITH WEEK SELECTOR ==========
+# ========== TAB 1 ==========
 with tab1:
     st.subheader("Advanced Opportunities")
+
+    current_season = get_current_nfl_season()
+    st.caption(f"Currently showing **{current_season}** season")
 
     selected_week = st.selectbox(
         "Select Week / Round",
@@ -245,19 +255,18 @@ with tab1:
         index=0
     )
 
-    with st.spinner("Loading advanced metrics and schedule..."):
+    with st.spinner("Loading 2026 schedule and advanced metrics..."):
         metrics = get_advanced_team_metrics()
         full_schedule = load_current_schedule()
         week_games = filter_schedule_by_week(full_schedule, selected_week)
         odds_data = fetch_nfl_odds(api_key) if api_key else None
         all_schedules = load_schedules()
 
-    st.markdown(f"### {selected_week}")
+    st.markdown(f"### {selected_week} ({current_season})")
 
     if week_games.empty:
-        st.info(f"No games found for {selected_week} yet.")
+        st.info(f"No games found for {selected_week} in the {current_season} season yet.")
     else:
-        # Create odds lookup
         odds_lookup = {}
         if odds_data:
             for g in odds_data:
@@ -273,7 +282,6 @@ with tab1:
             away = to_abbr(away_full)
             gameday = str(row.get("gameday", ""))[:10]
 
-            # Get spread if available
             avg_spread = None
             game_odds = odds_lookup.get((away_full, home_full))
             if game_odds:
@@ -361,7 +369,7 @@ with tab1:
         else:
             st.info("No strong signals for this week.")
 
-# ========== TAB 2: GAMES & ODDS ==========
+# ========== TAB 2 ==========
 with tab2:
     st.subheader("Upcoming Games & Current Lines")
     if odds_data:
@@ -487,11 +495,11 @@ with tab3:
                 else:
                     st.warning("No props could be matched to recent stats.")
 
-# ========== TAB 4: BACKTEST ==========
+# ========== TAB 4 ==========
 with tab4:
     st.subheader("Improved Backtest – EPA Edge")
     min_edge = st.slider("Minimum EPA edge", 0.03, 0.20, 0.06, 0.01)
-    seasons_back = st.multiselect("Seasons", [2022, 2023, 2024, 2025], default=[2023, 2024, 2025])
+    seasons_back = st.multiselect("Seasons", [2022, 2023, 2024, 2025, 2026], default=[2024, 2025, 2026])
 
     if st.button("Run Backtest"):
         with st.spinner("Running backtest..."):
@@ -524,21 +532,15 @@ with tab4:
             except Exception as e:
                 st.error(str(e))
 
-# ========== TAB 5: DEPLOY ==========
+# ========== TAB 5 ==========
 with tab5:
     st.subheader("Deploy / Update")
     st.markdown("""
     After making changes:
     1. Upload the new `app.py` to your GitHub repo
-    2. Make sure `requirements.txt` includes:
-       - streamlit
-       - pandas
-       - numpy
-       - requests
-       - nflreadpy
-       - scikit-learn
+    2. Make sure `requirements.txt` includes streamlit, pandas, numpy, requests, nflreadpy, scikit-learn
     3. Go to share.streamlit.io → Reboot the app
     """)
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Full version • Week selector + Player Props + Advanced Models")
+st.sidebar.caption("Full version • 2026 season • Week selector + Player Props")
