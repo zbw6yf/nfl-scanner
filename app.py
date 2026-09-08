@@ -77,6 +77,7 @@ def to_abbr(name: str) -> Optional[str]:
 st.sidebar.header("Settings")
 api_key = st.sidebar.text_input("The Odds API Key", type="password")
 n_simulations = st.sidebar.slider("Monte Carlo simulations", 2000, 15000, 8000, 1000)
+
 if st.sidebar.button("Clear all caches"):
     st.cache_data.clear()
     st.cache_resource.clear()
@@ -84,7 +85,7 @@ if st.sidebar.button("Clear all caches"):
         del st.session_state["weather_cache"]
     st.rerun()
 
-st.sidebar.caption("Weather is loaded once per page load.")
+st.sidebar.caption("Weather is loaded once per page load and is unique per stadium + kickoff.")
 
 # -----------------------------
 # DATA FUNCTIONS
@@ -199,7 +200,6 @@ def get_roof(schedules: pd.DataFrame, home: str, game_date: str) -> str:
             roof = rows.iloc[0]["roof"]
             if pd.notna(roof):
                 return str(roof).lower().strip()
-        # fallback to any known roof for that team
         home_rows = schedules[schedules["home_team"] == home].dropna(subset=["roof"])
         if not home_rows.empty:
             return str(home_rows.iloc[-1]["roof"]).lower().strip()
@@ -208,11 +208,11 @@ def get_roof(schedules: pd.DataFrame, home: str, game_date: str) -> str:
     return "outdoors"
 
 # -----------------------------
-# WEATHER (cached + session)
+# WEATHER – unique per stadium + kickoff
 # -----------------------------
 @st.cache_data(ttl=2 * 3600, show_spinner=False)
 def fetch_weather_api(lat: float, lon: float, kickoff_iso: str) -> Dict[str, Any]:
-    """Single Open-Meteo call – heavily cached."""
+    """Single Open-Meteo call – cached by (lat, lon, kickoff)."""
     try:
         r = requests.get(
             "https://api.open-meteo.com/v1/forecast",
@@ -223,12 +223,13 @@ def fetch_weather_api(lat: float, lon: float, kickoff_iso: str) -> Dict[str, Any
                 "temperature_unit": "fahrenheit",
                 "wind_speed_unit": "mph",
                 "timezone": "auto",
-                "forecast_days": 10
+                "forecast_days": 10,
             },
-            timeout=8
+            timeout=8,
         )
         if r.status_code != 200:
             return {"temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0, "source": "fallback"}
+
         data = r.json()
         hourly = data.get("hourly", {})
         times = hourly.get("time", [])
@@ -251,20 +252,30 @@ def fetch_weather_api(lat: float, lon: float, kickoff_iso: str) -> Dict[str, Any
                 best_idx = i
 
         return {
-            "temp_f": float(hourly.get("temperature_2m", [70])[best_idx]),
-            "wind_mph": float(hourly.get("wind_speed_10m", [5])[best_idx]),
-            "precip_prob": float(hourly.get("precipitation_probability", [10])[best_idx]),
-            "source": "open-meteo"
+            "temp_f": float(hourly.get("temperature_2m", [70.0])[best_idx]),
+            "wind_mph": float(hourly.get("wind_speed_10m", [5.0])[best_idx]),
+            "precip_prob": float(hourly.get("precipitation_probability", [10.0])[best_idx]),
+            "source": "open-meteo",
         }
     except Exception:
         return {"temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0, "source": "fallback"}
 
+def make_weather_key(home: str, commence_raw: str) -> str:
+    """Create a unique, stable key for each game."""
+    if commence_raw and len(commence_raw) >= 13:
+        return f"{home}_{commence_raw[:13]}"
+    date_part = commence_raw[:10] if commence_raw else datetime.now().strftime("%Y-%m-%d")
+    return f"{home}_{date_part}"
+
 def get_weather_cache(odds_data: List, schedules: pd.DataFrame) -> Dict[str, Dict]:
-    """Build weather dict once and store in session_state."""
+    """
+    Build a weather dictionary with a UNIQUE key per game.
+    Never overwrite under a plain team abbreviation.
+    """
     if "weather_cache" in st.session_state and isinstance(st.session_state["weather_cache"], dict):
         return st.session_state["weather_cache"]
 
-    cache = {}
+    cache: Dict[str, Dict] = {}
     if not odds_data:
         st.session_state["weather_cache"] = cache
         return cache
@@ -276,25 +287,27 @@ def get_weather_cache(odds_data: List, schedules: pd.DataFrame) -> Dict[str, Dic
             if not home or home not in STADIUM_COORDS:
                 continue
 
-            commence = game.get("commence_time") or ""
-            game_date = commence[:10] if len(commence) >= 10 else datetime.now().strftime("%Y-%m-%d")
+            commence_raw = game.get("commence_time") or ""
+            game_date = commence_raw[:10] if len(commence_raw) >= 10 else datetime.now().strftime("%Y-%m-%d")
             roof = get_roof(schedules, home, game_date)
 
-            key = f"{home}_{commence[:13]}" if commence else home
+            key = make_weather_key(home, commence_raw)
 
             if roof in ("dome", "closed"):
                 cache[key] = {
-                    "temp_f": 72.0, "wind_mph": 0.0, "precip_prob": 0.0,
-                    "source": "dome", "roof": roof
+                    "temp_f": 72.0,
+                    "wind_mph": 0.0,
+                    "precip_prob": 0.0,
+                    "source": "dome",
+                    "roof": roof,
                 }
-                cache[home] = cache[key]
                 continue
 
             lat, lon = STADIUM_COORDS[home]
-            wx = fetch_weather_api(lat, lon, commence or f"{game_date}T17:00:00Z")
+            wx = fetch_weather_api(lat, lon, commence_raw or f"{game_date}T17:00:00Z")
             wx["roof"] = roof
             cache[key] = wx
-            cache[home] = wx
+
         except Exception:
             continue
 
@@ -518,10 +531,20 @@ with tab1:
                 game_date = commence[:10] if commence else datetime.now().strftime("%Y-%m-%d")
 
                 roof = get_roof(schedules, home, game_date)
-                wx_key = f"{home}_{commence_raw[:13]}" if commence_raw else home
-                weather = weather_cache.get(wx_key) or weather_cache.get(home) or {
-                    "temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0, "roof": roof
-                }
+
+                # UNIQUE key – must match the key used when building the cache
+                wx_key = make_weather_key(home, commence_raw)
+                weather = weather_cache.get(wx_key)
+
+                if weather is None:
+                    weather = {
+                        "temp_f": 70.0,
+                        "wind_mph": 5.0,
+                        "precip_prob": 10.0,
+                        "roof": roof,
+                        "source": "fallback",
+                    }
+
                 wx_adj = weather_adjustments(roof, weather)
 
                 # average lines
