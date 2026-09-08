@@ -933,7 +933,66 @@ with tab1:
                 continue
         if opportunities:
             df = pd.DataFrame(opportunities).sort_values("Score", ascending=False)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # ---- FILTER CONTROLS ----
+            st.markdown("##### Filters")
+            f1, f2, f3 = st.columns([1, 1.4, 1])
+            with f1:
+                min_score = st.slider(
+                    "Min Score",
+                    min_value=0.0,
+                    max_value=max(10.0, float(df["Score"].max()) if len(df) else 10.0),
+                    value=2.0,
+                    step=0.5,
+                    key="opp_min_score",
+                )
+            with f2:
+                # Map friendly labels to substrings in Recommendation
+                rec_options = {
+                    "Home ATS": "Lean Home ATS",
+                    "Away ATS": "Lean Away ATS",
+                    "Over": "Lean Over",
+                    "Under": "Lean Under",
+                    "No strong lean": "No strong lean",
+                }
+                selected_recs = st.multiselect(
+                    "Recommendation",
+                    options=list(rec_options.keys()),
+                    default=["Home ATS", "Away ATS", "Over", "Under"],
+                    key="opp_rec_filter",
+                )
+            with f3:
+                df["_Week_num"] = pd.to_numeric(df["Week"], errors="coerce")
+                available_weeks = sorted(df["_Week_num"].dropna().unique().tolist())
+                week_choices = ["All weeks"] + [f"Week {int(w)}" for w in available_weeks]
+                selected_week_filter = st.selectbox(
+                    "Week",
+                    options=week_choices,
+                    index=0,
+                    key="opp_week_filter",
+                )
+
+            # Apply filters
+            filtered = df[df["Score"] >= min_score].copy()
+            if selected_recs:
+                allowed = {rec_options[r] for r in selected_recs if r in rec_options}
+                filtered = filtered[filtered["Recommendation"].isin(allowed)]
+            if selected_week_filter != "All weeks" and available_weeks:
+                try:
+                    wk = int(selected_week_filter.replace("Week ", ""))
+                    filtered = filtered[filtered["_Week_num"] == wk]
+                except Exception:
+                    pass
+
+            st.caption(
+                f"Showing **{len(filtered)}** of **{len(df)}** opportunities "
+                f"(Min Score ≥ {min_score}"
+                + (f", Week filter: {selected_week_filter}" if selected_week_filter != "All weeks" else "")
+                + ")"
+            )
+            # Drop helper col before display
+            display_df = filtered.drop(columns=["_Week_num"], errors="ignore")
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
 
             # ---- TOP 5 SIGNALED GAMES BY WEEK ----
             st.markdown("---")
@@ -1126,3 +1185,4 @@ with tab4:
                         st.warning("No games met the filters.")
             except Exception as e:
                 st.error(f"Backtest error: {e}")
+
