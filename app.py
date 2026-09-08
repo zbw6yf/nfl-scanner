@@ -939,39 +939,45 @@ with tab1:
             st.markdown("---")
             st.subheader("🏆 Top 5 Signaled Games by Week")
             st.caption(
-                "Shows the 5 highest-Score opportunities for each NFL week separately "
-                "(Week 1 top 5, then Week 2 top 5, etc.). Only weeks that appear in the current odds feed are listed."
+                "Select a week from the dropdown to see its 5 highest-Score opportunities. "
+                "Only weeks present in the current odds feed are listed."
             )
             df_week = df.copy()
             df_week["Week_num"] = pd.to_numeric(df_week["Week"], errors="coerce")
-            # Drop rows with no week so they don't pollute the groups
             df_known = df_week[df_week["Week_num"].notna()].copy()
+            display_cols = [
+                "Game", "Kickoff", "Spread", "Total", "Home Imp", "Away Imp",
+                "EPA Edge", "Form Δ", "Recommendation", "Score", "Signals"
+            ]
             if not df_known.empty:
                 weeks_sorted = sorted(df_known["Week_num"].unique())
-                display_cols = [
-                    "Game", "Kickoff", "Spread", "Total", "Home Imp", "Away Imp",
-                    "EPA Edge", "Form Δ", "Recommendation", "Score", "Signals"
-                ]
-                for w in weeks_sorted:
-                    week_df = (
-                        df_known[df_known["Week_num"] == w]
-                        .sort_values("Score", ascending=False)
-                        .head(5)
-                    )
-                    cols = [c for c in display_cols if c in week_df.columns]
-                    st.markdown(f"### Week {int(w)}")
-                    st.dataframe(week_df[cols], use_container_width=True, hide_index=True)
+                week_labels = {int(w): f"Week {int(w)}" for w in weeks_sorted}
+                # Default to the earliest upcoming week
+                default_idx = 0
+                selected_label = st.selectbox(
+                    "Select week",
+                    options=[week_labels[int(w)] for w in weeks_sorted],
+                    index=default_idx,
+                    key="top5_week_select",
+                )
+                # Map label back to week number
+                selected_week = next(
+                    int(w) for w, lab in week_labels.items() if lab == selected_label
+                )
+                week_df = (
+                    df_known[df_known["Week_num"] == selected_week]
+                    .sort_values("Score", ascending=False)
+                    .head(5)
+                )
+                cols = [c for c in display_cols if c in week_df.columns]
+                st.markdown(f"**{selected_label}** — top {len(week_df)} by Score")
+                st.dataframe(week_df[cols], use_container_width=True, hide_index=True)
             else:
-                # Fallback when week lookup fails for every game
                 st.warning(
                     "Could not resolve NFL week numbers from the schedule. "
                     "Showing overall Top 5 instead."
                 )
                 top5 = df.head(5)
-                display_cols = [
-                    "Game", "Kickoff", "Spread", "Total", "Home Imp", "Away Imp",
-                    "EPA Edge", "Form Δ", "Recommendation", "Score", "Signals"
-                ]
                 cols = [c for c in display_cols if c in top5.columns]
                 st.dataframe(top5[cols], use_container_width=True, hide_index=True)
 
