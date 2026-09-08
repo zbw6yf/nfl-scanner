@@ -81,11 +81,12 @@ n_simulations = st.sidebar.slider("Monte Carlo simulations", 2000, 15000, 8000, 
 if st.sidebar.button("Clear all caches"):
     st.cache_data.clear()
     st.cache_resource.clear()
-    if "weather_cache" in st.session_state:
-        del st.session_state["weather_cache"]
+    for k in list(st.session_state.keys()):
+        if "weather" in k.lower() or "cache" in k.lower():
+            del st.session_state[k]
     st.rerun()
 
-st.sidebar.caption("Weather is loaded once per page load and is unique per stadium + kickoff.")
+st.sidebar.caption("Weather is unique per stadium + kickoff time.")
 
 # -----------------------------
 # DATA FUNCTIONS
@@ -208,79 +209,102 @@ def get_roof(schedules: pd.DataFrame, home: str, game_date: str) -> str:
     return "outdoors"
 
 # -----------------------------
-# WEATHER – unique per stadium + kickoff
+# WEATHER – FIXED & DIAGNOSTIC
 # -----------------------------
-@st.cache_data(ttl=2 * 3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_weather_api(lat: float, lon: float, kickoff_iso: str) -> Dict[str, Any]:
-    """Single Open-Meteo call – cached by (lat, lon, kickoff)."""
+    """Fetch real forecast. Returns source='open-meteo' on success."""
     try:
+        # Clean the kickoff string
+        if not kickoff_iso or len(kickoff_iso) < 10:
+            kickoff_iso = datetime.utcnow().strftime("%Y-%m-%dT17:00")
+
         r = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
-                "latitude": lat,
-                "longitude": lon,
+                "latitude": round(lat, 4),
+                "longitude": round(lon, 4),
                 "hourly": "temperature_2m,precipitation_probability,wind_speed_10m",
                 "temperature_unit": "fahrenheit",
                 "wind_speed_unit": "mph",
                 "timezone": "auto",
-                "forecast_days": 10,
+                "forecast_days": 14,
             },
-            timeout=8,
+            timeout=10,
         )
         if r.status_code != 200:
-            return {"temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0, "source": "fallback"}
+            return {
+                "temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0,
+                "source": f"http_{r.status_code}"
+            }
 
         data = r.json()
         hourly = data.get("hourly", {})
         times = hourly.get("time", [])
-        if not times:
-            return {"temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0, "source": "fallback"}
+        temps = hourly.get("temperature_2m", [])
+        winds = hourly.get("wind_speed_10m", [])
+        precs = hourly.get("precipitation_probability", [])
 
-        kick = pd.to_datetime(kickoff_iso)
-        if getattr(kick, "tzinfo", None) is None:
-            kick = kick.tz_localize("UTC")
+        if not times or not temps:
+            return {"temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0, "source": "empty"}
+
+        # Find closest hour
+        try:
+            kick = pd.to_datetime(kickoff_iso)
+            if kick.tzinfo is None:
+                kick = kick.tz_localize("UTC")
+        except Exception:
+            kick = pd.Timestamp.utcnow()
 
         best_idx = 0
         best_diff = float("inf")
         for i, t in enumerate(times):
-            tt = pd.to_datetime(t)
-            if getattr(tt, "tzinfo", None) is None:
-                tt = tt.tz_localize("UTC")
-            diff = abs((tt - kick).total_seconds())
-            if diff < best_diff:
-                best_diff = diff
-                best_idx = i
+            try:
+                tt = pd.to_datetime(t)
+                if tt.tzinfo is None:
+                    tt = tt.tz_localize("UTC")
+                diff = abs((tt - kick).total_seconds())
+                if diff < best_diff:
+                    best_diff = diff
+                    best_idx = i
+            except Exception:
+                continue
 
         return {
-            "temp_f": float(hourly.get("temperature_2m", [70.0])[best_idx]),
-            "wind_mph": float(hourly.get("wind_speed_10m", [5.0])[best_idx]),
-            "precip_prob": float(hourly.get("precipitation_probability", [10.0])[best_idx]),
+            "temp_f": float(temps[best_idx]),
+            "wind_mph": float(winds[best_idx]) if best_idx < len(winds) else 5.0,
+            "precip_prob": float(precs[best_idx]) if best_idx < len(precs) else 10.0,
             "source": "open-meteo",
+            "matched_time": times[best_idx] if best_idx < len(times) else None,
         }
-    except Exception:
-        return {"temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0, "source": "fallback"}
+    except Exception as e:
+        return {
+            "temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0,
+            "source": f"error:{type(e).__name__}"
+        }
 
 def make_weather_key(home: str, commence_raw: str) -> str:
-    """Create a unique, stable key for each game."""
-    if commence_raw and len(commence_raw) >= 13:
-        return f"{home}_{commence_raw[:13]}"
-    date_part = commence_raw[:10] if commence_raw else datetime.now().strftime("%Y-%m-%d")
-    return f"{home}_{date_part}"
+    """Very unique key per game."""
+    if commence_raw and len(commence_raw) >= 16:
+        return f"{home}_{commence_raw[:16]}"  # includes minutes
+    if commence_raw and len(commence_raw) >= 10:
+        return f"{home}_{commence_raw[:10]}"
+    return f"{home}_{datetime.now().strftime('%Y-%m-%d')}"
 
-def get_weather_cache(odds_data: List, schedules: pd.DataFrame) -> Dict[str, Dict]:
-    """
-    Build a weather dictionary with a UNIQUE key per game.
-    Never overwrite under a plain team abbreviation.
-    """
-    if "weather_cache" in st.session_state and isinstance(st.session_state["weather_cache"], dict):
-        return st.session_state["weather_cache"]
+def build_weather_cache(odds_data: List, schedules: pd.DataFrame) -> Dict[str, Dict]:
+    """Build weather for every game with real API calls + diagnostics."""
+    cache = {}
+    real_count = 0
+    fallback_count = 0
+    samples = []
 
-    cache: Dict[str, Dict] = {}
     if not odds_data:
-        st.session_state["weather_cache"] = cache
         return cache
 
-    for game in odds_data:
+    progress = st.progress(0, text="Fetching unique weather for each outdoor stadium...")
+    total = len(odds_data)
+
+    for idx, game in enumerate(odds_data):
         try:
             home_full = game.get("home_team")
             home = to_abbr(home_full)
@@ -290,28 +314,49 @@ def get_weather_cache(odds_data: List, schedules: pd.DataFrame) -> Dict[str, Dic
             commence_raw = game.get("commence_time") or ""
             game_date = commence_raw[:10] if len(commence_raw) >= 10 else datetime.now().strftime("%Y-%m-%d")
             roof = get_roof(schedules, home, game_date)
-
             key = make_weather_key(home, commence_raw)
 
             if roof in ("dome", "closed"):
                 cache[key] = {
-                    "temp_f": 72.0,
-                    "wind_mph": 0.0,
-                    "precip_prob": 0.0,
-                    "source": "dome",
-                    "roof": roof,
+                    "temp_f": 72.0, "wind_mph": 0.0, "precip_prob": 0.0,
+                    "source": "dome", "roof": roof, "home": home
                 }
-                continue
+            else:
+                lat, lon = STADIUM_COORDS[home]
+                wx = fetch_weather_api(lat, lon, commence_raw or f"{game_date}T17:00:00Z")
+                wx["roof"] = roof
+                wx["home"] = home
+                wx["lat"] = lat
+                wx["lon"] = lon
+                cache[key] = wx
 
-            lat, lon = STADIUM_COORDS[home]
-            wx = fetch_weather_api(lat, lon, commence_raw or f"{game_date}T17:00:00Z")
-            wx["roof"] = roof
-            cache[key] = wx
+                if wx.get("source") == "open-meteo":
+                    real_count += 1
+                    if len(samples) < 6:
+                        samples.append({
+                            "team": home,
+                            "temp": wx["temp_f"],
+                            "wind": wx["wind_mph"],
+                            "precip": wx["precip_prob"],
+                            "key": key
+                        })
+                else:
+                    fallback_count += 1
 
         except Exception:
             continue
 
-    st.session_state["weather_cache"] = cache
+        progress.progress((idx + 1) / total, text=f"Weather {idx+1}/{total}")
+
+    progress.empty()
+
+    # Store diagnostics
+    st.session_state["weather_debug"] = {
+        "real": real_count,
+        "fallback": fallback_count,
+        "samples": samples,
+        "total_keys": len(cache)
+    }
     return cache
 
 def weather_adjustments(roof: str, weather: Dict) -> Dict[str, Any]:
@@ -329,54 +374,33 @@ def weather_adjustments(roof: str, weather: Dict) -> Dict[str, Any]:
     labels = []
 
     if wind >= 20:
-        total_adj -= 3.5
-        noise_extra += 2.5
-        under_bias += 0.04
-        rule_pts += 1.4
+        total_adj -= 3.5; noise_extra += 2.5; under_bias += 0.04; rule_pts += 1.4
         labels.append(f"High wind {wind:.0f} mph")
     elif wind >= 15:
-        total_adj -= 2.0
-        noise_extra += 1.5
-        under_bias += 0.025
-        rule_pts += 0.9
+        total_adj -= 2.0; noise_extra += 1.5; under_bias += 0.025; rule_pts += 0.9
         labels.append(f"Wind {wind:.0f} mph")
 
     if precip >= 60:
-        total_adj -= 2.5
-        noise_extra += 2.0
-        under_bias += 0.03
-        rule_pts += 1.1
+        total_adj -= 2.5; noise_extra += 2.0; under_bias += 0.03; rule_pts += 1.1
         labels.append(f"Precip {precip:.0f}%")
     elif precip >= 40:
-        total_adj -= 1.2
-        noise_extra += 1.0
-        under_bias += 0.015
-        rule_pts += 0.6
+        total_adj -= 1.2; noise_extra += 1.0; under_bias += 0.015; rule_pts += 0.6
         labels.append(f"Precip {precip:.0f}%")
 
     if temp <= 25:
-        total_adj -= 2.0
-        noise_extra += 1.5
-        rule_pts += 0.7
+        total_adj -= 2.0; noise_extra += 1.5; rule_pts += 0.7
         labels.append(f"Very cold {temp:.0f}°F")
     elif temp <= 35:
-        total_adj -= 1.0
-        noise_extra += 0.8
-        rule_pts += 0.4
+        total_adj -= 1.0; noise_extra += 0.8; rule_pts += 0.4
         labels.append(f"Cold {temp:.0f}°F")
     elif temp >= 95:
-        total_adj -= 1.0
-        noise_extra += 1.0
-        rule_pts += 0.4
+        total_adj -= 1.0; noise_extra += 1.0; rule_pts += 0.4
         labels.append(f"Hot {temp:.0f}°F")
 
     label = " • ".join(labels) if labels else f"Outdoor {temp:.0f}°F / {wind:.0f} mph"
     return {
-        "total_adj": total_adj,
-        "noise_extra": noise_extra,
-        "under_bias": under_bias,
-        "rule_pts": rule_pts,
-        "label": label
+        "total_adj": total_adj, "noise_extra": noise_extra,
+        "under_bias": under_bias, "rule_pts": rule_pts, "label": label
     }
 
 # -----------------------------
@@ -412,15 +436,10 @@ def prepare_historical_features(seasons: List[int]):
             if pd.isna(total_line):
                 total_line = 45.0
             rows.append({
-                "epa_edge": epa_edge,
-                "spread": spread,
-                "rest_diff": 0.0,
-                "home_off": home_off,
-                "home_def": home_def,
-                "away_off": away_off,
-                "away_def": away_def,
-                "abs_spread": abs(spread),
-                "total_line": float(total_line),
+                "epa_edge": epa_edge, "spread": spread, "rest_diff": 0.0,
+                "home_off": home_off, "home_def": home_def,
+                "away_off": away_off, "away_def": away_def,
+                "abs_spread": abs(spread), "total_line": float(total_line),
                 "home_covered": 1 if result > spread else 0
             })
         df = pd.DataFrame(rows)
@@ -486,7 +505,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
 with tab1:
     st.subheader("Ranked Opportunities")
 
-    with st.spinner("Loading data (EPA + Odds + Weather) – this happens once per page load..."):
+    with st.spinner("Loading EPA, Odds and unique weather for each stadium..."):
         team_epa = get_team_epa()
         schedules = load_schedules()
         odds_data, odds_status = fetch_nfl_odds(api_key) if api_key else (None, "No API key entered")
@@ -495,14 +514,28 @@ with tab1:
         except Exception:
             current_season = 2025
         model_bundle = train_ats_model(list(range(current_season - 4, current_season)))
-        weather_cache = get_weather_cache(odds_data or [], schedules)
 
-    # Status row
+        # Build weather with progress bar and diagnostics
+        weather_cache = build_weather_cache(odds_data or [], schedules)
+
+    # Status + Weather diagnostics
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("EPA teams", 0 if team_epa.empty else len(team_epa))
     c2.metric("Odds events", 0 if not odds_data else len(odds_data))
     c3.metric("Model", "Ready" if model_bundle else "Missing")
-    c4.metric("Weather entries", len(weather_cache))
+    c4.metric("Weather keys", len(weather_cache))
+
+    # Show weather debug info
+    debug = st.session_state.get("weather_debug", {})
+    if debug:
+        st.info(
+            f"Weather fetch results → Real Open-Meteo: **{debug.get('real', 0)}** | "
+            f"Fallbacks: **{debug.get('fallback', 0)}** | Total keys: {debug.get('total_keys', 0)}"
+        )
+        if debug.get("samples"):
+            st.write("Sample real weather pulls (should be different):")
+            st.dataframe(pd.DataFrame(debug["samples"]), use_container_width=True, hide_index=True)
+
     st.caption(odds_status)
 
     opportunities = []
@@ -531,23 +564,18 @@ with tab1:
                 game_date = commence[:10] if commence else datetime.now().strftime("%Y-%m-%d")
 
                 roof = get_roof(schedules, home, game_date)
-
-                # UNIQUE key – must match the key used when building the cache
                 wx_key = make_weather_key(home, commence_raw)
                 weather = weather_cache.get(wx_key)
 
                 if weather is None:
                     weather = {
-                        "temp_f": 70.0,
-                        "wind_mph": 5.0,
-                        "precip_prob": 10.0,
-                        "roof": roof,
-                        "source": "fallback",
+                        "temp_f": 70.0, "wind_mph": 5.0, "precip_prob": 10.0,
+                        "roof": roof, "source": "missing_key"
                     }
 
                 wx_adj = weather_adjustments(roof, weather)
 
-                # average lines
+                # lines
                 spreads, totals = [], []
                 for book in game.get("bookmakers", []):
                     for market in book.get("markets", []):
@@ -571,56 +599,39 @@ with tab1:
 
                 rest_diff = get_rest_days(schedules, home, game_date) - get_rest_days(schedules, away, game_date)
 
-                # rule score
                 signals = []
                 rule_score = 0.0
                 if epa_edge > 0.08:
-                    signals.append(f"Home EPA +{epa_edge:.3f}")
-                    rule_score += 2.2
+                    signals.append(f"Home EPA +{epa_edge:.3f}"); rule_score += 2.2
                 elif epa_edge < -0.08:
-                    signals.append(f"Away EPA {epa_edge:.3f}")
-                    rule_score += 2.0
+                    signals.append(f"Away EPA {epa_edge:.3f}"); rule_score += 2.0
                 if avg_spread is not None and avg_spread > 1.5:
-                    signals.append("Home underdog")
-                    rule_score += 1.3
+                    signals.append("Home underdog"); rule_score += 1.3
                 if avg_spread is not None and abs(avg_spread) >= 7:
-                    signals.append(f"Large spread {avg_spread:+.1f}")
-                    rule_score += 0.7
+                    signals.append(f"Large spread {avg_spread:+.1f}"); rule_score += 0.7
                 if avg_total >= 48.5:
-                    signals.append(f"High total {avg_total:.1f}")
-                    rule_score += 0.6
+                    signals.append(f"High total {avg_total:.1f}"); rule_score += 0.6
                 if rest_diff >= 3:
-                    signals.append(f"Home rest +{rest_diff}d")
-                    rule_score += 1.1
+                    signals.append(f"Home rest +{rest_diff}d"); rule_score += 1.1
                 elif rest_diff <= -3:
-                    signals.append(f"Away rest {rest_diff}d")
-                    rule_score += 1.0
+                    signals.append(f"Away rest {rest_diff}d"); rule_score += 1.0
                 if wx_adj["rule_pts"] > 0:
-                    signals.append(wx_adj["label"])
-                    rule_score += wx_adj["rule_pts"]
+                    signals.append(wx_adj["label"]); rule_score += wx_adj["rule_pts"]
 
-                # ML
                 ml_home = 0.5
                 if model is not None and avg_spread is not None and feature_cols is not None:
                     feat = pd.DataFrame([{
-                        "epa_edge": epa_edge,
-                        "spread": avg_spread,
-                        "rest_diff": rest_diff,
-                        "home_off": home_off,
-                        "home_def": home_def,
-                        "away_off": away_off,
-                        "away_def": away_def,
-                        "abs_spread": abs(avg_spread),
-                        "total_line": avg_total
+                        "epa_edge": epa_edge, "spread": avg_spread, "rest_diff": rest_diff,
+                        "home_off": home_off, "home_def": home_def,
+                        "away_off": away_off, "away_def": away_def,
+                        "abs_spread": abs(avg_spread), "total_line": avg_total
                     }])[feature_cols]
                     ml_home = float(model.predict_proba(feat)[0, 1])
 
-                # Monte Carlo
                 mc = monte_carlo_game(
                     home_off, home_def, away_off, away_def,
                     avg_spread if avg_spread is not None else 0.0,
-                    avg_total,
-                    n_sims=n_simulations,
+                    avg_total, n_sims=n_simulations,
                     total_adj=wx_adj["total_adj"],
                     noise_extra=wx_adj["noise_extra"],
                     under_bias=wx_adj["under_bias"]
@@ -628,10 +639,8 @@ with tab1:
 
                 ml_edge = abs(ml_home - 0.5) * 4.0
                 mc_edge = max(mc["home_ev"], mc["away_ev"]) * 8.0
-                agree = 1.5 if (
-                    (ml_home > 0.5 and mc["home_cover_prob"] > 0.52) or
-                    (ml_home < 0.5 and mc["home_cover_prob"] < 0.48)
-                ) else 0.0
+                agree = 1.5 if ((ml_home > 0.5 and mc["home_cover_prob"] > 0.52) or
+                                (ml_home < 0.5 and mc["home_cover_prob"] < 0.48)) else 0.0
                 total_score = rule_score + ml_edge + mc_edge + agree
 
                 if mc["home_ev"] > 0.03 and ml_home > 0.53:
@@ -648,7 +657,8 @@ with tab1:
                 if roof in ("dome", "closed"):
                     wx_str = "Dome"
                 else:
-                    wx_str = f"{weather.get('temp_f', 70):.0f}°F / {weather.get('wind_mph', 5):.0f} mph / {weather.get('precip_prob', 10):.0f}%"
+                    src = weather.get("source", "?")
+                    wx_str = f"{weather.get('temp_f', 70):.0f}°F / {weather.get('wind_mph', 5):.0f} mph / {weather.get('precip_prob', 10):.0f}% ({src})"
 
                 if signals or total_score > 2.0:
                     opportunities.append({
@@ -667,16 +677,16 @@ with tab1:
                         "Score": round(total_score, 2)
                     })
             except Exception as e:
-                skipped.append(f"Error on game: {e}")
+                skipped.append(f"Error: {e}")
                 continue
 
         if opportunities:
             df = pd.DataFrame(opportunities).sort_values("Score", ascending=False)
             st.dataframe(df, use_container_width=True, hide_index=True)
         else:
-            st.warning("No opportunities matched the current filters.")
+            st.warning("No opportunities matched the filters.")
             if skipped:
-                with st.expander("Skipped / errors"):
+                with st.expander("Skipped"):
                     for s in skipped:
                         st.text(s)
     else:
@@ -685,7 +695,7 @@ with tab1:
         elif not odds_data:
             st.error(f"Could not load odds: {odds_status}")
         else:
-            st.error("Could not load EPA data from nflreadpy.")
+            st.error("Could not load EPA data.")
 
 # ========== TAB 2 ==========
 with tab2:
@@ -730,7 +740,7 @@ with tab3:
                 st.error("Failed to fetch")
             elif "error" in props:
                 st.error(props.get("error"))
-                st.caption("Player props usually require a paid Odds API plan.")
+                st.caption("Player props usually require a paid plan.")
             else:
                 rows = []
                 for book in props.get("bookmakers", []):
@@ -761,14 +771,12 @@ with tab4:
             try:
                 mb = train_ats_model(train_seasons)
                 if not mb:
-                    st.error("Not enough historical data to train.")
+                    st.error("Not enough historical data.")
                 else:
                     model, cols = mb
                     hist_sched = load_schedules(eval_seasons)
                     hist_epa = get_team_epa(eval_seasons)
-                    completed = hist_sched[
-                        hist_sched["result"].notna() & hist_sched["spread_line"].notna()
-                    ]
+                    completed = hist_sched[hist_sched["result"].notna() & hist_sched["spread_line"].notna()]
                     results = []
                     for _, row in completed.iterrows():
                         home = row["home_team"]
