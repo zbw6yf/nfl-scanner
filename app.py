@@ -55,6 +55,7 @@ STADIUM_COORDS = {
     "SF": (37.4033, -121.9694), "SEA": (47.5952, -122.3316), "TB": (27.9759, -82.5033),
     "TEN": (36.1665, -86.7713), "WAS": (38.9077, -76.8645),
 }
+# Time zone offsets from UTC (standard; DST handled roughly via season)
 TEAM_TZ = {
     "ARI": -7, "ATL": -5, "BAL": -5, "BUF": -5, "CAR": -5, "CHI": -6,
     "CIN": -5, "CLE": -5, "DAL": -6, "DEN": -7, "DET": -5, "GB": -6,
@@ -63,6 +64,7 @@ TEAM_TZ = {
     "NYJ": -5, "PHI": -5, "PIT": -5, "SF": -8, "SEA": -8, "TB": -5,
     "TEN": -6, "WAS": -5,
 }
+# NFL Divisions (stable alignment)
 DIVISIONS = {
     "AFC East": {"BUF", "MIA", "NE", "NYJ"},
     "AFC North": {"BAL", "CIN", "CLE", "PIT"},
@@ -92,14 +94,16 @@ def is_divisional(home: str, away: str) -> bool:
     return TEAM_TO_DIV.get(home) == TEAM_TO_DIV.get(away) and home in TEAM_TO_DIV
 
 def timezone_diff(home: str, away: str) -> int:
+    """Absolute hours of timezone change for the away team traveling to home."""
     h = TEAM_TZ.get(home, -5)
     a = TEAM_TZ.get(away, -5)
     return abs(h - a)
 
 def travel_direction(home: str, away: str) -> str:
+    """Rough direction of travel for away team: Eastbound, Westbound, or None."""
     h = TEAM_TZ.get(home, -5)
     a = TEAM_TZ.get(away, -5)
-    diff = h - a
+    diff = h - a  # positive = away is traveling west (to earlier TZ)
     if abs(diff) < 1:
         return "None"
     return "Westbound" if diff > 0 else "Eastbound"
@@ -152,6 +156,7 @@ def get_team_epa(seasons: Optional[List[int]] = None) -> pd.DataFrame:
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def get_team_pace(seasons: Optional[List[int]] = None) -> pd.DataFrame:
+    """Plays per game (offense + defense snaps approx via play counts)."""
     try:
         if seasons is None:
             current = int(nfl.get_current_season())
@@ -161,13 +166,16 @@ def get_team_pace(seasons: Optional[List[int]] = None) -> pd.DataFrame:
             pbp = pbp.to_pandas()
         if pbp is None or pbp.empty:
             return pd.DataFrame()
+        # Count offensive plays per team per game
         plays = pbp[
             (pbp["play_type"].isin(["pass", "run"])) &
             (pbp["posteam"].notna())
         ].copy()
         if plays.empty:
             return pd.DataFrame()
+        # Group by game_id + posteam
         g = plays.groupby(["game_id", "posteam"]).size().reset_index(name="off_plays")
+        # Average plays per game (offense)
         pace = g.groupby("posteam")["off_plays"].mean().reset_index()
         pace.columns = ["team", "plays_per_game"]
         return pace.set_index("team")
@@ -176,6 +184,10 @@ def get_team_pace(seasons: Optional[List[int]] = None) -> pd.DataFrame:
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def get_recent_form(seasons: Optional[List[int]] = None, n_games: int = 6) -> Dict[str, Dict]:
+    """
+    Last N completed games: average EPA (off - def) and average margin (points).
+    Returns dict[team] = {"form_epa": float, "form_margin": float, "n": int}
+    """
     try:
         if seasons is None:
             current = int(nfl.get_current_season())
@@ -185,6 +197,7 @@ def get_recent_form(seasons: Optional[List[int]] = None, n_games: int = 6) -> Di
             sched = sched.to_pandas()
         if sched is None or sched.empty:
             return {}
+        # Completed games only
         completed = sched[
             sched["result"].notna() &
             sched["home_score"].notna() &
@@ -194,6 +207,7 @@ def get_recent_form(seasons: Optional[List[int]] = None, n_games: int = 6) -> Di
             return {}
         completed["gameday"] = pd.to_datetime(completed["gameday"])
         completed = completed.sort_values("gameday")
+        # Also need EPA if possible – fallback to margin only if EPA unavailable
         epa_df = get_team_epa(seasons)
         form = {}
         all_teams = set(completed["home_team"].unique()) | set(completed["away_team"].unique())
@@ -210,9 +224,11 @@ def get_recent_form(seasons: Optional[List[int]] = None, n_games: int = 6) -> Di
                 else:
                     margin = float(row["away_score"]) - float(row["home_score"])
                 margins.append(margin)
+                # Approximate recent EPA differential if available
                 if not epa_df.empty and team in epa_df.index:
                     opp = row["away_team"] if row["home_team"] == team else row["home_team"]
                     if opp in epa_df.index:
+                        # crude: team's off EPA vs opp def EPA
                         team_off = float(epa_df.loc[team, "off_epa"])
                         opp_def = float(epa_df.loc[opp, "def_epa"])
                         epas.append(team_off - opp_def)
@@ -313,68 +329,127 @@ def get_roof(schedules: pd.DataFrame, home: str, game_date: str) -> str:
         pass
     return "outdoors"
 
-def get_week(schedules: pd.DataFrame, home: str, away: str, game_date: str) -> Optional[int]:
+# Common schedule abbr variants (nflverse sometimes uses LAR / WSH / etc.)
+_TEAM_ALIASES = {
+    "LA": {"LA", "LAR", "STL"},
+    "LAR": {"LA", "LAR", "STL"},
+    "LAC": {"LAC", "SD"},
+    "LV": {"LV", "OAK", "LVR"},
+    "WAS": {"WAS", "WSH", "WFT"},
+    "WSH": {"WAS", "WSH", "WFT"},
+    "GB": {"GB", "GNB"},
+    "KC": {"KC", "KAN"},
+    "NE": {"NE", "NWE"},
+    "NO": {"NO", "NOR"},
+    "SF": {"SF", "SFO"},
+    "TB": {"TB", "TAM"},
+    "JAC": {"JAX", "JAC"},
+    "JAX": {"JAX", "JAC"},
+}
+
+def _expand_team(t: str) -> set:
+    return _TEAM_ALIASES.get(t, {t}) | {t}
+
+def estimate_week_from_date(game_date: str) -> Optional[int]:
     """
-    Look up NFL week number from schedules for a given matchup/date.
-    Strictly prefers current-season games and only accepts matches within
-    a small date window so historical same-matchup games cannot pollute Week 1.
+    Estimate NFL week from calendar date when schedule lookup fails.
+    Week 1 ≈ first Thursday on/after Sept 4, with a few days of buffer for Wed openers.
     """
     try:
-        if schedules.empty or "week" not in schedules.columns:
+        target = pd.to_datetime(str(game_date)[:10], errors="coerce")
+        if pd.isna(target):
             return None
+        year = target.year if target.month >= 3 else target.year - 1
+        start = pd.Timestamp(year=year, month=9, day=4)
+        while start.weekday() != 3:  # Thursday
+            start += pd.Timedelta(days=1)
+        week1_start = start - pd.Timedelta(days=3)
+        if target < week1_start - pd.Timedelta(days=7):
+            return None
+        days_since = (target - week1_start).days
+        if days_since < 0:
+            return 1
+        week = days_since // 7 + 1
+        if week < 1:
+            return 1
+        if week > 22:
+            return None
+        return int(week)
+    except Exception:
+        return None
+
+def get_week(schedules: pd.DataFrame, home: str, away: str, game_date: str) -> Optional[int]:
+    """
+    Look up NFL week from schedules (current season, abbr aliases, tight dates).
+    Falls back to calendar estimate so Top-5-by-Week never goes blank.
+    """
+    try:
         gd = str(game_date)[:10]
         target = pd.to_datetime(gd, errors="coerce")
         if pd.isna(target):
-            return None
+            return estimate_week_from_date(game_date)
 
         try:
             current = int(nfl.get_current_season())
         except Exception:
             current = target.year if target.month >= 8 else target.year - 1
 
-        sched = schedules.copy()
-        if "season" in sched.columns:
+        sched = schedules.copy() if schedules is not None and not getattr(schedules, "empty", True) else pd.DataFrame()
+        if not sched.empty and "season" in sched.columns:
             sched_cur = sched[sched["season"] == current]
             if not sched_cur.empty:
                 sched = sched_cur
 
-        def _week_if_close(rows: pd.DataFrame, max_days: int = 2) -> Optional[int]:
-            if rows.empty:
-                return None
-            tmp = rows.copy()
-            tmp["_gd"] = pd.to_datetime(tmp["gameday"], errors="coerce")
-            tmp = tmp.dropna(subset=["_gd"])
-            if tmp.empty:
-                return None
-            tmp["_diff"] = (tmp["_gd"] - target).abs().dt.days
-            tmp = tmp[tmp["_diff"] <= max_days].sort_values("_diff")
-            if tmp.empty:
-                return None
-            w = tmp.iloc[0]["week"]
-            return int(w) if pd.notna(w) else None
+        if not sched.empty and "week" in sched.columns and "home_team" in sched.columns:
+            home_set = _expand_team(home)
+            away_set = _expand_team(away)
 
-        # 1) Home + away within ±2 days of requested date (current season)
-        mask = (sched["home_team"] == home) & (sched["away_team"] == away)
-        week = _week_if_close(sched.loc[mask], max_days=2)
-        if week is not None:
-            return week
+            def _week_if_close(rows: pd.DataFrame, max_days: int = 3) -> Optional[int]:
+                if rows.empty:
+                    return None
+                tmp = rows.copy()
+                tmp["_gd"] = pd.to_datetime(tmp["gameday"], errors="coerce")
+                tmp = tmp.dropna(subset=["_gd"])
+                if tmp.empty:
+                    return None
+                tmp["_diff"] = (tmp["_gd"] - target).abs().dt.days
+                tmp = tmp[tmp["_diff"] <= max_days].sort_values("_diff")
+                if tmp.empty:
+                    return None
+                w = tmp.iloc[0]["week"]
+                return int(w) if pd.notna(w) else None
 
-        # 2) Home team within ±1 day (current season)
-        mask2 = sched["home_team"] == home
-        week = _week_if_close(sched.loc[mask2], max_days=1)
-        if week is not None:
-            return week
+            mask = sched["home_team"].isin(home_set) & sched["away_team"].isin(away_set)
+            week = _week_if_close(sched.loc[mask], max_days=3)
+            if week is not None:
+                return week
 
-        # 3) Exact calendar date in current season
-        mask3 = sched["gameday"].astype(str).str[:10] == gd
-        rows3 = sched.loc[mask3]
-        if not rows3.empty and pd.notna(rows3.iloc[0]["week"]):
-            return int(rows3.iloc[0]["week"])
+            mask_flip = sched["home_team"].isin(away_set) & sched["away_team"].isin(home_set)
+            week = _week_if_close(sched.loc[mask_flip], max_days=3)
+            if week is not None:
+                return week
+
+            mask2 = sched["home_team"].isin(home_set)
+            week = _week_if_close(sched.loc[mask2], max_days=1)
+            if week is not None:
+                return week
+
+            mask3 = sched["gameday"].astype(str).str[:10] == gd
+            rows3 = sched.loc[mask3]
+            if not rows3.empty and pd.notna(rows3.iloc[0].get("week")):
+                return int(rows3.iloc[0]["week"])
+
+        return estimate_week_from_date(game_date)
     except Exception:
-        pass
-    return None
+        return estimate_week_from_date(game_date)
 
 def implied_team_totals(spread: float, total: float) -> Tuple[float, float]:
+    """
+    spread = home team line (negative if home favorite).
+    Returns (home_implied, away_implied).
+    """
+    # Standard: home_implied = (total - spread) / 2
+    # away_implied = (total + spread) / 2
     home_imp = (total - spread) / 2.0
     away_imp = (total + spread) / 2.0
     return home_imp, away_imp
@@ -706,24 +781,32 @@ with tab1:
                 away_def = float(team_epa.loc[away, "def_epa"])
                 epa_edge = (home_off - away_def) - (away_off - home_def)
                 rest_diff = get_rest_days(schedules, home, game_date) - get_rest_days(schedules, away, game_date)
+                # ---- NEW SIGNALS ----
+                # 1. Implied Team Totals
                 if avg_spread is not None:
                     home_imp, away_imp = implied_team_totals(avg_spread, avg_total)
                 else:
                     home_imp, away_imp = avg_total / 2, avg_total / 2
+                # 2. Recent Form
                 home_form = recent_form.get(home, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
                 away_form = recent_form.get(away, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
                 form_margin_diff = home_form["form_margin"] - away_form["form_margin"]
                 form_epa_diff = home_form["form_epa"] - away_form["form_epa"]
+                # 3. Pace
                 home_pace = float(team_pace.loc[home, "plays_per_game"]) if (not team_pace.empty and home in team_pace.index) else league_avg_pace
                 away_pace = float(team_pace.loc[away, "plays_per_game"]) if (not team_pace.empty and away in team_pace.index) else league_avg_pace
                 combined_pace = (home_pace + away_pace) / 2.0
                 pace_vs_avg = combined_pace - league_avg_pace
+                # Pace adjustment to total: ~0.4 pts per extra play above average
                 pace_adj = pace_vs_avg * 0.35
+                # 4. Travel / Time-zone
                 tz_diff = timezone_diff(home, away)
                 travel_dir = travel_direction(home, away)
+                # 5. Divisional
                 div_flag = is_divisional(home, away)
                 signals = []
                 rule_score = 0.0
+                # Existing EPA / spread / rest / weather signals
                 if epa_edge > 0.08:
                     signals.append(f"Home EPA +{epa_edge:.3f}"); rule_score += 2.2
                 elif epa_edge < -0.08:
@@ -740,6 +823,7 @@ with tab1:
                     signals.append(f"Away rest {rest_diff}d"); rule_score += 1.0
                 if wx_adj["rule_pts"] > 0:
                     signals.append(wx_adj["label"]); rule_score += wx_adj["rule_pts"]
+                # NEW: Implied Team Totals signals (high value)
                 if home_imp >= 27.5:
                     signals.append(f"High Home Imp {home_imp:.1f}"); rule_score += 1.5
                 elif home_imp <= 17.5:
@@ -748,8 +832,11 @@ with tab1:
                     signals.append(f"High Away Imp {away_imp:.1f}"); rule_score += 1.4
                 elif away_imp <= 17.5:
                     signals.append(f"Low Away Imp {away_imp:.1f}"); rule_score += 1.1
+                # Implied total vs market total mismatch (value for totals)
+                model_total_est = home_imp + away_imp  # should equal avg_total, but used for framing
                 if avg_total >= 48 and (home_imp + away_imp) < 46:
                     signals.append("Implied soft total"); rule_score += 0.8
+                # NEW: Recent Form
                 if form_margin_diff >= 7:
                     signals.append(f"Home form +{form_margin_diff:.1f}"); rule_score += 1.6
                 elif form_margin_diff <= -7:
@@ -758,10 +845,12 @@ with tab1:
                     signals.append(f"Home form EPA +{form_epa_diff:.3f}"); rule_score += 1.3
                 elif form_epa_diff < -0.12:
                     signals.append(f"Away form EPA {form_epa_diff:.3f}"); rule_score += 1.2
+                # NEW: Pace
                 if pace_vs_avg >= 4.0:
                     signals.append(f"Fast pace +{pace_vs_avg:.1f}"); rule_score += 1.0
                 elif pace_vs_avg <= -4.0:
                     signals.append(f"Slow pace {pace_vs_avg:.1f}"); rule_score += 0.9
+                # NEW: Travel / TZ
                 if tz_diff >= 3:
                     if travel_dir == "Westbound":
                         signals.append(f"Away TZ -{tz_diff}h West"); rule_score += 1.1
@@ -769,9 +858,11 @@ with tab1:
                         signals.append(f"Away TZ -{tz_diff}h East"); rule_score += 0.9
                 elif tz_diff == 2:
                     signals.append(f"Away TZ -{tz_diff}h"); rule_score += 0.5
+                # NEW: Divisional
                 if div_flag:
                     signals.append("Divisional"); rule_score += 0.7
-                form_margin_adj = form_margin_diff * 0.15
+                # Form adjustment for Monte Carlo (scaled)
+                form_margin_adj = form_margin_diff * 0.15  # soft contribution
                 ml_home = 0.5
                 if model is not None and avg_spread is not None and feature_cols is not None:
                     feat = pd.DataFrame([{
@@ -806,6 +897,7 @@ with tab1:
                     rec = "Lean Under"
                 else:
                     rec = "No strong lean"
+                # Clearer weather display
                 if roof in ("dome", "closed"):
                     wx_str = "Dome"
                 else:
@@ -852,6 +944,7 @@ with tab1:
             )
             df_week = df.copy()
             df_week["Week_num"] = pd.to_numeric(df_week["Week"], errors="coerce")
+            # Drop rows with no week so they don't pollute the groups
             df_known = df_week[df_week["Week_num"].notna()].copy()
             if not df_known.empty:
                 weeks_sorted = sorted(df_known["Week_num"].unique())
@@ -869,6 +962,7 @@ with tab1:
                     st.markdown(f"### Week {int(w)}")
                     st.dataframe(week_df[cols], use_container_width=True, hide_index=True)
             else:
+                # Fallback when week lookup fails for every game
                 st.warning(
                     "Could not resolve NFL week numbers from the schedule. "
                     "Showing overall Top 5 instead."
@@ -881,6 +975,7 @@ with tab1:
                 cols = [c for c in display_cols if c in top5.columns]
                 st.dataframe(top5[cols], use_container_width=True, hide_index=True)
 
+            # Quick summary of top signals
             st.markdown("#### Top Signal Summary")
             st.caption("Implied Team Totals, Recent Form, Pace, Travel/TZ and Divisional are now folded into Score + Signals.")
         else:
@@ -917,6 +1012,7 @@ with tab2:
                         for o in m.get("outcomes", []):
                             if o.get("name") == "Over":
                                 total = f"{o.get('point', 0):.1f}"
+            # Add implied + divisional for richer view
             home_a = to_abbr(home)
             away_a = to_abbr(away)
             imp_h = imp_a = "—"
