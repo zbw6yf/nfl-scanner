@@ -618,11 +618,3 @@ with tab4:
                         st.warning("No qualifying games under current filters.")
             except Exception as e:
                 st.error(str(e))
-
-# ========== TAB 5: DEPLOY ==========
-with tab5:
-    st.subheader("Deploy / Update your app")
-    st.markdown(""")
-    After making changes:
-    1. Upload the new `app.py` to your GitHub repo
-    2. Make sure `requirements.txt` contains:
