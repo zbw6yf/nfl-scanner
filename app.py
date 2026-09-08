@@ -742,6 +742,161 @@ def implied_team_totals(spread: float, total: float) -> Tuple[float, float]:
 
 
 # -----------------------------
+# Embedded 2026 REG schedule Weeks 1-10 (ESPN official) — source of truth for matchups/dates/times
+EMBEDDED_2026_SCHEDULE = [
+    {"week": 1, "gameday": "2026-09-09", "gametime": "20:20", "away": "NE", "home": "SEA", "roof": "outdoors"},
+    {"week": 1, "gameday": "2026-09-10", "gametime": "20:35", "away": "SF", "home": "LA", "roof": "outdoors"},
+    {"week": 1, "gameday": "2026-09-13", "gametime": "13:00", "away": "TB", "home": "CIN", "roof": "outdoors"},
+    {"week": 1, "gameday": "2026-09-13", "gametime": "13:00", "away": "NO", "home": "DET", "roof": "dome"},
+    {"week": 1, "gameday": "2026-09-13", "gametime": "13:00", "away": "NYJ", "home": "TEN", "roof": "outdoors"},
+    {"week": 1, "gameday": "2026-09-13", "gametime": "13:00", "away": "BAL", "home": "IND", "roof": "dome"},
+    {"week": 1, "gameday": "2026-09-13", "gametime": "13:00", "away": "ATL", "home": "PIT", "roof": "outdoors"},
+    {"week": 1, "gameday": "2026-09-13", "gametime": "13:00", "away": "CHI", "home": "CAR", "roof": "outdoors"},
+    {"week": 1, "gameday": "2026-09-13", "gametime": "13:00", "away": "CLE", "home": "JAX", "roof": "outdoors"},
+    {"week": 1, "gameday": "2026-09-13", "gametime": "13:00", "away": "BUF", "home": "HOU", "roof": "dome"},
+    {"week": 1, "gameday": "2026-09-13", "gametime": "16:25", "away": "MIA", "home": "LV", "roof": "dome"},
+    {"week": 1, "gameday": "2026-09-13", "gametime": "16:25", "away": "GB", "home": "MIN", "roof": "dome"},
+    {"week": 1, "gameday": "2026-09-13", "gametime": "16:25", "away": "WAS", "home": "PHI", "roof": "outdoors"},
+    {"week": 1, "gameday": "2026-09-13", "gametime": "16:25", "away": "ARI", "home": "LAC", "roof": "outdoors"},
+    {"week": 1, "gameday": "2026-09-13", "gametime": "20:20", "away": "DAL", "home": "NYG", "roof": "outdoors"},
+    {"week": 1, "gameday": "2026-09-14", "gametime": "20:15", "away": "DEN", "home": "KC", "roof": "outdoors"},
+    {"week": 2, "gameday": "2026-09-17", "gametime": "20:15", "away": "DET", "home": "BUF", "roof": "outdoors"},
+    {"week": 2, "gameday": "2026-09-20", "gametime": "13:00", "away": "CAR", "home": "ATL", "roof": "dome"},
+    {"week": 2, "gameday": "2026-09-20", "gametime": "13:00", "away": "MIN", "home": "CHI", "roof": "outdoors"},
+    {"week": 2, "gameday": "2026-09-20", "gametime": "13:00", "away": "PHI", "home": "TEN", "roof": "outdoors"},
+    {"week": 2, "gameday": "2026-09-20", "gametime": "13:00", "away": "PIT", "home": "NE", "roof": "outdoors"},
+    {"week": 2, "gameday": "2026-09-20", "gametime": "13:00", "away": "GB", "home": "NYJ", "roof": "outdoors"},
+    {"week": 2, "gameday": "2026-09-20", "gametime": "13:00", "away": "CLE", "home": "TB", "roof": "outdoors"},
+    {"week": 2, "gameday": "2026-09-20", "gametime": "13:00", "away": "NO", "home": "BAL", "roof": "outdoors"},
+    {"week": 2, "gameday": "2026-09-20", "gametime": "13:00", "away": "CIN", "home": "HOU", "roof": "dome"},
+    {"week": 2, "gameday": "2026-09-20", "gametime": "16:05", "away": "JAX", "home": "DEN", "roof": "outdoors"},
+    {"week": 2, "gameday": "2026-09-20", "gametime": "16:05", "away": "LV", "home": "LAC", "roof": "outdoors"},
+    {"week": 2, "gameday": "2026-09-20", "gametime": "16:25", "away": "WAS", "home": "DAL", "roof": "dome"},
+    {"week": 2, "gameday": "2026-09-20", "gametime": "16:25", "away": "SEA", "home": "ARI", "roof": "dome"},
+    {"week": 2, "gameday": "2026-09-20", "gametime": "16:25", "away": "MIA", "home": "SF", "roof": "outdoors"},
+    {"week": 2, "gameday": "2026-09-20", "gametime": "20:20", "away": "IND", "home": "KC", "roof": "outdoors"},
+    {"week": 2, "gameday": "2026-09-21", "gametime": "20:15", "away": "NYG", "home": "LA", "roof": "outdoors"},
+    {"week": 3, "gameday": "2026-09-24", "gametime": "20:15", "away": "ATL", "home": "GB", "roof": "outdoors"},
+    {"week": 3, "gameday": "2026-09-27", "gametime": "13:00", "away": "LAC", "home": "BUF", "roof": "outdoors"},
+    {"week": 3, "gameday": "2026-09-27", "gametime": "13:00", "away": "CAR", "home": "CLE", "roof": "outdoors"},
+    {"week": 3, "gameday": "2026-09-27", "gametime": "13:00", "away": "NYJ", "home": "DET", "roof": "dome"},
+    {"week": 3, "gameday": "2026-09-27", "gametime": "13:00", "away": "HOU", "home": "IND", "roof": "dome"},
+    {"week": 3, "gameday": "2026-09-27", "gametime": "13:00", "away": "KC", "home": "MIA", "roof": "outdoors"},
+    {"week": 3, "gameday": "2026-09-27", "gametime": "13:00", "away": "TEN", "home": "NYG", "roof": "outdoors"},
+    {"week": 3, "gameday": "2026-09-27", "gametime": "13:00", "away": "CIN", "home": "PIT", "roof": "outdoors"},
+    {"week": 3, "gameday": "2026-09-27", "gametime": "13:00", "away": "SEA", "home": "WAS", "roof": "outdoors"},
+    {"week": 3, "gameday": "2026-09-27", "gametime": "13:00", "away": "NE", "home": "JAX", "roof": "outdoors"},
+    {"week": 3, "gameday": "2026-09-27", "gametime": "16:05", "away": "ARI", "home": "SF", "roof": "outdoors"},
+    {"week": 3, "gameday": "2026-09-27", "gametime": "16:05", "away": "MIN", "home": "TB", "roof": "outdoors"},
+    {"week": 3, "gameday": "2026-09-27", "gametime": "16:25", "away": "BAL", "home": "DAL", "roof": "outdoors"},
+    {"week": 3, "gameday": "2026-09-27", "gametime": "16:25", "away": "LV", "home": "NO", "roof": "dome"},
+    {"week": 3, "gameday": "2026-09-27", "gametime": "20:20", "away": "LA", "home": "DEN", "roof": "outdoors"},
+    {"week": 3, "gameday": "2026-09-28", "gametime": "20:15", "away": "PHI", "home": "CHI", "roof": "outdoors"},
+    {"week": 4, "gameday": "2026-10-01", "gametime": "20:15", "away": "PIT", "home": "CLE", "roof": "outdoors"},
+    {"week": 4, "gameday": "2026-10-04", "gametime": "09:30", "away": "IND", "home": "WAS", "roof": "outdoors"},
+    {"week": 4, "gameday": "2026-10-04", "gametime": "13:00", "away": "NE", "home": "BUF", "roof": "outdoors"},
+    {"week": 4, "gameday": "2026-10-04", "gametime": "13:00", "away": "NYJ", "home": "CHI", "roof": "outdoors"},
+    {"week": 4, "gameday": "2026-10-04", "gametime": "13:00", "away": "JAX", "home": "CIN", "roof": "outdoors"},
+    {"week": 4, "gameday": "2026-10-04", "gametime": "13:00", "away": "ARI", "home": "NYG", "roof": "outdoors"},
+    {"week": 4, "gameday": "2026-10-04", "gametime": "13:00", "away": "LA", "home": "PHI", "roof": "outdoors"},
+    {"week": 4, "gameday": "2026-10-04", "gametime": "13:00", "away": "GB", "home": "TB", "roof": "outdoors"},
+    {"week": 4, "gameday": "2026-10-04", "gametime": "13:00", "away": "TEN", "home": "BAL", "roof": "outdoors"},
+    {"week": 4, "gameday": "2026-10-04", "gametime": "13:00", "away": "DAL", "home": "HOU", "roof": "dome"},
+    {"week": 4, "gameday": "2026-10-04", "gametime": "16:05", "away": "MIA", "home": "MIN", "roof": "dome"},
+    {"week": 4, "gameday": "2026-10-04", "gametime": "16:25", "away": "KC", "home": "LV", "roof": "dome"},
+    {"week": 4, "gameday": "2026-10-04", "gametime": "16:25", "away": "DEN", "home": "SF", "roof": "outdoors"},
+    {"week": 4, "gameday": "2026-10-04", "gametime": "16:25", "away": "LAC", "home": "SEA", "roof": "outdoors"},
+    {"week": 4, "gameday": "2026-10-04", "gametime": "20:20", "away": "DET", "home": "CAR", "roof": "outdoors"},
+    {"week": 4, "gameday": "2026-10-05", "gametime": "20:15", "away": "ATL", "home": "NO", "roof": "dome"},
+    {"week": 5, "gameday": "2026-10-08", "gametime": "20:15", "away": "TB", "home": "DAL", "roof": "dome"},
+    {"week": 5, "gameday": "2026-10-11", "gametime": "09:30", "away": "PHI", "home": "JAX", "roof": "outdoors"},
+    {"week": 5, "gameday": "2026-10-11", "gametime": "13:00", "away": "HOU", "home": "TEN", "roof": "outdoors"},
+    {"week": 5, "gameday": "2026-10-11", "gametime": "13:00", "away": "CIN", "home": "MIA", "roof": "outdoors"},
+    {"week": 5, "gameday": "2026-10-11", "gametime": "13:00", "away": "LV", "home": "NE", "roof": "outdoors"},
+    {"week": 5, "gameday": "2026-10-11", "gametime": "13:00", "away": "MIN", "home": "NO", "roof": "dome"},
+    {"week": 5, "gameday": "2026-10-11", "gametime": "13:00", "away": "CLE", "home": "NYJ", "roof": "outdoors"},
+    {"week": 5, "gameday": "2026-10-11", "gametime": "13:00", "away": "IND", "home": "PIT", "roof": "outdoors"},
+    {"week": 5, "gameday": "2026-10-11", "gametime": "13:00", "away": "NYG", "home": "WAS", "roof": "outdoors"},
+    {"week": 5, "gameday": "2026-10-11", "gametime": "16:05", "away": "DEN", "home": "LAC", "roof": "outdoors"},
+    {"week": 5, "gameday": "2026-10-11", "gametime": "16:25", "away": "CHI", "home": "GB", "roof": "outdoors"},
+    {"week": 5, "gameday": "2026-10-11", "gametime": "16:25", "away": "DET", "home": "ARI", "roof": "dome"},
+    {"week": 5, "gameday": "2026-10-11", "gametime": "16:25", "away": "SF", "home": "SEA", "roof": "outdoors"},
+    {"week": 5, "gameday": "2026-10-11", "gametime": "20:20", "away": "BAL", "home": "ATL", "roof": "dome"},
+    {"week": 5, "gameday": "2026-10-12", "gametime": "20:15", "away": "BUF", "home": "LA", "roof": "outdoors"},
+    {"week": 6, "gameday": "2026-10-15", "gametime": "20:15", "away": "SEA", "home": "DEN", "roof": "outdoors"},
+    {"week": 6, "gameday": "2026-10-18", "gametime": "09:30", "away": "HOU", "home": "JAX", "roof": "outdoors"},
+    {"week": 6, "gameday": "2026-10-18", "gametime": "13:00", "away": "CHI", "home": "ATL", "roof": "dome"},
+    {"week": 6, "gameday": "2026-10-18", "gametime": "13:00", "away": "BAL", "home": "CLE", "roof": "outdoors"},
+    {"week": 6, "gameday": "2026-10-18", "gametime": "13:00", "away": "TEN", "home": "IND", "roof": "dome"},
+    {"week": 6, "gameday": "2026-10-18", "gametime": "13:00", "away": "NYJ", "home": "NE", "roof": "outdoors"},
+    {"week": 6, "gameday": "2026-10-18", "gametime": "13:00", "away": "NO", "home": "NYG", "roof": "outdoors"},
+    {"week": 6, "gameday": "2026-10-18", "gametime": "13:00", "away": "CAR", "home": "PHI", "roof": "outdoors"},
+    {"week": 6, "gameday": "2026-10-18", "gametime": "13:00", "away": "PIT", "home": "TB", "roof": "outdoors"},
+    {"week": 6, "gameday": "2026-10-18", "gametime": "16:05", "away": "ARI", "home": "LA", "roof": "outdoors"},
+    {"week": 6, "gameday": "2026-10-18", "gametime": "16:25", "away": "LAC", "home": "KC", "roof": "outdoors"},
+    {"week": 6, "gameday": "2026-10-18", "gametime": "16:25", "away": "BUF", "home": "LV", "roof": "dome"},
+    {"week": 6, "gameday": "2026-10-18", "gametime": "20:20", "away": "DAL", "home": "GB", "roof": "outdoors"},
+    {"week": 6, "gameday": "2026-10-19", "gametime": "20:15", "away": "WAS", "home": "SF", "roof": "outdoors"},
+    {"week": 7, "gameday": "2026-10-22", "gametime": "20:15", "away": "NE", "home": "CHI", "roof": "outdoors"},
+    {"week": 7, "gameday": "2026-10-25", "gametime": "09:30", "away": "PIT", "home": "NO", "roof": "outdoors"},
+    {"week": 7, "gameday": "2026-10-25", "gametime": "13:00", "away": "SF", "home": "ATL", "roof": "dome"},
+    {"week": 7, "gameday": "2026-10-25", "gametime": "13:00", "away": "CLE", "home": "TEN", "roof": "outdoors"},
+    {"week": 7, "gameday": "2026-10-25", "gametime": "13:00", "away": "IND", "home": "MIN", "roof": "dome"},
+    {"week": 7, "gameday": "2026-10-25", "gametime": "13:00", "away": "MIA", "home": "NYJ", "roof": "outdoors"},
+    {"week": 7, "gameday": "2026-10-25", "gametime": "13:00", "away": "TB", "home": "CAR", "roof": "outdoors"},
+    {"week": 7, "gameday": "2026-10-25", "gametime": "13:00", "away": "CIN", "home": "BAL", "roof": "outdoors"},
+    {"week": 7, "gameday": "2026-10-25", "gametime": "13:00", "away": "NYG", "home": "HOU", "roof": "dome"},
+    {"week": 7, "gameday": "2026-10-25", "gametime": "16:05", "away": "DEN", "home": "ARI", "roof": "dome"},
+    {"week": 7, "gameday": "2026-10-25", "gametime": "16:25", "away": "GB", "home": "DET", "roof": "dome"},
+    {"week": 7, "gameday": "2026-10-25", "gametime": "16:25", "away": "LA", "home": "LV", "roof": "dome"},
+    {"week": 7, "gameday": "2026-10-25", "gametime": "20:20", "away": "KC", "home": "SEA", "roof": "outdoors"},
+    {"week": 7, "gameday": "2026-10-26", "gametime": "20:15", "away": "DAL", "home": "PHI", "roof": "outdoors"},
+    {"week": 8, "gameday": "2026-10-29", "gametime": "20:15", "away": "CAR", "home": "GB", "roof": "outdoors"},
+    {"week": 8, "gameday": "2026-11-01", "gametime": "13:00", "away": "BAL", "home": "BUF", "roof": "outdoors"},
+    {"week": 8, "gameday": "2026-11-01", "gametime": "13:00", "away": "TEN", "home": "CIN", "roof": "outdoors"},
+    {"week": 8, "gameday": "2026-11-01", "gametime": "13:00", "away": "ARI", "home": "DAL", "roof": "dome"},
+    {"week": 8, "gameday": "2026-11-01", "gametime": "13:00", "away": "MIN", "home": "DET", "roof": "dome"},
+    {"week": 8, "gameday": "2026-11-01", "gametime": "13:00", "away": "LV", "home": "NYJ", "roof": "outdoors"},
+    {"week": 8, "gameday": "2026-11-01", "gametime": "13:00", "away": "CLE", "home": "PIT", "roof": "outdoors"},
+    {"week": 8, "gameday": "2026-11-01", "gametime": "13:00", "away": "ATL", "home": "TB", "roof": "outdoors"},
+    {"week": 8, "gameday": "2026-11-01", "gametime": "13:00", "away": "IND", "home": "JAX", "roof": "outdoors"},
+    {"week": 8, "gameday": "2026-11-01", "gametime": "16:05", "away": "LAC", "home": "LA", "roof": "outdoors"},
+    {"week": 8, "gameday": "2026-11-01", "gametime": "16:25", "away": "KC", "home": "DEN", "roof": "outdoors"},
+    {"week": 8, "gameday": "2026-11-01", "gametime": "16:25", "away": "NE", "home": "MIA", "roof": "outdoors"},
+    {"week": 8, "gameday": "2026-11-01", "gametime": "20:20", "away": "PHI", "home": "WAS", "roof": "outdoors"},
+    {"week": 8, "gameday": "2026-11-02", "gametime": "20:15", "away": "CHI", "home": "SEA", "roof": "outdoors"},
+    {"week": 9, "gameday": "2026-11-05", "gametime": "20:15", "away": "JAX", "home": "BAL", "roof": "outdoors"},
+    {"week": 9, "gameday": "2026-11-08", "gametime": "09:30", "away": "CIN", "home": "ATL", "roof": "dome"},
+    {"week": 9, "gameday": "2026-11-08", "gametime": "13:00", "away": "DAL", "home": "IND", "roof": "dome"},
+    {"week": 9, "gameday": "2026-11-08", "gametime": "13:00", "away": "NYJ", "home": "KC", "roof": "outdoors"},
+    {"week": 9, "gameday": "2026-11-08", "gametime": "13:00", "away": "DET", "home": "MIA", "roof": "outdoors"},
+    {"week": 9, "gameday": "2026-11-08", "gametime": "13:00", "away": "CLE", "home": "NO", "roof": "dome"},
+    {"week": 9, "gameday": "2026-11-08", "gametime": "13:00", "away": "NYG", "home": "PHI", "roof": "outdoors"},
+    {"week": 9, "gameday": "2026-11-08", "gametime": "13:00", "away": "LA", "home": "WAS", "roof": "outdoors"},
+    {"week": 9, "gameday": "2026-11-08", "gametime": "13:00", "away": "DEN", "home": "CAR", "roof": "outdoors"},
+    {"week": 9, "gameday": "2026-11-08", "gametime": "16:05", "away": "HOU", "home": "LAC", "roof": "outdoors"},
+    {"week": 9, "gameday": "2026-11-08", "gametime": "16:05", "away": "LV", "home": "SF", "roof": "outdoors"},
+    {"week": 9, "gameday": "2026-11-08", "gametime": "16:25", "away": "GB", "home": "NE", "roof": "outdoors"},
+    {"week": 9, "gameday": "2026-11-08", "gametime": "16:25", "away": "ARI", "home": "SEA", "roof": "outdoors"},
+    {"week": 9, "gameday": "2026-11-08", "gametime": "20:20", "away": "TB", "home": "CHI", "roof": "outdoors"},
+    {"week": 9, "gameday": "2026-11-09", "gametime": "20:15", "away": "BUF", "home": "MIN", "roof": "dome"},
+    {"week": 10, "gameday": "2026-11-12", "gametime": "20:15", "away": "WAS", "home": "NYG", "roof": "outdoors"},
+    {"week": 10, "gameday": "2026-11-15", "gametime": "09:30", "away": "NE", "home": "DET", "roof": "outdoors"},
+    {"week": 10, "gameday": "2026-11-15", "gametime": "13:00", "away": "KC", "home": "ATL", "roof": "dome"},
+    {"week": 10, "gameday": "2026-11-15", "gametime": "13:00", "away": "HOU", "home": "CLE", "roof": "outdoors"},
+    {"week": 10, "gameday": "2026-11-15", "gametime": "13:00", "away": "MIN", "home": "GB", "roof": "outdoors"},
+    {"week": 10, "gameday": "2026-11-15", "gametime": "13:00", "away": "JAX", "home": "TEN", "roof": "outdoors"},
+    {"week": 10, "gameday": "2026-11-15", "gametime": "13:00", "away": "MIA", "home": "IND", "roof": "dome"},
+    {"week": 10, "gameday": "2026-11-15", "gametime": "13:00", "away": "CAR", "home": "NO", "roof": "dome"},
+    {"week": 10, "gameday": "2026-11-15", "gametime": "13:00", "away": "BUF", "home": "NYJ", "roof": "outdoors"},
+    {"week": 10, "gameday": "2026-11-15", "gametime": "16:05", "away": "SEA", "home": "LV", "roof": "dome"},
+    {"week": 10, "gameday": "2026-11-15", "gametime": "16:05", "away": "LA", "home": "ARI", "roof": "dome"},
+    {"week": 10, "gameday": "2026-11-15", "gametime": "16:25", "away": "SF", "home": "DAL", "roof": "dome"},
+    {"week": 10, "gameday": "2026-11-15", "gametime": "20:20", "away": "PIT", "home": "CIN", "roof": "outdoors"},
+    {"week": 10, "gameday": "2026-11-16", "gametime": "20:15", "away": "LAC", "home": "BAL", "roof": "outdoors"},
+]
+
+
 # BUILD MASTER GAME LIST FROM SCHEDULE (source of truth for weeks / dates)
 # -----------------------------
 def _normalize_team_abbr(t: str) -> str:
@@ -818,15 +973,16 @@ def build_upcoming_from_odds(odds_data, schedules: pd.DataFrame) -> List[Dict]:
 
 
 
-def build_upcoming_games(schedules: pd.DataFrame, odds_data: Optional[List], days_ahead: int = 90) -> List[Dict]:
+
+def build_upcoming_games(schedules: pd.DataFrame, odds_data: Optional[List], days_ahead: int = 120) -> List[Dict]:
     """
-    Prefer official schedule for complete weeks/dates/times.
-    Ensures each upcoming week has the full slate (e.g. Week 3 = 16 games)
-    by merging ESPN week payloads when counts are short.
-    Fall back to Odds API list if schedule yields no rows.
+    Build upcoming games using the embedded 2026 official schedule as the
+    primary source of truth (guarantees full weekly slates, e.g. Week 3 = 16).
+    Odds / nflverse / ESPN only overlay lines and weather — they never remove games.
     """
     games: List[Dict] = []
 
+    # Odds index for line overlay only
     odds_by_matchup: Dict[Tuple[str, str], Dict] = {}
     odds_by_date_teams: Dict[Tuple[str, str, str], Dict] = {}
     if odds_data:
@@ -840,216 +996,99 @@ def build_upcoming_games(schedules: pd.DataFrame, odds_data: Optional[List], day
             if commence:
                 odds_by_date_teams[(commence, h, a)] = ev
 
-    try:
-        current = int(nfl.get_current_season())
-    except Exception:
-        current = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
-    cal_year = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
-    current = max(current, cal_year)
-
-    sched_ok = schedules is not None and isinstance(schedules, pd.DataFrame) and not schedules.empty
-    sched = pd.DataFrame()
-    if sched_ok:
-        sched = schedules.copy()
-        if "season" in sched.columns:
-            years = {current, current + 1, current - 1, cal_year}
-            sched_year = sched[sched["season"].isin(list(years))]
-            if not sched_year.empty:
-                sched = sched_year
-        if "game_type" in sched.columns:
-            reg = sched[sched["game_type"].astype(str).str.upper() == "REG"]
-            if not reg.empty:
-                sched = reg
-
-    # Always pull ESPN for current season weeks in the near window so counts are complete
-    try:
-        espn_sched = load_schedules_from_espn(season=current, max_week=10)
-        if not espn_sched.empty:
-            if sched.empty:
-                sched = espn_sched
-            else:
-                # Merge: ESPN fills gaps
-                sched = pd.concat([espn_sched, sched], ignore_index=True, sort=False)
-    except Exception:
-        pass
-
-    if sched is None or sched.empty:
-        if odds_data:
-            return build_upcoming_from_odds(odds_data, schedules if sched_ok else pd.DataFrame())
-        return []
-
-    # Normalize teams
-    for col in ("home_team", "away_team"):
-        if col in sched.columns:
-            sched[col] = sched[col].astype(str).map(_normalize_team_abbr)
-
     today = pd.Timestamp.now().normalize()
-    cutoff = today + pd.Timedelta(days=max(days_ahead, 90))
+    cutoff = today + pd.Timedelta(days=max(days_ahead, 120))
 
-    if "gameday" in sched.columns:
-        sched = sched.copy()
-        sched["_gd"] = pd.to_datetime(sched["gameday"], errors="coerce")
-        sched = sched[sched["_gd"].notna()]
-        # Keep a wide window so full weeks (Thu–Mon) stay intact
-        sched = sched[(sched["_gd"] >= today - pd.Timedelta(days=3)) & (sched["_gd"] <= cutoff)]
-
-    # Keep unplayed games when possible
-    if "result" in sched.columns and not sched.empty:
-        unplayed = sched[sched["result"].isna()]
-        if not unplayed.empty:
-            sched = unplayed
-        elif "home_score" in sched.columns:
-            no_score = sched[sched["home_score"].isna()]
-            if not no_score.empty:
-                sched = no_score
-
-    # Dedupe by week + matchup (not gameday) so timezone variants don't drop games
-    if not sched.empty and "week" in sched.columns and "home_team" in sched.columns and "away_team" in sched.columns:
-        sched = sched.drop_duplicates(subset=["week", "home_team", "away_team"], keep="first")
-
-    # If any week in range has fewer than 14 REG games, re-fetch that week from ESPN and top up
-    if "week" in sched.columns and not sched.empty:
-        for wk in sorted(sched["week"].dropna().unique()):
-            try:
-                wk = int(wk)
-            except Exception:
+    # ---- Primary: embedded official slate ----
+    for row in EMBEDDED_2026_SCHEDULE:
+        try:
+            gameday = row["gameday"]
+            gd = pd.to_datetime(gameday, errors="coerce")
+            if pd.isna(gd):
                 continue
-            if wk < 1 or wk > 18:
+            # Keep games from 2 days ago through cutoff (full weeks intact)
+            if gd < today - pd.Timedelta(days=2) or gd > cutoff:
                 continue
-            week_rows = sched[sched["week"] == wk]
-            if len(week_rows) >= 14:
-                continue
-            try:
-                url = (
-                    "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-                    f"?seasontype=2&week={wk}&dates={current}"
-                )
-                r = requests.get(url, timeout=15)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
-                extra = []
-                for ev in data.get("events") or []:
-                    comps = ev.get("competitions") or []
-                    if not comps:
-                        continue
-                    comp = comps[0]
-                    competitors = comp.get("competitors") or []
-                    home = next((c for c in competitors if c.get("homeAway") == "home"), None)
-                    away = next((c for c in competitors if c.get("homeAway") == "away"), None)
-                    if not home or not away:
-                        continue
-                    home_abbr = _normalize_team_abbr((home.get("team") or {}).get("abbreviation") or "")
-                    away_abbr = _normalize_team_abbr((away.get("team") or {}).get("abbreviation") or "")
-                    if not home_abbr or not away_abbr:
-                        continue
-                    # Skip if already present
-                    exists = (
-                        (sched["week"] == wk)
-                        & (sched["home_team"] == home_abbr)
-                        & (sched["away_team"] == away_abbr)
-                    ).any()
-                    if exists:
-                        continue
-                    date_iso = ev.get("date") or ""
-                    gameday, gametime = "", ""
-                    if date_iso:
-                        try:
-                            ts = pd.to_datetime(date_iso, utc=True)
-                            try:
-                                from zoneinfo import ZoneInfo
-                                ts_et = ts.tz_convert(ZoneInfo("America/New_York"))
-                            except Exception:
-                                ts_et = ts.tz_convert(None) - pd.Timedelta(hours=4)
-                            gameday = ts_et.strftime("%Y-%m-%d")
-                            gametime = ts_et.strftime("%H:%M")
-                        except Exception:
-                            gameday = date_iso[:10]
-                    extra.append({
-                        "game_id": f"{current}_{wk:02d}_{away_abbr}_{home_abbr}",
-                        "season": current,
-                        "game_type": "REG",
-                        "week": wk,
-                        "gameday": gameday,
-                        "gametime": gametime,
-                        "away_team": away_abbr,
-                        "home_team": home_abbr,
-                        "result": None,
-                        "roof": "outdoors",
-                    })
-                if extra:
-                    sched = pd.concat([sched, pd.DataFrame(extra)], ignore_index=True, sort=False)
-                    sched = sched.drop_duplicates(subset=["week", "home_team", "away_team"], keep="first")
-            except Exception:
-                continue
+            home = _normalize_team_abbr(row["home"])
+            away = _normalize_team_abbr(row["away"])
+            week = int(row["week"])
+            gametime = row.get("gametime") or "13:00"
+            roof = row.get("roof") or "outdoors"
 
-    for _, row in sched.iterrows():
-        home = _normalize_team_abbr(row.get("home_team", ""))
-        away = _normalize_team_abbr(row.get("away_team", ""))
-        if not home or not away:
+            odds_ev = odds_by_date_teams.get((gameday, home, away)) or odds_by_matchup.get((home, away))
+            commence_raw = (odds_ev.get("commence_time") if odds_ev else "") or ""
+            kickoff = format_schedule_kickoff(gameday, gametime)
+
+            avg_spread, avg_total = _extract_odds_lines(odds_ev, home)
+            if avg_total is None:
+                avg_total = 45.0
+
+            games.append({
+                "week": week,
+                "gameday": gameday,
+                "gametime": gametime,
+                "kickoff": kickoff,
+                "home": home,
+                "away": away,
+                "home_full": full_name(home),
+                "away_full": full_name(away),
+                "roof": roof,
+                "avg_spread": avg_spread,
+                "avg_total": avg_total,
+                "odds_event": odds_ev,
+                "commence_raw": commence_raw or f"{gameday}T{gametime}:00Z",
+                "game_id": f"2026_{week:02d}_{away}_{home}",
+            })
+        except Exception:
             continue
 
-        gameday = str(row.get("gameday", ""))[:10]
-        gametime = row.get("gametime")
-        week = row.get("week")
+    # If embedded produced nothing (e.g. far future), fall back to schedule DF / odds
+    if not games and schedules is not None and not getattr(schedules, "empty", True):
         try:
-            week = int(week) if pd.notna(week) else None
+            sched = schedules.copy()
+            if "gameday" in sched.columns:
+                sched["_gd"] = pd.to_datetime(sched["gameday"], errors="coerce")
+                sched = sched[sched["_gd"].notna()]
+                sched = sched[(sched["_gd"] >= today - pd.Timedelta(days=2)) & (sched["_gd"] <= cutoff)]
+            for _, row in sched.iterrows():
+                home = _normalize_team_abbr(row.get("home_team", ""))
+                away = _normalize_team_abbr(row.get("away_team", ""))
+                if not home or not away:
+                    continue
+                gameday = str(row.get("gameday", ""))[:10]
+                gametime = row.get("gametime") or "13:00"
+                week = row.get("week")
+                try:
+                    week = int(week) if pd.notna(week) else estimate_week_from_date(gameday)
+                except Exception:
+                    week = estimate_week_from_date(gameday)
+                odds_ev = odds_by_date_teams.get((gameday, home, away)) or odds_by_matchup.get((home, away))
+                avg_spread, avg_total = _extract_odds_lines(odds_ev, home)
+                if avg_total is None:
+                    avg_total = 45.0
+                games.append({
+                    "week": week,
+                    "gameday": gameday,
+                    "gametime": gametime,
+                    "kickoff": format_schedule_kickoff(gameday, gametime),
+                    "home": home,
+                    "away": away,
+                    "home_full": full_name(home),
+                    "away_full": full_name(away),
+                    "roof": str(row.get("roof") or "outdoors").lower(),
+                    "avg_spread": avg_spread,
+                    "avg_total": avg_total,
+                    "odds_event": odds_ev,
+                    "commence_raw": (odds_ev.get("commence_time") if odds_ev else "") or f"{gameday}T{gametime}:00Z",
+                    "game_id": row.get("game_id"),
+                })
         except Exception:
-            week = None
-        roof = str(row.get("roof", "outdoors") or "outdoors").lower().strip()
-
-        odds_ev = None
-        if gameday:
-            odds_ev = odds_by_date_teams.get((gameday, home, away))
-        if odds_ev is None:
-            odds_ev = odds_by_matchup.get((home, away))
-
-        commence_raw = (odds_ev.get("commence_time") if odds_ev else "") or ""
-        if gametime and str(gametime) not in ("None", "nan", ""):
-            kickoff = format_schedule_kickoff(gameday, gametime)
-        elif commence_raw:
-            kickoff = format_kickoff(commence_raw)
-        else:
-            kickoff = format_schedule_kickoff(gameday, None)
-
-        avg_spread, avg_total = _extract_odds_lines(odds_ev, home)
-        if avg_spread is None and pd.notna(row.get("spread_line")):
-            try:
-                avg_spread = float(row["spread_line"])
-            except Exception:
-                pass
-        if avg_total is None and pd.notna(row.get("total_line")):
-            try:
-                avg_total = float(row["total_line"])
-            except Exception:
-                pass
-        if avg_total is None:
-            avg_total = 45.0
-
-        if week is None and gameday:
-            week = estimate_week_from_date(gameday)
-
-        games.append({
-            "week": week,
-            "gameday": gameday,
-            "gametime": gametime,
-            "kickoff": kickoff,
-            "home": home,
-            "away": away,
-            "home_full": full_name(home),
-            "away_full": full_name(away),
-            "roof": roof,
-            "avg_spread": avg_spread,
-            "avg_total": avg_total,
-            "odds_event": odds_ev,
-            "commence_raw": commence_raw or (f"{gameday}T{(str(gametime) if gametime else '17:00')}:00Z" if gameday else ""),
-            "game_id": row.get("game_id"),
-        })
+            pass
 
     if not games and odds_data:
-        games = build_upcoming_from_odds(odds_data, schedules if sched_ok else pd.DataFrame())
+        games = build_upcoming_from_odds(odds_data, schedules if schedules is not None else pd.DataFrame())
 
-    # Final dedupe by week+matchup
+    # Dedupe week+matchup
     seen = set()
     unique = []
     for g in games:
@@ -1058,7 +1097,7 @@ def build_upcoming_games(schedules: pd.DataFrame, odds_data: Optional[List], day
             continue
         seen.add(key)
         unique.append(g)
-    unique.sort(key=lambda g: (g.get("gameday") or "", str(g.get("gametime") or ""), g.get("kickoff") or ""))
+    unique.sort(key=lambda g: (g.get("gameday") or "", str(g.get("gametime") or "")))
     return unique
 
 
