@@ -316,11 +316,120 @@ def _to_pandas(obj) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# ESPN team abbr -> our standard abbr
+_ESPN_ABBR = {
+    "WSH": "WAS", "LAR": "LA", "JAC": "JAX",
+}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_schedules_from_espn(season: int = None, max_week: int = 18) -> pd.DataFrame:
+    """
+    Fetch the official NFL schedule from ESPN's public scoreboard API.
+    Returns a DataFrame with columns compatible with nflverse schedules
+    (season, week, gameday, gametime, home_team, away_team, game_type, roof, ...).
+    This is the most reliable source for complete weeks (includes NE@JAX, PHI@CHI, etc.).
+    """
+    if season is None:
+        season = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
+    rows = []
+    for week in range(1, max_week + 1):
+        try:
+            url = (
+                "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+                f"?seasontype=2&week={week}&dates={season}"
+            )
+            r = requests.get(url, timeout=20)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            events = data.get("events") or []
+            if not events:
+                # No more scheduled weeks
+                if week > 1:
+                    break
+                continue
+            for ev in events:
+                try:
+                    comps = ev.get("competitions") or []
+                    if not comps:
+                        continue
+                    comp = comps[0]
+                    competitors = comp.get("competitors") or []
+                    home = next((c for c in competitors if c.get("homeAway") == "home"), None)
+                    away = next((c for c in competitors if c.get("homeAway") == "away"), None)
+                    if not home or not away:
+                        continue
+                    home_abbr = (home.get("team") or {}).get("abbreviation") or ""
+                    away_abbr = (away.get("team") or {}).get("abbreviation") or ""
+                    home_abbr = _ESPN_ABBR.get(home_abbr, home_abbr)
+                    away_abbr = _ESPN_ABBR.get(away_abbr, away_abbr)
+                    if not home_abbr or not away_abbr:
+                        continue
+
+                    # Date/time in UTC ISO from ESPN
+                    date_iso = ev.get("date") or comp.get("date") or ""
+                    gameday = ""
+                    gametime = ""
+                    if date_iso:
+                        try:
+                            ts = pd.to_datetime(date_iso, utc=True)
+                            try:
+                                from zoneinfo import ZoneInfo
+                                ts_et = ts.tz_convert(ZoneInfo("America/New_York"))
+                            except Exception:
+                                ts_et = ts.tz_convert(None) - pd.Timedelta(hours=4)
+                            gameday = ts_et.strftime("%Y-%m-%d")
+                            gametime = ts_et.strftime("%H:%M")
+                        except Exception:
+                            gameday = date_iso[:10]
+
+                    # Completed?
+                    status = ((comp.get("status") or {}).get("type") or {}).get("name") or ""
+                    home_score = home.get("score")
+                    away_score = away.get("score")
+                    result = None
+                    if status in ("STATUS_FINAL", "STATUS_FULL_TIME") and home_score is not None and away_score is not None:
+                        try:
+                            result = float(home_score) - float(away_score)
+                        except Exception:
+                            result = 0.0
+
+                    venue = (comp.get("venue") or {})
+                    indoor = venue.get("indoor")
+                    roof = "dome" if indoor else "outdoors"
+
+                    rows.append({
+                        "game_id": f"{season}_{week:02d}_{away_abbr}_{home_abbr}",
+                        "season": season,
+                        "game_type": "REG",
+                        "week": week,
+                        "gameday": gameday,
+                        "gametime": gametime,
+                        "away_team": away_abbr,
+                        "home_team": home_abbr,
+                        "away_score": float(away_score) if away_score not in (None, "") else None,
+                        "home_score": float(home_score) if home_score not in (None, "") else None,
+                        "result": result,
+                        "roof": roof,
+                        "spread_line": None,
+                        "total_line": None,
+                        "espn_id": ev.get("id"),
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_schedules_from_nflverse_release() -> pd.DataFrame:
     """
     Load the full multi-season schedule CSV published by nflverse.
-    Most reliable source for complete 2026 weeks/dates/times (NE@JAX, PHI@CHI, etc.).
     """
     urls = [
         "https://github.com/nflverse/nflverse-data/releases/download/schedules/games.csv",
@@ -340,14 +449,16 @@ def load_schedules_from_nflverse_release() -> pd.DataFrame:
     return pd.DataFrame()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_schedules(seasons: Optional[List[int]] = None) -> pd.DataFrame:
     """
-    Load NFL schedules robustly.
+    Load NFL schedules from multiple sources and merge.
 
-    Priority:
-      1) Official nflverse release CSV (complete weeks/dates/times, including 2026)
-      2) nflreadpy package per-season loads
+    Priority / merge order:
+      1) ESPN scoreboard API (most complete live weeks for current season)
+      2) nflverse release CSV
+      3) nflreadpy package
+    Later sources fill gaps; ESPN rows win on conflicts for current season.
     """
     try:
         if seasons is None:
@@ -355,48 +466,73 @@ def load_schedules(seasons: Optional[List[int]] = None) -> pd.DataFrame:
                 current = int(nfl.get_current_season())
             except Exception:
                 current = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
-            # Always include the calendar NFL year (e.g. 2026 in Sep 2026) even if package lags
             cal_year = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
             current = max(current, cal_year)
             seasons = list(range(current - 3, current + 2))
         seasons = list(dict.fromkeys(int(s) for s in seasons))
+        current_season = max(seasons)
 
-        # 1) Preferred: full release CSV
-        release = load_schedules_from_nflverse_release()
-        if not release.empty:
-            if "season" in release.columns:
-                filtered = release[release["season"].isin(seasons)]
-                if not filtered.empty:
-                    release = filtered
-            if not release.empty:
-                if "game_id" in release.columns:
-                    release = release.drop_duplicates(subset=["game_id"], keep="last")
-                return release.reset_index(drop=True)
-
-        # 2) Fallback: nflreadpy package
         frames = []
-        for yr in seasons:
-            try:
-                raw = nfl.load_schedules(seasons=[yr])
-                pdf = _to_pandas(raw)
-                if pdf is not None and not pdf.empty:
-                    frames.append(pdf)
-            except Exception:
-                continue
-        if not frames:
-            try:
-                raw = nfl.load_schedules(seasons=seasons)
-                pdf = _to_pandas(raw)
-                if pdf is not None and not pdf.empty:
-                    frames.append(pdf)
-            except Exception:
-                pass
+
+        # 1) ESPN – current season full slate
+        try:
+            espn = load_schedules_from_espn(season=current_season, max_week=18)
+            if not espn.empty:
+                frames.append(espn)
+        except Exception:
+            pass
+
+        # 2) nflverse CSV
+        try:
+            release = load_schedules_from_nflverse_release()
+            if not release.empty:
+                if "season" in release.columns:
+                    release = release[release["season"].isin(seasons)]
+                if not release.empty:
+                    frames.append(release)
+        except Exception:
+            pass
+
+        # 3) nflreadpy package
+        try:
+            for yr in seasons:
+                try:
+                    raw = nfl.load_schedules(seasons=[yr])
+                    pdf = _to_pandas(raw)
+                    if pdf is not None and not pdf.empty:
+                        frames.append(pdf)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
         if not frames:
             return pd.DataFrame()
-        sched = pd.concat(frames, ignore_index=True)
-        if "game_id" in sched.columns:
-            sched = sched.drop_duplicates(subset=["game_id"], keep="last")
-        return sched
+
+        # Normalize key columns and merge, preferring earlier frames (ESPN first)
+        normalized = []
+        for f in frames:
+            f = f.copy()
+            for col in ("home_team", "away_team"):
+                if col in f.columns:
+                    f[col] = f[col].astype(str).str.upper().replace({
+                        "WSH": "WAS", "WFT": "WAS", "LAR": "LA", "STL": "LA",
+                        "JAC": "JAX", "GNB": "GB", "KAN": "KC", "NWE": "NE",
+                        "NOR": "NO", "SFO": "SF", "TAM": "TB", "OAK": "LV", "LVR": "LV", "SD": "LAC",
+                    })
+            if "gameday" in f.columns:
+                f["gameday"] = f["gameday"].astype(str).str[:10]
+            normalized.append(f)
+
+        sched = pd.concat(normalized, ignore_index=True, sort=False)
+
+        # Prefer ESPN/first occurrence per matchup+date
+        if "gameday" in sched.columns and "home_team" in sched.columns and "away_team" in sched.columns:
+            sched = sched.drop_duplicates(subset=["gameday", "home_team", "away_team"], keep="first")
+        elif "game_id" in sched.columns:
+            sched = sched.drop_duplicates(subset=["game_id"], keep="first")
+
+        return sched.reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
 
@@ -681,7 +817,7 @@ def build_upcoming_from_odds(odds_data, schedules: pd.DataFrame) -> List[Dict]:
     return games
 
 
-def build_upcoming_games(schedules: pd.DataFrame, odds_data: Optional[List], days_ahead: int = 60) -> List[Dict]:
+def build_upcoming_games(schedules: pd.DataFrame, odds_data: Optional[List], days_ahead: int = 90) -> List[Dict]:
     """
     Prefer official schedule for complete weeks/dates/times.
     Fall back to Odds API list if schedule yields no rows.
@@ -724,7 +860,7 @@ def build_upcoming_games(schedules: pd.DataFrame, odds_data: Optional[List], day
                     sched = reg
 
             today = pd.Timestamp.now().normalize()
-            cutoff = today + pd.Timedelta(days=days_ahead)
+            cutoff = today + pd.Timedelta(days=max(days_ahead, 90))
 
             if "gameday" in sched.columns:
                 sched = sched.copy()
@@ -1079,7 +1215,7 @@ with tab1:
         model_bundle = train_ats_model(list(range(current_season - 4, current_season)))
         # Source of truth: schedule-driven game list (includes every week 1–18 game)
         # Falls back to Odds API events if schedule rows are empty
-        upcoming = build_upcoming_games(schedules, odds_data, days_ahead=60)
+        upcoming = build_upcoming_games(schedules, odds_data, days_ahead=90)
         weather_cache = build_weather_cache_from_games(upcoming)
 
     c1, c2, c3, c4, c5 = st.columns(5)
