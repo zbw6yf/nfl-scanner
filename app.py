@@ -1017,6 +1017,80 @@ EMBEDDED_2026_SCHEDULE = [
 ]
 
 
+
+def _normalize_team_abbr(t: str) -> str:
+    t = str(t or "").strip().upper()
+    aliases = {
+        "LAR": "LA", "STL": "LA", "WSH": "WAS", "WFT": "WAS", "JAC": "JAX",
+        "GNB": "GB", "KAN": "KC", "NWE": "NE", "NOR": "NO", "SFO": "SF",
+        "TAM": "TB", "OAK": "LV", "LVR": "LV", "SD": "LAC",
+    }
+    return aliases.get(t, t)
+
+
+def _extract_odds_lines(odds_ev, home_abbr: str):
+    """Return (avg_spread home, avg_total) from an Odds API event."""
+    if not odds_ev:
+        return None, None
+    spreads, totals = [], []
+    home_full = odds_ev.get("home_team", full_name(home_abbr))
+    for book in odds_ev.get("bookmakers", []) or []:
+        for market in book.get("markets", []) or []:
+            if market.get("key") == "spreads":
+                for o in market.get("outcomes", []) or []:
+                    if o.get("name") == home_full and o.get("point") is not None:
+                        spreads.append(o.get("point"))
+            elif market.get("key") == "totals":
+                for o in market.get("outcomes", []) or []:
+                    if o.get("name") == "Over" and o.get("point") is not None:
+                        totals.append(o.get("point"))
+    avg_spread = float(np.mean(spreads)) if spreads else None
+    avg_total = float(np.mean(totals)) if totals else None
+    return avg_spread, avg_total
+
+
+def build_upcoming_from_odds(odds_data, schedules: pd.DataFrame) -> List[Dict]:
+    """Fallback: build game list purely from Odds API events."""
+    games = []
+    if not odds_data:
+        return games
+    for ev in odds_data:
+        home_full = ev.get("home_team", "")
+        away_full = ev.get("away_team", "")
+        home = _normalize_team_abbr(to_abbr(home_full) or "")
+        away = _normalize_team_abbr(to_abbr(away_full) or "")
+        if not home or not away:
+            continue
+        commence_raw = ev.get("commence_time") or ""
+        kickoff = format_kickoff(commence_raw) if commence_raw else ""
+        game_date = commence_raw[:10] if len(commence_raw) >= 10 else ""
+        avg_spread, avg_total = _extract_odds_lines(ev, home)
+        if avg_total is None:
+            avg_total = 45.0
+        week = None
+        if game_date:
+            week = get_week(schedules, home, away, game_date) if (schedules is not None and not getattr(schedules, "empty", True)) else estimate_week_from_date(game_date)
+        roof = get_roof(schedules, home, game_date) if (schedules is not None and not getattr(schedules, "empty", True)) else "outdoors"
+        games.append({
+            "week": week,
+            "gameday": game_date,
+            "gametime": None,
+            "kickoff": kickoff,
+            "home": home,
+            "away": away,
+            "home_full": home_full or full_name(home),
+            "away_full": away_full or full_name(away),
+            "roof": roof,
+            "avg_spread": avg_spread,
+            "avg_total": avg_total,
+            "odds_event": ev,
+            "commence_raw": commence_raw,
+            "game_id": ev.get("id"),
+        })
+    games.sort(key=lambda g: (g.get("gameday") or "", g.get("kickoff") or ""))
+    return games
+
+
 def build_upcoming_games(schedules: pd.DataFrame, odds_data: Optional[List], days_ahead: int = 120) -> List[Dict]:
     """
     Build upcoming games using the embedded 2026 official schedule as the
