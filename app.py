@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import numpy as np
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 import warnings
 warnings.filterwarnings("ignore")
@@ -739,6 +740,266 @@ def implied_team_totals(spread: float, total: float) -> Tuple[float, float]:
     home_imp = (total - spread) / 2.0
     away_imp = (total + spread) / 2.0
     return home_imp, away_imp
+
+
+def american_to_implied_prob(american_odds) -> Optional[float]:
+    """Convert American odds to implied probability (no-vig raw)."""
+    try:
+        o = float(american_odds)
+    except Exception:
+        return None
+    if o < 0:
+        return (-o) / ((-o) + 100.0)
+    if o > 0:
+        return 100.0 / (o + 100.0)
+    return None
+
+
+def remove_vig_two_way(p_home: float, p_away: float) -> Tuple[float, float]:
+    """Normalize two-way implied probs so they sum to 1."""
+    s = p_home + p_away
+    if s <= 0:
+        return 0.5, 0.5
+    return p_home / s, p_away / s
+
+
+def extract_moneylines(odds_ev: Optional[Dict], home_full: str, away_full: str) -> Tuple[Optional[float], Optional[float]]:
+    """Average American moneylines for home/away from an Odds API event."""
+    if not odds_ev:
+        return None, None
+    home_mls, away_mls = [], []
+    for book in odds_ev.get("bookmakers", []) or []:
+        for market in book.get("markets", []) or []:
+            if market.get("key") != "h2h":
+                continue
+            for o in market.get("outcomes", []) or []:
+                name = o.get("name")
+                price = o.get("price")
+                if price is None:
+                    continue
+                if name == home_full:
+                    home_mls.append(float(price))
+                elif name == away_full:
+                    away_mls.append(float(price))
+    h = float(np.mean(home_mls)) if home_mls else None
+    a = float(np.mean(away_mls)) if away_mls else None
+    return h, a
+
+
+def market_home_win_prob(odds_ev: Optional[Dict], home_full: str, away_full: str, spread: Optional[float] = None) -> Optional[float]:
+    """
+    Fair market probability home wins (or covers if only spread available).
+    Prefer moneyline; fall back to rough spread→prob conversion.
+    """
+    h_ml, a_ml = extract_moneylines(odds_ev, home_full, away_full)
+    if h_ml is not None and a_ml is not None:
+        ph = american_to_implied_prob(h_ml)
+        pa = american_to_implied_prob(a_ml)
+        if ph is not None and pa is not None:
+            ph, pa = remove_vig_two_way(ph, pa)
+            return ph
+    # Fallback: approximate cover/win prob from spread (home line)
+    if spread is not None:
+        # logistic-ish: P(home covers) ≈ 0.5 + spread/25, clamped
+        try:
+            # Negative spread = home favorite → higher cover prob of the spread line itself isn't win prob
+            # For outright win approx: favorite by S points → P(win) ≈ 0.5 + min(0.35, abs(S)*0.03)*sign
+            s = float(spread)
+            # home spread line: negative means home favored by |s|
+            edge = -s  # positive if home favorite
+            p = 0.5 + max(-0.35, min(0.35, edge * 0.03))
+            return float(p)
+        except Exception:
+            return None
+    return None
+
+
+def compute_edge(model_prob: float, market_prob: Optional[float]) -> Optional[float]:
+    """Model probability edge vs market (percentage points)."""
+    if market_prob is None:
+        return None
+    return (model_prob - market_prob) * 100.0
+
+
+def clv_spread(line_taken: float, closing_line: float, side: str) -> float:
+    """
+    Closing line value in points for an ATS bet.
+    side: 'home' or 'away' — line_taken is the home spread when side=home,
+    or the away spread (usually -home_spread) when side=away.
+    Positive CLV = you got a better number than close.
+    """
+    try:
+        lt = float(line_taken)
+        cl = float(closing_line)
+    except Exception:
+        return 0.0
+    side = (side or "home").lower()
+    if side == "home":
+        # Took home +3, closed home +1 → CLV = +2 (better)
+        return lt - cl
+    # Away side: away line is typically -home_line
+    # Took away -3 (home was +3), close away -1 (home +1) → better by 2
+    return cl - lt
+
+
+def clv_total(line_taken: float, closing_total: float, side: str) -> float:
+    """CLV for totals in points. Over: higher line taken is better. Under: lower is better."""
+    try:
+        lt = float(line_taken)
+        cl = float(closing_total)
+    except Exception:
+        return 0.0
+    side = (side or "over").lower()
+    if side == "over":
+        return lt - cl  # took 47, closed 45.5 → +1.5
+    return cl - lt  # under: took 44, closed 45.5 → +1.5
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_injury_flags() -> Dict[str, Dict[str, Any]]:
+    """
+    Fetch ESPN injury report. Returns dict[team_abbr] = {
+      'flag': str summary, 'qb_out': bool, 'key_out': int, 'details': list
+    }
+    """
+    ESPN_ABBR = {
+        "WSH": "WAS", "LAR": "LA", "JAC": "JAX",
+    }
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        r = requests.get(
+            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/injuries",
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return out
+        data = r.json()
+        # Build id -> abbr map
+        id_to_abbr = {}
+        try:
+            tr = requests.get(
+                "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams",
+                timeout=15,
+            )
+            if tr.status_code == 200:
+                teams = (
+                    tr.json()
+                    .get("sports", [{}])[0]
+                    .get("leagues", [{}])[0]
+                    .get("teams", [])
+                )
+                for t in teams:
+                    tm = t.get("team", t)
+                    abbr = ESPN_ABBR.get(tm.get("abbreviation"), tm.get("abbreviation"))
+                    if abbr and tm.get("id"):
+                        id_to_abbr[str(tm["id"])] = abbr
+        except Exception:
+            pass
+
+        for block in data.get("injuries") or []:
+            team_id = str(block.get("id") or "")
+            display = block.get("displayName") or ""
+            abbr = id_to_abbr.get(team_id) or to_abbr(display) or _normalize_team_abbr(display)
+            if not abbr or len(abbr) > 3:
+                # try map from display name
+                abbr = to_abbr(display) or ""
+            if not abbr:
+                continue
+            abbr = _normalize_team_abbr(abbr)
+            qb_out = False
+            key_out = 0
+            details = []
+            severe = {"out", "injured reserve", "doubtful", "ir"}
+            for inj in block.get("injuries") or []:
+                status = (inj.get("status") or "").strip()
+                status_l = status.lower()
+                ath = inj.get("athlete") or {}
+                name = ath.get("displayName") or ath.get("shortName") or "?"
+                pos = ath.get("position")
+                if isinstance(pos, dict):
+                    pos = pos.get("abbreviation") or pos.get("displayName") or ""
+                pos = (pos or "").upper()
+                if status_l in severe or status_l.startswith("out") or "reserve" in status_l:
+                    key_out += 1
+                    details.append(f"{name} ({pos}) {status}")
+                    if pos == "QB":
+                        qb_out = True
+                elif status_l in ("questionable", "q"):
+                    details.append(f"{name} ({pos}) Q")
+            flag_parts = []
+            if qb_out:
+                flag_parts.append("QB OUT")
+            if key_out:
+                flag_parts.append(f"{key_out} OUT/IR")
+            out[abbr] = {
+                "flag": " · ".join(flag_parts) if flag_parts else "",
+                "qb_out": qb_out,
+                "key_out": key_out,
+                "details": details[:8],
+            }
+    except Exception:
+        return out
+    return out
+
+
+def injury_label_for_game(home: str, away: str, injury_map: Dict[str, Dict]) -> str:
+    parts = []
+    for team, label in ((away, "Away"), (home, "Home")):
+        info = injury_map.get(team) or {}
+        if info.get("qb_out"):
+            parts.append(f"{label} QB OUT")
+        elif info.get("key_out", 0) >= 2:
+            parts.append(f"{label} {info['key_out']} OUT")
+        elif info.get("flag"):
+            parts.append(f"{label}: {info['flag']}")
+    return " · ".join(parts) if parts else "—"
+
+
+# ---- Bet log / unit tracker helpers ----
+BET_LOG_PATH = Path("/home/workdir/artifacts/bet_log.csv")
+
+
+def _load_bet_log() -> pd.DataFrame:
+    cols = [
+        "id", "logged_at", "week", "game", "bet_type", "side", "line_taken",
+        "odds", "units", "model_prob", "market_prob", "edge_pct",
+        "closing_line", "result", "profit_units", "clv", "notes",
+    ]
+    if "bet_log_df" in st.session_state and isinstance(st.session_state["bet_log_df"], pd.DataFrame):
+        return st.session_state["bet_log_df"]
+    try:
+        if BET_LOG_PATH.exists():
+            df = pd.read_csv(BET_LOG_PATH)
+            st.session_state["bet_log_df"] = df
+            return df
+    except Exception:
+        pass
+    df = pd.DataFrame(columns=cols)
+    st.session_state["bet_log_df"] = df
+    return df
+
+
+def _save_bet_log(df: pd.DataFrame) -> None:
+    st.session_state["bet_log_df"] = df
+    try:
+        df.to_csv(BET_LOG_PATH, index=False)
+    except Exception:
+        pass
+
+
+def american_profit(units: float, american_odds: float, won: bool) -> float:
+    if not won:
+        return -abs(units)
+    try:
+        o = float(american_odds)
+    except Exception:
+        o = -110
+    if o < 0:
+        return abs(units) * (100.0 / (-o))
+    return abs(units) * (o / 100.0)
+
+
+
 # Embedded FULL 2026 REG schedule Weeks 1-18 (ESPN official)
 # Source of truth for matchups / dates / times — never drop games from this list.
 EMBEDDED_2026_SCHEDULE = [
@@ -1461,11 +1722,12 @@ def monte_carlo_game(
 # -----------------------------
 # TABS
 # -----------------------------
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🎯 Opportunities",
     "📅 Games & Odds",
     "🎯 Player Props",
-    "📊 Backtest"
+    "📊 Bankroll & CLV",
+    "📈 Backtest"
 ])
 # ========== TAB 1 ==========
 with tab1:
@@ -1484,6 +1746,10 @@ with tab1:
         # Source of truth: schedule-driven game list (includes every week 1–18 game)
         # Falls back to Odds API events if schedule rows are empty
         upcoming = build_upcoming_games(schedules, odds_data, days_ahead=90)
+        try:
+            injury_map = load_injury_flags()
+        except Exception:
+            injury_map = {}
         weather_cache = build_weather_cache_from_games(upcoming)
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -1658,6 +1924,37 @@ with tab1:
                     rec = "Lean Under"
                 else:
                     rec = "No strong lean"
+
+                # Market edge: blend ML + MC home cover/win vs market implied
+                odds_ev = g.get("odds_event")
+                model_home = 0.5 * ml_home + 0.5 * mc["home_cover_prob"]
+                mkt_home = market_home_win_prob(odds_ev, home_full, away_full, avg_spread)
+                edge_home = compute_edge(model_home, mkt_home)
+                # Side edge aligned to recommendation
+                if rec == "Lean Away ATS":
+                    model_side = 1.0 - model_home
+                    mkt_side = (1.0 - mkt_home) if mkt_home is not None else None
+                    edge_pct = compute_edge(model_side, mkt_side)
+                elif rec in ("Lean Over", "Lean Under"):
+                    # totals edge vs 50/50 market baseline adjusted by under bias already in MC
+                    if rec == "Lean Over":
+                        edge_pct = (mc["over_prob"] - 0.5) * 100.0
+                    else:
+                        edge_pct = (mc["under_prob"] - 0.5) * 100.0
+                else:
+                    edge_pct = edge_home
+
+                # Injury flags
+                try:
+                    inj_map = injury_map if isinstance(injury_map, dict) else {}
+                except NameError:
+                    inj_map = {}
+                inj_label = injury_label_for_game(home, away, inj_map)
+                if inj_label and inj_label != "—":
+                    signals.append(inj_label)
+                    if "QB OUT" in inj_label:
+                        total_score += 1.2
+
                 if roof in ("dome", "closed"):
                     wx_str = "Dome"
                 else:
@@ -1683,12 +1980,24 @@ with tab1:
                     "Pace": f"{combined_pace:.1f}",
                     "TZ Diff": f"{tz_diff}h" if tz_diff else "0",
                     "Div": "Yes" if div_flag else "No",
+                    "Model %": f"{model_home*100:.1f}%",
+                    "Market %": f"{mkt_home*100:.1f}%" if mkt_home is not None else "—",
+                    "Edge %": f"{edge_pct:+.1f}" if edge_pct is not None else "—",
+                    "Injury": inj_label,
                     "ML Home %": f"{ml_home*100:.1f}%",
                     "MC Home %": f"{mc['home_cover_prob']*100:.1f}%",
                     "MC Over %": f"{mc['over_prob']*100:.1f}%",
                     "Recommendation": rec,
                     "Signals": " • ".join(signals) if signals else "—",
-                    "Score": round(total_score, 2)
+                    "Score": round(total_score, 2),
+                    # hidden numeric helpers for tracker
+                    "_model_prob": model_home,
+                    "_market_prob": mkt_home if mkt_home is not None else None,
+                    "_edge_pct": edge_pct,
+                    "_spread": avg_spread,
+                    "_total": avg_total,
+                    "_home": home,
+                    "_away": away,
                 })
             except Exception as e:
                 skipped.append(f"Error: {e}")
@@ -1762,7 +2071,8 @@ with tab1:
                 + ")"
                 + week_note
             )
-            display_df = filtered.drop(columns=["_Week_num"], errors="ignore")
+            helper_cols = [c for c in filtered.columns if c.startswith("_")]
+            display_df = filtered.drop(columns=["_Week_num"] + helper_cols, errors="ignore")
             st.dataframe(display_df, use_container_width=True, hide_index=True)
 
             # ---- TOP 5 SIGNALED GAMES BY WEEK ----
@@ -1991,7 +2301,155 @@ with tab3:
                     st.warning("No props returned.")
 
 # ========== TAB 4 ==========
+
 with tab4:
+    st.subheader("Bankroll & Closing Line Value")
+    st.caption(
+        "Log units on model leans, grade results, and track CLV (closing line value). "
+        "Positive CLV means you beat the closing number — the best long-term skill metric."
+    )
+    bet_df = _load_bet_log()
+
+    # ---- Quick-add from a lean ----
+    st.markdown("##### Log a bet")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        b_game = st.text_input("Game", value="", placeholder="Away @ Home", key="bet_game")
+        b_week = st.number_input("Week", min_value=1, max_value=22, value=1, key="bet_week")
+        b_type = st.selectbox("Bet type", ["ATS", "Total", "ML"], key="bet_type")
+    with c2:
+        b_side = st.selectbox("Side", ["Home", "Away", "Over", "Under"], key="bet_side")
+        b_line = st.number_input("Line taken", value=0.0, step=0.5, format="%.1f", key="bet_line")
+        b_odds = st.number_input("Odds (American)", value=-110, step=5, key="bet_odds")
+    with c3:
+        b_units = st.number_input("Units", min_value=0.1, max_value=10.0, value=1.0, step=0.1, key="bet_units")
+        b_model = st.number_input("Model prob (0-1)", min_value=0.0, max_value=1.0, value=0.55, step=0.01, key="bet_model")
+        b_mkt = st.number_input("Market prob (0-1)", min_value=0.0, max_value=1.0, value=0.50, step=0.01, key="bet_mkt")
+    b_notes = st.text_input("Notes", key="bet_notes")
+    if st.button("Add to log", type="primary", key="bet_add"):
+        import uuid
+        edge = (b_model - b_mkt) * 100.0
+        new_row = {
+            "id": str(uuid.uuid4())[:8],
+            "logged_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "week": int(b_week),
+            "game": b_game,
+            "bet_type": b_type,
+            "side": b_side,
+            "line_taken": float(b_line),
+            "odds": float(b_odds),
+            "units": float(b_units),
+            "model_prob": float(b_model),
+            "market_prob": float(b_mkt),
+            "edge_pct": round(edge, 2),
+            "closing_line": None,
+            "result": "Pending",
+            "profit_units": 0.0,
+            "clv": None,
+            "notes": b_notes,
+        }
+        bet_df = pd.concat([bet_df, pd.DataFrame([new_row])], ignore_index=True)
+        _save_bet_log(bet_df)
+        st.success("Bet logged.")
+        st.rerun()
+
+    st.markdown("---")
+    st.markdown("##### Open & settled bets")
+    if bet_df is None or bet_df.empty:
+        st.info("No bets logged yet. Add one above, or use Edge % from Opportunities to size spots.")
+    else:
+        st.dataframe(bet_df.drop(columns=["id"], errors="ignore"), use_container_width=True, hide_index=True)
+
+        st.markdown("##### Grade / update a bet")
+        ids = bet_df["id"].astype(str).tolist() if "id" in bet_df.columns else []
+        if ids:
+            pick = st.selectbox("Bet id", ids, key="bet_grade_id")
+            row = bet_df[bet_df["id"].astype(str) == pick].iloc[0]
+            g1, g2, g3, g4 = st.columns(4)
+            with g1:
+                close_line = st.number_input(
+                    "Closing line",
+                    value=float(row["closing_line"]) if pd.notna(row.get("closing_line")) else float(row.get("line_taken") or 0),
+                    step=0.5,
+                    format="%.1f",
+                    key="bet_close",
+                )
+            with g2:
+                result = st.selectbox(
+                    "Result",
+                    ["Pending", "Win", "Loss", "Push"],
+                    index=["Pending", "Win", "Loss", "Push"].index(str(row.get("result") or "Pending"))
+                    if str(row.get("result") or "Pending") in ["Pending", "Win", "Loss", "Push"] else 0,
+                    key="bet_result",
+                )
+            with g3:
+                st.write(f"Line taken: **{row.get('line_taken')}**")
+                st.write(f"Side: **{row.get('side')}** · Type: **{row.get('bet_type')}**")
+            with g4:
+                if st.button("Save grade", key="bet_save_grade"):
+                    idx = bet_df.index[bet_df["id"].astype(str) == pick][0]
+                    bet_df.at[idx, "closing_line"] = close_line
+                    bet_df.at[idx, "result"] = result
+                    side = str(row.get("side") or "Home").lower()
+                    btype = str(row.get("bet_type") or "ATS").upper()
+                    lt = float(row.get("line_taken") or 0)
+                    if btype == "TOTAL":
+                        clv = clv_total(lt, close_line, "over" if "over" in side else "under")
+                    else:
+                        clv = clv_spread(lt, close_line, "home" if "home" in side else "away")
+                    bet_df.at[idx, "clv"] = round(clv, 2)
+                    units = float(row.get("units") or 1)
+                    odds = float(row.get("odds") or -110)
+                    if result == "Win":
+                        bet_df.at[idx, "profit_units"] = round(american_profit(units, odds, True), 3)
+                    elif result == "Loss":
+                        bet_df.at[idx, "profit_units"] = round(american_profit(units, odds, False), 3)
+                    elif result == "Push":
+                        bet_df.at[idx, "profit_units"] = 0.0
+                    _save_bet_log(bet_df)
+                    st.success(f"Updated. CLV = {clv:+.1f} pts")
+                    st.rerun()
+
+        # Summary metrics
+        settled = bet_df[bet_df["result"].isin(["Win", "Loss", "Push"])] if "result" in bet_df.columns else bet_df.iloc[0:0]
+        st.markdown("##### Performance")
+        m1, m2, m3, m4 = st.columns(4)
+        if len(settled):
+            wins = (settled["result"] == "Win").sum()
+            losses = (settled["result"] == "Loss").sum()
+            decided = wins + losses
+            wr = wins / decided if decided else 0
+            profit = settled["profit_units"].sum() if "profit_units" in settled.columns else 0
+            clv_avg = settled["clv"].mean() if "clv" in settled.columns and settled["clv"].notna().any() else None
+            m1.metric("Record", f"{wins}-{losses}", delta=f"{wr:.1%} win" if decided else None)
+            m2.metric("Profit (u)", f"{profit:+.2f}")
+            m3.metric("Avg CLV (pts)", f"{clv_avg:+.2f}" if clv_avg is not None and pd.notna(clv_avg) else "—")
+            m4.metric("Bets graded", f"{len(settled)}")
+        else:
+            m1.metric("Record", "0-0")
+            m2.metric("Profit (u)", "0.00")
+            m3.metric("Avg CLV (pts)", "—")
+            m4.metric("Bets graded", "0")
+
+        st.download_button(
+            "Download bet log CSV",
+            data=bet_df.to_csv(index=False),
+            file_name="nfl_bet_log.csv",
+            mime="text/csv",
+            key="bet_dl",
+        )
+        up = st.file_uploader("Import bet log CSV", type=["csv"], key="bet_up")
+        if up is not None:
+            try:
+                imported = pd.read_csv(up)
+                _save_bet_log(imported)
+                st.success("Imported.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Import failed: {e}")
+
+
+with tab5:
     st.subheader("Simple Backtest")
     min_edge = st.slider("Minimum EPA edge", 0.03, 0.20, 0.05, 0.01)
     eval_seasons = st.multiselect("Evaluation seasons", [2021, 2022, 2023, 2024, 2025], default=[2023, 2024, 2025])
