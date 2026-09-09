@@ -854,6 +854,7 @@ def clv_total(line_taken: float, closing_total: float, side: str) -> float:
         return lt - cl  # took 47, closed 45.5 → +1.5
     return cl - lt  # under: took 44, closed 45.5 → +1.5
 
+
 # ---- Bet log / unit tracker helpers ----
 BET_LOG_PATH = Path("/home/workdir/artifacts/bet_log.csv")
 
@@ -1645,10 +1646,6 @@ with tab1:
         # Source of truth: schedule-driven game list (includes every week 1–18 game)
         # Falls back to Odds API events if schedule rows are empty
         upcoming = build_upcoming_games(schedules, odds_data, days_ahead=90)
-        try:
-            injury_map = load_injury_flags()
-        except Exception:
-            injury_map = {}
         weather_cache = build_weather_cache_from_games(upcoming)
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -1843,17 +1840,6 @@ with tab1:
                 else:
                     edge_pct = edge_home
 
-                # Injury flags
-                try:
-                    inj_map = injury_map if isinstance(injury_map, dict) else {}
-                except NameError:
-                    inj_map = {}
-                inj_label = injury_label_for_game(home, away, inj_map)
-                if inj_label and inj_label != "—":
-                    signals.append(inj_label)
-                    if "QB OUT" in inj_label:
-                        total_score += 1.2
-
                 if roof in ("dome", "closed"):
                     wx_str = "Dome"
                 else:
@@ -1882,7 +1868,6 @@ with tab1:
                     "Model %": f"{model_home*100:.1f}%",
                     "Market %": f"{mkt_home*100:.1f}%" if mkt_home is not None else "—",
                     "Edge %": f"{edge_pct:+.1f}" if edge_pct is not None else "—",
-                    "Injury": inj_label,
                     "ML Home %": f"{ml_home*100:.1f}%",
                     "MC Home %": f"{mc['home_cover_prob']*100:.1f}%",
                     "MC Over %": f"{mc['over_prob']*100:.1f}%",
@@ -2399,4 +2384,3 @@ with tab5:
                         st.warning("No games met the filters.")
             except Exception as e:
                 st.error(f"Backtest error: {e}")
-
