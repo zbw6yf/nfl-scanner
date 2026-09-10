@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import requests
+import re
 import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -966,6 +967,7 @@ def clv_total(line_taken: float, closing_total: float, side: str) -> float:
 
 
 
+
 SLUG_TO_ABBR = {
     "arizona-cardinals": "ARI", "atlanta-falcons": "ATL", "baltimore-ravens": "BAL",
     "buffalo-bills": "BUF", "carolina-panthers": "CAR", "chicago-bears": "CHI",
@@ -980,6 +982,16 @@ SLUG_TO_ABBR = {
     "tennessee-titans": "TEN", "washington-commanders": "WAS",
 }
 
+ESPN_TEAM_IDS = {
+    "ARI": 22, "ATL": 1, "BAL": 33, "BUF": 2, "CAR": 29, "CHI": 3, "CIN": 4, "CLE": 5,
+    "DAL": 6, "DEN": 7, "DET": 8, "GB": 9, "HOU": 34, "IND": 11, "JAX": 30, "KC": 12,
+    "LAC": 24, "LA": 14, "LV": 13, "MIA": 15, "MIN": 16, "NE": 17, "NO": 18, "NYG": 19,
+    "NYJ": 20, "PHI": 21, "PIT": 23, "SF": 25, "SEA": 26, "TB": 27, "TEN": 10, "WAS": 28,
+}
+
+# Ourlads uses LAR for Rams
+OURLADS_ABBR = {**{a: a for a in ESPN_TEAM_IDS}, "LA": "LAR", "WAS": "WAS"}
+
 
 def _strip_html(s: str) -> str:
     s = re.sub(r"<[^>]+>", "", s or "")
@@ -987,124 +999,300 @@ def _strip_html(s: str) -> str:
     return s
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def load_nfl_injury_report() -> pd.DataFrame:
-    """
-    Load official injury report from https://www.nfl.com/injuries/
-    Uses stdlib HTML parsing (no BeautifulSoup required).
-    Columns: Team, Team Abbr, Player, Position, Injury, Practice Status, Game Status
-    """
+def _http_get(url: str, timeout: int = 30) -> Optional[requests.Response]:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        return requests.get(url, headers=headers, timeout=timeout)
+    except Exception:
+        return None
+
+
+def _injuries_from_nfl_com() -> pd.DataFrame:
     cols = ["Team", "Team Abbr", "Player", "Position", "Injury", "Practice Status", "Game Status"]
     empty = pd.DataFrame(columns=cols)
-    try:
-        r = requests.get(
-            "https://www.nfl.com/injuries/",
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            timeout=35,
-        )
-        if r.status_code != 200 or not r.text or len(r.text) < 1000:
-            return empty
-        html = r.text
+    r = _http_get("https://www.nfl.com/injuries/")
+    if r is None or r.status_code != 200 or not r.text or len(r.text) < 1000:
+        return empty
+    html = r.text
+    team_order = []
+    for m in re.finditer(r'href="(/teams/[a-z0-9-]+/)"', html):
+        slug = m.group(1).strip("/").split("/")[-1]
+        if slug in SLUG_TO_ABBR and (not team_order or team_order[-1] != slug):
+            team_order.append(slug)
+    tables = re.findall(r"<table[^>]*>(.*?)</table>", html, flags=re.S | re.I)
+    if not tables:
+        return empty
+    rows = []
+    n = min(len(team_order), len(tables)) if team_order else 0
+    for i in range(n):
+        slug = team_order[i]
+        abbr = SLUG_TO_ABBR.get(slug, slug[:3].upper())
+        try:
+            team_name = full_name(abbr)
+        except Exception:
+            team_name = abbr
+        trs = re.findall(r"<tr[^>]*>(.*?)</tr>", tables[i], flags=re.S | re.I)
+        for tr in trs[1:]:
+            cells = [_strip_html(c) for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, flags=re.S | re.I)]
+            if len(cells) < 2:
+                continue
+            player = cells[0]
+            if not player or player.lower() == "player":
+                continue
+            rows.append({
+                "Team": team_name,
+                "Team Abbr": abbr,
+                "Player": player,
+                "Position": cells[1] if len(cells) > 1 else "",
+                "Injury": (cells[2] if len(cells) > 2 else "") or "—",
+                "Practice Status": (cells[3] if len(cells) > 3 else "") or "—",
+                "Game Status": (cells[4] if len(cells) > 4 else "") or "—",
+            })
+    return pd.DataFrame(rows) if rows else empty
 
-        # Team order from /teams/<slug>/ links
-        team_order = []
-        for m in re.finditer(r'href="(/teams/[a-z0-9-]+/)"', html):
-            slug = m.group(1).strip("/").split("/")[-1]
-            if slug in SLUG_TO_ABBR and (not team_order or team_order[-1] != slug):
-                team_order.append(slug)
 
-        tables = re.findall(r"<table[^>]*>(.*?)</table>", html, flags=re.S | re.I)
-        if not tables:
-            return empty
-
-        rows = []
-        n = min(len(team_order), len(tables)) if team_order else len(tables)
-        for i in range(n):
-            if team_order and i < len(team_order):
-                slug = team_order[i]
-                abbr = SLUG_TO_ABBR.get(slug, slug[:3].upper())
-            else:
-                abbr = f"T{i}"
-            try:
-                team_name = full_name(abbr)
-            except Exception:
-                team_name = abbr
-            tbody = tables[i]
-            trs = re.findall(r"<tr[^>]*>(.*?)</tr>", tbody, flags=re.S | re.I)
-            for tr in trs[1:]:  # skip header
-                cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, flags=re.S | re.I)
-                cells = [_strip_html(c) for c in cells]
-                if len(cells) < 2:
+def _injuries_from_espn_core() -> pd.DataFrame:
+    """ESPN core API — team injury lists + detail pages (slower but reliable)."""
+    cols = ["Team", "Team Abbr", "Player", "Position", "Injury", "Practice Status", "Game Status"]
+    rows = []
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
+    for abbr, tid in ESPN_TEAM_IDS.items():
+        try:
+            url = f"https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/teams/{tid}/injuries?limit=100"
+            r = requests.get(url, headers=headers, timeout=20)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            items = data.get("items") or []
+            team_name = full_name(abbr)
+            # Cap per team to keep load reasonable
+            for item in items[:25]:
+                ref = (item.get("$ref") or "").replace("http://", "https://")
+                if not ref:
                     continue
-                player = cells[0]
-                if not player or player.lower() == "player":
+                try:
+                    detail = requests.get(ref, headers=headers, timeout=12).json()
+                except Exception:
                     continue
-                pos = cells[1] if len(cells) > 1 else ""
-                injury = cells[2] if len(cells) > 2 else ""
-                practice = cells[3] if len(cells) > 3 else ""
-                game_status = cells[4] if len(cells) > 4 else ""
+                status = detail.get("status") or "—"
+                # Skip pure "Active" noise if no injury designation
+                if str(status).lower() == "active":
+                    continue
+                ath_ref = ((detail.get("athlete") or {}).get("$ref") or "").replace("http://", "https://")
+                player = "—"
+                pos = ""
+                if ath_ref:
+                    try:
+                        ath = requests.get(ath_ref, headers=headers, timeout=10).json()
+                        player = ath.get("displayName") or ath.get("fullName") or "—"
+                        p = ath.get("position")
+                        if isinstance(p, dict):
+                            pos = p.get("abbreviation") or p.get("displayName") or ""
+                        elif isinstance(p, str):
+                            pos = p
+                    except Exception:
+                        # Fall back to short comment name guess
+                        sc = detail.get("shortComment") or detail.get("longComment") or ""
+                        player = sc.split("(")[0].strip()[:40] or "—"
+                injury = (detail.get("type") or {}).get("description") if isinstance(detail.get("type"), dict) else ""
+                if not injury:
+                    # parse from shortComment e.g. "Love (ankle) is..."
+                    sc = detail.get("shortComment") or ""
+                    m = re.search(r"\(([^)]+)\)", sc)
+                    injury = m.group(1) if m else (detail.get("longComment") or "—")[:60]
                 rows.append({
                     "Team": team_name,
                     "Team Abbr": abbr,
                     "Player": player,
                     "Position": pos,
                     "Injury": injury or "—",
-                    "Practice Status": practice or "—",
-                    "Game Status": game_status or "—",
+                    "Practice Status": "—",
+                    "Game Status": status,
                 })
-        if not rows:
-            return empty
-        return pd.DataFrame(rows)
-    except Exception:
-        return empty
+        except Exception:
+            continue
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
 
-def _load_bet_log() -> pd.DataFrame:
-    cols = [
-        "id", "logged_at", "week", "game", "bet_type", "side", "line_taken",
-        "odds", "units", "model_prob", "market_prob", "edge_pct",
-        "closing_line", "result", "profit_units", "clv", "notes",
-    ]
-    if "bet_log_df" in st.session_state and isinstance(st.session_state["bet_log_df"], pd.DataFrame):
-        return st.session_state["bet_log_df"]
+@st.cache_data(ttl=900, show_spinner=False)
+def load_nfl_injury_report() -> pd.DataFrame:
+    """
+    Injury report with fallbacks:
+      1) NFL.com official HTML report
+      2) ESPN core API per-team injuries
+    """
+    cols = ["Team", "Team Abbr", "Player", "Position", "Injury", "Practice Status", "Game Status"]
     try:
-        if BET_LOG_PATH.exists():
-            df = pd.read_csv(BET_LOG_PATH)
-            st.session_state["bet_log_df"] = df
+        df = _injuries_from_nfl_com()
+        if df is not None and not df.empty:
             return df
     except Exception:
         pass
-    df = pd.DataFrame(columns=cols)
-    st.session_state["bet_log_df"] = df
-    return df
-
-
-def _save_bet_log(df: pd.DataFrame) -> None:
-    st.session_state["bet_log_df"] = df
     try:
-        df.to_csv(BET_LOG_PATH, index=False)
+        df = _injuries_from_espn_core()
+        if df is not None and not df.empty:
+            return df
     except Exception:
         pass
+    return pd.DataFrame(columns=cols)
 
 
-def american_profit(units: float, american_odds: float, won: bool) -> float:
-    if not won:
-        return -abs(units)
-    try:
-        o = float(american_odds)
-    except Exception:
-        o = -110
-    if o < 0:
-        return abs(units) * (100.0 / (-o))
-    return abs(units) * (o / 100.0)
+def _parse_ourlads_player(cell: str) -> str:
+    """'Coleman, Keon 24/2' -> 'Keon Coleman' when possible."""
+    cell = _strip_html(cell)
+    if not cell:
+        return ""
+    # Drop draft suffix like 24/2 or U/LAC or CF16
+    cell = re.sub(r"\s+\d{2}/\d.*$", "", cell)
+    cell = re.sub(r"\s+[A-Z]{1,3}/[A-Z]{2,3}$", "", cell)
+    cell = re.sub(r"\s+CF\d+.*$", "", cell)
+    cell = re.sub(r"\s+U/[A-Za-z]+$", "", cell)
+    if "," in cell:
+        parts = [p.strip() for p in cell.split(",", 1)]
+        if len(parts) == 2:
+            return f"{parts[1]} {parts[0]}".strip()
+    return cell.strip()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_depth_charts() -> pd.DataFrame:
+    """
+    Load depth charts from Ourlads (https://www.ourlads.com/nfldepthcharts/).
+    Returns Team, Team Abbr, Side, Position, Rank, Player
+    """
+    cols = ["Team", "Team Abbr", "Unit", "Position", "Rank", "Player"]
+    rows = []
+    for abbr in ESPN_TEAM_IDS.keys():
+        ol = OURLADS_ABBR.get(abbr, abbr)
+        url = f"https://www.ourlads.com/nfldepthcharts/depthchart/{ol}"
+        try:
+            r = _http_get(url, timeout=25)
+            if r is None or r.status_code != 200 or not r.text:
+                continue
+            tables = re.findall(r"<table[^>]*>(.*?)</table>", r.text, flags=re.S | re.I)
+            try:
+                team_name = full_name(abbr)
+            except Exception:
+                team_name = abbr
+            # Heuristic unit labels by table order: Offense, Defense, Special Teams
+            unit_names = ["Offense", "Defense", "Special Teams", "Other"]
+            for ti, table in enumerate(tables):
+                unit = unit_names[ti] if ti < len(unit_names) else "Other"
+                trs = re.findall(r"<tr[^>]*>(.*?)</tr>", table, flags=re.S | re.I)
+                if not trs:
+                    continue
+                for tr in trs[1:]:
+                    cells = [_strip_html(c) for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, flags=re.S | re.I)]
+                    if len(cells) < 3:
+                        continue
+                    pos = cells[0]
+                    if not pos or pos.lower() in ("pos", "position"):
+                        continue
+                    # Pattern: Pos, No, Player1, No, Player2, ...
+                    rank = 0
+                    for i in range(2, len(cells), 2):
+                        raw = cells[i] if i < len(cells) else ""
+                        player = _parse_ourlads_player(raw)
+                        if not player:
+                            continue
+                        rank += 1
+                        rows.append({
+                            "Team": team_name,
+                            "Team Abbr": abbr,
+                            "Unit": unit,
+                            "Position": pos,
+                            "Rank": rank,
+                            "Player": player,
+                        })
+        except Exception:
+            continue
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+
+
+def _normalize_team_abbr(t: str) -> str:
+    t = str(t or "").strip().upper()
+    aliases = {
+        "LAR": "LA", "STL": "LA", "WSH": "WAS", "WFT": "WAS", "JAC": "JAX",
+        "GNB": "GB", "KAN": "KC", "NWE": "NE", "NOR": "NO", "SFO": "SF",
+        "TAM": "TB", "OAK": "LV", "LVR": "LV", "SD": "LAC",
+    }
+    return aliases.get(t, t)
+
+
+def _extract_odds_lines(odds_ev, home_abbr: str):
+    """Return (avg_spread home, avg_total) from an Odds API event."""
+    if not odds_ev:
+        return None, None
+    spreads, totals = [], []
+    home_full = odds_ev.get("home_team", full_name(home_abbr))
+    for book in odds_ev.get("bookmakers", []) or []:
+        for market in book.get("markets", []) or []:
+            if market.get("key") == "spreads":
+                for o in market.get("outcomes", []) or []:
+                    if o.get("name") == home_full and o.get("point") is not None:
+                        spreads.append(o.get("point"))
+            elif market.get("key") == "totals":
+                for o in market.get("outcomes", []) or []:
+                    if o.get("name") == "Over" and o.get("point") is not None:
+                        totals.append(o.get("point"))
+    avg_spread = float(np.mean(spreads)) if spreads else None
+    avg_total = float(np.mean(totals)) if totals else None
+    return avg_spread, avg_total
+
+
+def build_upcoming_from_odds(odds_data, schedules: pd.DataFrame) -> List[Dict]:
+    """Fallback: build game list purely from Odds API events."""
+    games = []
+    if not odds_data:
+        return games
+    for ev in odds_data:
+        home_full = ev.get("home_team", "")
+        away_full = ev.get("away_team", "")
+        home = _normalize_team_abbr(to_abbr(home_full) or "")
+        away = _normalize_team_abbr(to_abbr(away_full) or "")
+        if not home or not away:
+            continue
+        commence_raw = ev.get("commence_time") or ""
+        kickoff = format_kickoff(commence_raw) if commence_raw else ""
+        game_date = commence_raw[:10] if len(commence_raw) >= 10 else ""
+        avg_spread, avg_total = _extract_odds_lines(ev, home)
+        if avg_total is None:
+            avg_total = 45.0
+        week = None
+        if game_date:
+            week = get_week(schedules, home, away, game_date) if (schedules is not None and not getattr(schedules, "empty", True)) else estimate_week_from_date(game_date)
+        roof = get_roof(schedules, home, game_date) if (schedules is not None and not getattr(schedules, "empty", True)) else "outdoors"
+        games.append({
+            "week": week,
+            "gameday": game_date,
+            "gametime": None,
+            "kickoff": kickoff,
+            "home": home,
+            "away": away,
+            "home_full": home_full or full_name(home),
+            "away_full": away_full or full_name(away),
+            "roof": roof,
+            "avg_spread": avg_spread,
+            "avg_total": avg_total,
+            "odds_event": ev,
+            "commence_raw": commence_raw,
+            "game_id": ev.get("id"),
+        })
+    games.sort(key=lambda g: (g.get("gameday") or "", g.get("kickoff") or ""))
+    return games
+
+
 
 
 
@@ -1384,80 +1572,6 @@ EMBEDDED_2026_SCHEDULE = [
     {"week": 18, "gameday": "2027-01-10", "gametime": "00:00", "away": "PIT", "home": "BAL", "roof": "outdoors"},
     {"week": 18, "gameday": "2027-01-10", "gametime": "00:00", "away": "TEN", "home": "HOU", "roof": "dome"},
 ]
-
-
-
-def _normalize_team_abbr(t: str) -> str:
-    t = str(t or "").strip().upper()
-    aliases = {
-        "LAR": "LA", "STL": "LA", "WSH": "WAS", "WFT": "WAS", "JAC": "JAX",
-        "GNB": "GB", "KAN": "KC", "NWE": "NE", "NOR": "NO", "SFO": "SF",
-        "TAM": "TB", "OAK": "LV", "LVR": "LV", "SD": "LAC",
-    }
-    return aliases.get(t, t)
-
-
-def _extract_odds_lines(odds_ev, home_abbr: str):
-    """Return (avg_spread home, avg_total) from an Odds API event."""
-    if not odds_ev:
-        return None, None
-    spreads, totals = [], []
-    home_full = odds_ev.get("home_team", full_name(home_abbr))
-    for book in odds_ev.get("bookmakers", []) or []:
-        for market in book.get("markets", []) or []:
-            if market.get("key") == "spreads":
-                for o in market.get("outcomes", []) or []:
-                    if o.get("name") == home_full and o.get("point") is not None:
-                        spreads.append(o.get("point"))
-            elif market.get("key") == "totals":
-                for o in market.get("outcomes", []) or []:
-                    if o.get("name") == "Over" and o.get("point") is not None:
-                        totals.append(o.get("point"))
-    avg_spread = float(np.mean(spreads)) if spreads else None
-    avg_total = float(np.mean(totals)) if totals else None
-    return avg_spread, avg_total
-
-
-def build_upcoming_from_odds(odds_data, schedules: pd.DataFrame) -> List[Dict]:
-    """Fallback: build game list purely from Odds API events."""
-    games = []
-    if not odds_data:
-        return games
-    for ev in odds_data:
-        home_full = ev.get("home_team", "")
-        away_full = ev.get("away_team", "")
-        home = _normalize_team_abbr(to_abbr(home_full) or "")
-        away = _normalize_team_abbr(to_abbr(away_full) or "")
-        if not home or not away:
-            continue
-        commence_raw = ev.get("commence_time") or ""
-        kickoff = format_kickoff(commence_raw) if commence_raw else ""
-        game_date = commence_raw[:10] if len(commence_raw) >= 10 else ""
-        avg_spread, avg_total = _extract_odds_lines(ev, home)
-        if avg_total is None:
-            avg_total = 45.0
-        week = None
-        if game_date:
-            week = get_week(schedules, home, away, game_date) if (schedules is not None and not getattr(schedules, "empty", True)) else estimate_week_from_date(game_date)
-        roof = get_roof(schedules, home, game_date) if (schedules is not None and not getattr(schedules, "empty", True)) else "outdoors"
-        games.append({
-            "week": week,
-            "gameday": game_date,
-            "gametime": None,
-            "kickoff": kickoff,
-            "home": home,
-            "away": away,
-            "home_full": home_full or full_name(home),
-            "away_full": away_full or full_name(away),
-            "roof": roof,
-            "avg_spread": avg_spread,
-            "avg_total": avg_total,
-            "odds_event": ev,
-            "commence_raw": commence_raw,
-            "game_id": ev.get("id"),
-        })
-    games.sort(key=lambda g: (g.get("gameday") or "", g.get("kickoff") or ""))
-    return games
 
 
 def build_upcoming_games(schedules: pd.DataFrame, odds_data: Optional[List], days_ahead: int = 120) -> List[Dict]:
@@ -1830,11 +1944,12 @@ def monte_carlo_game(
 # -----------------------------
 # TABS
 # -----------------------------
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "🎯 Opportunities",
     "📅 Games & Odds",
     "🌤️ Weather",
     "🏥 Injury Report",
+    "📋 Depth Charts",
     "🎯 Player Props",
     "📊 Bankroll & CLV",
     "📈 Backtest"
@@ -2439,8 +2554,9 @@ with tab4:
         inj_df = load_nfl_injury_report()
     if inj_df is None or inj_df.empty:
         st.warning(
-            "Could not load injury data from NFL.com right now. "
-            "Try again later or open https://www.nfl.com/injuries/ directly."
+            "Could not load injury data from NFL.com or ESPN right now. "
+            "Click **Clear all caches** in the sidebar, then reload this tab. "
+            "You can also open https://www.nfl.com/injuries/ directly."
         )
     else:
         teams = sorted(inj_df["Team"].dropna().unique().tolist())
@@ -2494,8 +2610,43 @@ with tab4:
                 hide_index=True,
             )
 
+
 with tab5:
+    st.subheader("Depth Charts")
+    st.caption(
+        "Current team depth charts from [Ourlads](https://www.ourlads.com/nfldepthcharts/). "
+        "Filter by team and unit (Offense / Defense / Special Teams)."
+    )
+    with st.spinner("Loading depth charts..."):
+        dc_df = load_depth_charts()
+    if dc_df is None or dc_df.empty:
+        st.warning("Could not load depth charts right now. Try clearing caches and reloading.")
+    else:
+        teams = sorted(dc_df["Team"].dropna().unique().tolist())
+        c1, c2 = st.columns(2)
+        with c1:
+            team_sel = st.selectbox("Team", options=teams, key="dc_team")
+        with c2:
+            units = ["All"] + sorted(dc_df["Unit"].dropna().unique().tolist())
+            unit_sel = st.selectbox("Unit", options=units, key="dc_unit")
+        view = dc_df[dc_df["Team"] == team_sel]
+        if unit_sel != "All":
+            view = view[view["Unit"] == unit_sel]
+        # Pivot-style readable table: Position x Rank
+        if not view.empty:
+            show = view[["Unit", "Position", "Rank", "Player"]].sort_values(["Unit", "Position", "Rank"])
+            st.dataframe(show, use_container_width=True, hide_index=True)
+            st.caption(f"{len(show)} entries · {team_sel}")
+            # Compact starter view (Rank 1)
+            starters = view[view["Rank"] == 1][["Unit", "Position", "Player"]].sort_values(["Unit", "Position"])
+            with st.expander("Starters only (Rank 1)", expanded=True):
+                st.dataframe(starters, use_container_width=True, hide_index=True)
+        else:
+            st.info("No depth chart rows for this selection.")
+
+with tab6:
     st.subheader("Player Props")
+
 
 
     if not api_key:
@@ -2533,7 +2684,7 @@ with tab5:
 
 # ========== TAB 4 ==========
 
-with tab6:
+with tab7:
     st.subheader("Bankroll & Closing Line Value")
     st.caption(
         "Log units on model leans, grade results, and track CLV (closing line value). "
@@ -2680,7 +2831,7 @@ with tab6:
                 st.error(f"Import failed: {e}")
 
 
-with tab7:
+with tab8:
     st.subheader("Simple Backtest")
     min_edge = st.slider("Minimum EPA edge", 0.03, 0.20, 0.05, 0.01)
     eval_seasons = st.multiselect("Evaluation seasons", [2021, 2022, 2023, 2024, 2025], default=[2023, 2024, 2025])
