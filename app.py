@@ -235,13 +235,19 @@ def get_team_pace(seasons: Optional[List[int]] = None) -> pd.DataFrame:
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def get_recent_form(seasons: Optional[List[int]] = None, n_games: int = 6) -> Dict[str, Dict]:
     """
-    Last N completed games: average EPA (off - def) and average margin (points).
+    Last N completed games **in the current season only**.
+    Prior seasons are ignored so Week 1 form is neutral (n=0).
     Returns dict[team] = {"form_epa": float, "form_margin": float, "n": int}
     """
     try:
-        if seasons is None:
+        try:
             current = int(nfl.get_current_season())
-            seasons = [current - 1, current]
+        except Exception:
+            current = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
+        cal_year = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
+        current = max(current, cal_year)
+        # Current season only — never pull prior years for form
+        seasons = [current]
         sched = nfl.load_schedules(seasons=seasons)
         if hasattr(sched, "to_pandas"):
             sched = sched.to_pandas()
@@ -577,21 +583,48 @@ def fetch_player_props(api_key: str, event_id: str) -> Optional[Dict]:
     except Exception as e:
         return {"error": str(e)}
 
-def get_rest_days(schedules: pd.DataFrame, team: str, game_date: str) -> int:
+def get_rest_days(schedules: pd.DataFrame, team: str, game_date: str, season: Optional[int] = None) -> Optional[int]:
+    """
+    Days since this team's previous game **in the same season**.
+    Returns None if the team has not played yet this season (e.g. Week 1)
+    so callers treat rest as neutral (no advantage).
+    """
     try:
-        if schedules.empty or "home_team" not in schedules.columns:
-            return 7
+        if schedules is None or schedules.empty or "home_team" not in schedules.columns:
+            return None
+        s = schedules.copy()
+        if season is not None and "season" in s.columns:
+            s = s[s["season"] == season]
+        # Only completed prior games this season (have a result or date strictly before)
         mask = (
-            ((schedules["home_team"] == team) | (schedules["away_team"] == team)) &
-            (schedules["gameday"].astype(str) < str(game_date)[:10])
+            ((s["home_team"] == team) | (s["away_team"] == team)) &
+            (s["gameday"].astype(str).str[:10] < str(game_date)[:10])
         )
-        prior = schedules.loc[mask].sort_values("gameday")
+        prior = s.loc[mask].sort_values("gameday")
         if prior.empty:
-            return 7
-        last = str(prior.iloc[-1]["gameday"])
-        return max((pd.to_datetime(game_date[:10]) - pd.to_datetime(last[:10])).days, 0)
+            return None  # no game yet this season → no rest edge
+        last = str(prior.iloc[-1]["gameday"])[:10]
+        return max(int((pd.to_datetime(str(game_date)[:10]) - pd.to_datetime(last)).days), 0)
     except Exception:
-        return 7
+        return None
+
+
+def rest_differential(schedules: pd.DataFrame, home: str, away: str, game_date: str, week: Optional[int] = None, season: Optional[int] = None) -> int:
+    """
+    Home rest days minus away rest days.
+    Forced to 0 in Week 1 or when either team has no prior game this season.
+    """
+    if week is not None:
+        try:
+            if int(week) <= 1:
+                return 0
+        except Exception:
+            pass
+    h = get_rest_days(schedules, home, game_date, season=season)
+    a = get_rest_days(schedules, away, game_date, season=season)
+    if h is None or a is None:
+        return 0
+    return int(h - a)
 
 def get_roof(schedules: pd.DataFrame, home: str, game_date: str) -> str:
     try:
@@ -932,6 +965,7 @@ def clv_total(line_taken: float, closing_total: float, side: str) -> float:
 
 
 
+
 SLUG_TO_ABBR = {
     "arizona-cardinals": "ARI", "atlanta-falcons": "ATL", "baltimore-ravens": "BAL",
     "buffalo-bills": "BUF", "carolina-panthers": "CAR", "chicago-bears": "CHI",
@@ -947,58 +981,76 @@ SLUG_TO_ABBR = {
 }
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+def _strip_html(s: str) -> str:
+    s = re.sub(r"<[^>]+>", "", s or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def load_nfl_injury_report() -> pd.DataFrame:
     """
-    Scrape the official NFL.com injury report (https://www.nfl.com/injuries/).
-    Returns columns: Team, Player, Position, Injury, Practice Status, Game Status.
+    Load official injury report from https://www.nfl.com/injuries/
+    Uses stdlib HTML parsing (no BeautifulSoup required).
+    Columns: Team, Team Abbr, Player, Position, Injury, Practice Status, Game Status
     """
-    rows = []
+    cols = ["Team", "Team Abbr", "Player", "Position", "Injury", "Practice Status", "Game Status"]
+    empty = pd.DataFrame(columns=cols)
     try:
         r = requests.get(
             "https://www.nfl.com/injuries/",
-            headers={"User-Agent": "Mozilla/5.0 (compatible; NFLScanner/1.0)"},
-            timeout=30,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=35,
         )
-        if r.status_code != 200:
-            return pd.DataFrame(columns=["Team", "Player", "Position", "Injury", "Practice Status", "Game Status"])
+        if r.status_code != 200 or not r.text or len(r.text) < 1000:
+            return empty
         html = r.text
-        try:
-            from bs4 import BeautifulSoup
-        except ImportError:
-            # minimal fallback without bs4
-            return pd.DataFrame(columns=["Team", "Player", "Position", "Injury", "Practice Status", "Game Status"])
-        soup = BeautifulSoup(html, "html.parser")
 
-        # Team order from /teams/<slug>/ links (deduped consecutive)
+        # Team order from /teams/<slug>/ links
         team_order = []
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "/teams/" in href:
-                slug = href.strip("/").split("/")[-1]
-                if slug in SLUG_TO_ABBR:
-                    if not team_order or team_order[-1] != slug:
-                        team_order.append(slug)
+        for m in re.finditer(r'href="(/teams/[a-z0-9-]+/)"', html):
+            slug = m.group(1).strip("/").split("/")[-1]
+            if slug in SLUG_TO_ABBR and (not team_order or team_order[-1] != slug):
+                team_order.append(slug)
 
-        tables = soup.find_all("table")
-        n = min(len(team_order), len(tables))
+        tables = re.findall(r"<table[^>]*>(.*?)</table>", html, flags=re.S | re.I)
+        if not tables:
+            return empty
+
+        rows = []
+        n = min(len(team_order), len(tables)) if team_order else len(tables)
         for i in range(n):
-            slug = team_order[i]
-            abbr = SLUG_TO_ABBR.get(slug, slug)
-            team_name = full_name(abbr)
-            table = tables[i]
-            for tr in table.find_all("tr")[1:]:
-                cols = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
-                if len(cols) < 2:
+            if team_order and i < len(team_order):
+                slug = team_order[i]
+                abbr = SLUG_TO_ABBR.get(slug, slug[:3].upper())
+            else:
+                abbr = f"T{i}"
+            try:
+                team_name = full_name(abbr)
+            except Exception:
+                team_name = abbr
+            tbody = tables[i]
+            trs = re.findall(r"<tr[^>]*>(.*?)</tr>", tbody, flags=re.S | re.I)
+            for tr in trs[1:]:  # skip header
+                cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, flags=re.S | re.I)
+                cells = [_strip_html(c) for c in cells]
+                if len(cells) < 2:
                     continue
-                # Expected: Player, Position, Injuries, Practice Status, Game Status
-                player = cols[0] if len(cols) > 0 else ""
-                pos = cols[1] if len(cols) > 1 else ""
-                injury = cols[2] if len(cols) > 2 else ""
-                practice = cols[3] if len(cols) > 3 else ""
-                game_status = cols[4] if len(cols) > 4 else ""
-                if not player:
+                player = cells[0]
+                if not player or player.lower() == "player":
                     continue
+                pos = cells[1] if len(cells) > 1 else ""
+                injury = cells[2] if len(cells) > 2 else ""
+                practice = cells[3] if len(cells) > 3 else ""
+                game_status = cells[4] if len(cells) > 4 else ""
                 rows.append({
                     "Team": team_name,
                     "Team Abbr": abbr,
@@ -1008,11 +1060,11 @@ def load_nfl_injury_report() -> pd.DataFrame:
                     "Practice Status": practice or "—",
                     "Game Status": game_status or "—",
                 })
+        if not rows:
+            return empty
+        return pd.DataFrame(rows)
     except Exception:
-        return pd.DataFrame(columns=["Team", "Team Abbr", "Player", "Position", "Injury", "Practice Status", "Game Status"])
-    if not rows:
-        return pd.DataFrame(columns=["Team", "Team Abbr", "Player", "Position", "Injury", "Practice Status", "Game Status"])
-    return pd.DataFrame(rows)
+        return empty
 
 
 def _load_bet_log() -> pd.DataFrame:
@@ -1874,7 +1926,7 @@ with tab1:
                     skipped.append(f"Neutral EPA used for {away} @ {home}")
                     home_off = home_def = away_off = away_def = 0.0
                 epa_edge = (home_off - away_def) - (away_off - home_def)
-                rest_diff = get_rest_days(schedules, home, game_date) - get_rest_days(schedules, away, game_date)
+                rest_diff = rest_differential(schedules, home, away, game_date, week=g.get("week"))
                 # ---- SIGNALS ----
                 if avg_spread is not None:
                     home_imp, away_imp = implied_team_totals(avg_spread, avg_total)
