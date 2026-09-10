@@ -821,6 +821,82 @@ def compute_edge(model_prob: float, market_prob: Optional[float]) -> Optional[fl
     return (model_prob - market_prob) * 100.0
 
 
+
+def confidence_grade(
+    rec: str,
+    total_score: float,
+    ml_home: float,
+    mc: dict,
+    edge_pct: Optional[float],
+    n_signals: int,
+    agree: float,
+) -> str:
+    """
+    A–F confidence for the lean.
+    A = strongest alignment of score, model, Monte Carlo, and market edge.
+    F = no lean or very weak evidence.
+    """
+    if rec == "No strong lean":
+        if total_score >= 4.0 and n_signals >= 3:
+            return "D"  # some signals but no formal lean
+        if total_score >= 2.0:
+            return "E"
+        return "F"
+
+    # Strength of the lean itself
+    if rec in ("Lean Home ATS", "Lean Away ATS"):
+        side_prob = mc.get("home_cover_prob", 0.5) if rec == "Lean Home ATS" else (1.0 - mc.get("home_cover_prob", 0.5))
+        model_side = ml_home if rec == "Lean Home ATS" else (1.0 - ml_home)
+        side_ev = mc.get("home_ev", 0.0) if rec == "Lean Home ATS" else mc.get("away_ev", 0.0)
+    else:
+        side_prob = mc.get("over_prob", 0.5) if rec == "Lean Over" else mc.get("under_prob", 0.5)
+        model_side = side_prob
+        side_ev = max(0.0, side_prob - 0.5)
+
+    edge_abs = abs(edge_pct) if edge_pct is not None else 0.0
+    points = 0.0
+    # Score contribution (0–4)
+    points += min(4.0, total_score / 2.5)
+    # Probability margin past 50% (0–2)
+    points += min(2.0, max(0.0, (side_prob - 0.5) * 10.0))
+    # Model agreement (0–1.5)
+    if agree > 0:
+        points += 1.5
+    elif abs(model_side - 0.5) >= 0.05:
+        points += 0.75
+    # Market edge (0–1.5)
+    if edge_abs >= 8:
+        points += 1.5
+    elif edge_abs >= 4:
+        points += 1.0
+    elif edge_abs >= 2:
+        points += 0.5
+    # Signal count (0–1)
+    if n_signals >= 5:
+        points += 1.0
+    elif n_signals >= 3:
+        points += 0.5
+    # EV quality (0–1)
+    if side_ev >= 0.08:
+        points += 1.0
+    elif side_ev >= 0.04:
+        points += 0.5
+
+    # Map points to letter (max theoretical ~11)
+    if points >= 8.5:
+        return "A"
+    if points >= 7.0:
+        return "B"
+    if points >= 5.5:
+        return "C"
+    if points >= 4.0:
+        return "D"
+    if points >= 2.5:
+        return "E"
+    return "F"
+
+
+
 def clv_spread(line_taken: float, closing_line: float, side: str) -> float:
     """
     Closing line value in points for an ATS bet.
@@ -853,6 +929,106 @@ def clv_total(line_taken: float, closing_total: float, side: str) -> float:
     if side == "over":
         return lt - cl  # took 47, closed 45.5 → +1.5
     return cl - lt  # under: took 44, closed 45.5 → +1.5
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_injury_flags() -> Dict[str, Dict[str, Any]]:
+    """
+    Fetch ESPN injury report. Returns dict[team_abbr] = {
+      'flag': str summary, 'qb_out': bool, 'key_out': int, 'details': list
+    }
+    """
+    ESPN_ABBR = {
+        "WSH": "WAS", "LAR": "LA", "JAC": "JAX",
+    }
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        r = requests.get(
+            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/injuries",
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return out
+        data = r.json()
+        # Build id -> abbr map
+        id_to_abbr = {}
+        try:
+            tr = requests.get(
+                "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams",
+                timeout=15,
+            )
+            if tr.status_code == 200:
+                teams = (
+                    tr.json()
+                    .get("sports", [{}])[0]
+                    .get("leagues", [{}])[0]
+                    .get("teams", [])
+                )
+                for t in teams:
+                    tm = t.get("team", t)
+                    abbr = ESPN_ABBR.get(tm.get("abbreviation"), tm.get("abbreviation"))
+                    if abbr and tm.get("id"):
+                        id_to_abbr[str(tm["id"])] = abbr
+        except Exception:
+            pass
+
+        for block in data.get("injuries") or []:
+            team_id = str(block.get("id") or "")
+            display = block.get("displayName") or ""
+            abbr = id_to_abbr.get(team_id) or to_abbr(display) or _normalize_team_abbr(display)
+            if not abbr or len(abbr) > 3:
+                # try map from display name
+                abbr = to_abbr(display) or ""
+            if not abbr:
+                continue
+            abbr = _normalize_team_abbr(abbr)
+            qb_out = False
+            key_out = 0
+            details = []
+            severe = {"out", "injured reserve", "doubtful", "ir"}
+            for inj in block.get("injuries") or []:
+                status = (inj.get("status") or "").strip()
+                status_l = status.lower()
+                ath = inj.get("athlete") or {}
+                name = ath.get("displayName") or ath.get("shortName") or "?"
+                pos = ath.get("position")
+                if isinstance(pos, dict):
+                    pos = pos.get("abbreviation") or pos.get("displayName") or ""
+                pos = (pos or "").upper()
+                if status_l in severe or status_l.startswith("out") or "reserve" in status_l:
+                    key_out += 1
+                    details.append(f"{name} ({pos}) {status}")
+                    if pos == "QB":
+                        qb_out = True
+                elif status_l in ("questionable", "q"):
+                    details.append(f"{name} ({pos}) Q")
+            flag_parts = []
+            if qb_out:
+                flag_parts.append("QB OUT")
+            if key_out:
+                flag_parts.append(f"{key_out} OUT/IR")
+            out[abbr] = {
+                "flag": " · ".join(flag_parts) if flag_parts else "",
+                "qb_out": qb_out,
+                "key_out": key_out,
+                "details": details[:8],
+            }
+    except Exception:
+        return out
+    return out
+
+
+def injury_label_for_game(home: str, away: str, injury_map: Dict[str, Dict]) -> str:
+    parts = []
+    for team, label in ((away, "Away"), (home, "Home")):
+        info = injury_map.get(team) or {}
+        if info.get("qb_out"):
+            parts.append(f"{label} QB OUT")
+        elif info.get("key_out", 0) >= 2:
+            parts.append(f"{label} {info['key_out']} OUT")
+        elif info.get("flag"):
+            parts.append(f"{label}: {info['flag']}")
+    return " · ".join(parts) if parts else "—"
 
 
 # ---- Bet log / unit tracker helpers ----
@@ -1622,9 +1798,10 @@ def monte_carlo_game(
 # -----------------------------
 # TABS
 # -----------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "🎯 Opportunities",
     "📅 Games & Odds",
+    "🌤️ Weather",
     "🎯 Player Props",
     "📊 Bankroll & CLV",
     "📈 Backtest"
@@ -1646,6 +1823,10 @@ with tab1:
         # Source of truth: schedule-driven game list (includes every week 1–18 game)
         # Falls back to Odds API events if schedule rows are empty
         upcoming = build_upcoming_games(schedules, odds_data, days_ahead=90)
+        try:
+            injury_map = load_injury_flags()
+        except Exception:
+            injury_map = {}
         weather_cache = build_weather_cache_from_games(upcoming)
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -1656,13 +1837,11 @@ with tab1:
     c5.metric("Form teams", len(recent_form))
     debug = st.session_state.get("weather_debug", {})
     if debug:
-        st.info(
+        st.caption(
             f"Weather → Real Open-Meteo: **{debug.get('real', 0)}** | "
-            f"Fallbacks: **{debug.get('fallback', 0)}** | Keys: {debug.get('total_keys', 0)}"
+            f"Fallbacks: **{debug.get('fallback', 0)}** | Keys: {debug.get('total_keys', 0)} "
+            f"(see **Weather** tab for full game-by-game forecast)"
         )
-        if debug.get("samples"):
-            st.caption("Sample real weather (should differ by stadium):")
-            st.dataframe(pd.DataFrame(debug["samples"]), use_container_width=True, hide_index=True)
     st.caption(odds_status + f" · {len(upcoming)} upcoming games loaded")
     # Helpful diagnostics when the game list is empty
     if not upcoming:
@@ -1840,6 +2019,17 @@ with tab1:
                 else:
                     edge_pct = edge_home
 
+                # Injury flags
+                try:
+                    inj_map = injury_map if isinstance(injury_map, dict) else {}
+                except NameError:
+                    inj_map = {}
+                inj_label = injury_label_for_game(home, away, inj_map)
+                if inj_label and inj_label != "—":
+                    signals.append(inj_label)
+                    if "QB OUT" in inj_label:
+                        total_score += 1.2
+
                 if roof in ("dome", "closed"):
                     wx_str = "Dome"
                 else:
@@ -1868,10 +2058,14 @@ with tab1:
                     "Model %": f"{model_home*100:.1f}%",
                     "Market %": f"{mkt_home*100:.1f}%" if mkt_home is not None else "—",
                     "Edge %": f"{edge_pct:+.1f}" if edge_pct is not None else "—",
+                    "Injury": inj_label,
                     "ML Home %": f"{ml_home*100:.1f}%",
                     "MC Home %": f"{mc['home_cover_prob']*100:.1f}%",
                     "MC Over %": f"{mc['over_prob']*100:.1f}%",
                     "Recommendation": rec,
+                    "Confidence": confidence_grade(
+                        rec, total_score, ml_home, mc, edge_pct, len(signals), agree
+                    ),
                     "Signals": " • ".join(signals) if signals else "—",
                     "Score": round(total_score, 2),
                     # hidden numeric helpers for tracker
@@ -1971,7 +2165,7 @@ with tab1:
             df_known = df_week[df_week["Week_num"].notna()].copy()
             display_cols = [
                 "Game", "Kickoff", "Spread", "Total", "Home Imp", "Away Imp",
-                "EPA Edge", "Form Δ", "Recommendation", "Score", "Signals"
+                "EPA Edge", "Form Δ", "Recommendation", "Confidence", "Score", "Signals"
             ]
             if not df_known.empty:
                 weeks_sorted = sorted(df_known["Week_num"].unique())
@@ -2149,8 +2343,77 @@ with tab2:
     else:
         st.warning("No upcoming games in the embedded schedule window.")
 
+
 with tab3:
+    st.subheader("Game Weather")
+    st.caption(
+        "Forecast at each outdoor stadium near kickoff (Open-Meteo). "
+        "Domes show controlled conditions. Used for total adjustments and under-bias in the model."
+    )
+    debug = st.session_state.get("weather_debug", {})
+    if debug:
+        st.caption(
+            f"Real Open-Meteo pulls: **{debug.get('real', 0)}** · "
+            f"Fallbacks: **{debug.get('fallback', 0)}** · Keys: **{debug.get('total_keys', 0)}**"
+        )
+    wx_rows = []
+    if upcoming:
+        for g in upcoming:
+            home = g.get("home")
+            away = g.get("away")
+            roof = (g.get("roof") or "outdoors").lower()
+            commence_raw = g.get("commence_raw") or ""
+            game_date = g.get("gameday") or (commence_raw[:10] if len(str(commence_raw)) >= 10 else "")
+            key = make_weather_key(home, commence_raw or game_date)
+            weather = (weather_cache or {}).get(key) or {}
+            if roof in ("dome", "closed"):
+                temp = 72.0
+                wind = 0.0
+                precip = 0.0
+                source = "dome"
+                wx_label = "Dome / Closed"
+            else:
+                temp = float(weather.get("temp_f", 70) or 70)
+                wind = float(weather.get("wind_mph", 5) or 5)
+                precip = float(weather.get("precip_prob", 10) or 10)
+                source = weather.get("source", "—")
+                wx_adj = weather_adjustments(roof, weather)
+                wx_label = wx_adj.get("label") or "Outdoor"
+            wx_rows.append({
+                "Week": g.get("week") if g.get("week") is not None else "—",
+                "Game": f"{g.get('away_full') or away} @ {g.get('home_full') or home}",
+                "Kickoff": g.get("kickoff") or game_date,
+                "Stadium": home,
+                "Roof": str(roof).title(),
+                "Temp (°F)": round(temp),
+                "Wind (mph)": round(wind),
+                "Precip %": round(precip),
+                "Impact": wx_label if roof not in ("dome", "closed") else "None (dome)",
+                "Source": source,
+            })
+    if wx_rows:
+        wx_df = pd.DataFrame(wx_rows)
+        weeks = sorted({w for w in wx_df["Week"].tolist() if w != "—"})
+        week_sel = st.selectbox(
+            "Filter by week",
+            options=["All weeks"] + [f"Week {int(w)}" for w in weeks],
+            key="wx_week_filter",
+        )
+        show = wx_df
+        if week_sel != "All weeks":
+            try:
+                wk = int(week_sel.replace("Week ", ""))
+                show = wx_df[wx_df["Week"] == wk]
+            except Exception:
+                pass
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.caption(f"{len(show)} games shown")
+    else:
+        st.info("No upcoming games / weather available yet. Load Opportunities first so weather is fetched.")
+
+with tab4:
     st.subheader("Player Props")
+
     if not api_key:
         st.warning("Enter API key first.")
     elif not odds_data:
@@ -2186,7 +2449,7 @@ with tab3:
 
 # ========== TAB 4 ==========
 
-with tab4:
+with tab5:
     st.subheader("Bankroll & Closing Line Value")
     st.caption(
         "Log units on model leans, grade results, and track CLV (closing line value). "
@@ -2333,7 +2596,7 @@ with tab4:
                 st.error(f"Import failed: {e}")
 
 
-with tab5:
+with tab6:
     st.subheader("Simple Backtest")
     min_edge = st.slider("Minimum EPA edge", 0.03, 0.20, 0.05, 0.01)
     eval_seasons = st.multiselect("Evaluation seasons", [2021, 2022, 2023, 2024, 2025], default=[2023, 2024, 2025])
@@ -2384,3 +2647,4 @@ with tab5:
                         st.warning("No games met the filters.")
             except Exception as e:
                 st.error(f"Backtest error: {e}")
+
