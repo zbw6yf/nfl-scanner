@@ -931,108 +931,88 @@ def clv_total(line_taken: float, closing_total: float, side: str) -> float:
     return cl - lt  # under: took 44, closed 45.5 → +1.5
 
 
+
+SLUG_TO_ABBR = {
+    "arizona-cardinals": "ARI", "atlanta-falcons": "ATL", "baltimore-ravens": "BAL",
+    "buffalo-bills": "BUF", "carolina-panthers": "CAR", "chicago-bears": "CHI",
+    "cincinnati-bengals": "CIN", "cleveland-browns": "CLE", "dallas-cowboys": "DAL",
+    "denver-broncos": "DEN", "detroit-lions": "DET", "green-bay-packers": "GB",
+    "houston-texans": "HOU", "indianapolis-colts": "IND", "jacksonville-jaguars": "JAX",
+    "kansas-city-chiefs": "KC", "las-vegas-raiders": "LV", "los-angeles-chargers": "LAC",
+    "los-angeles-rams": "LA", "miami-dolphins": "MIA", "minnesota-vikings": "MIN",
+    "new-england-patriots": "NE", "new-orleans-saints": "NO", "new-york-giants": "NYG",
+    "new-york-jets": "NYJ", "philadelphia-eagles": "PHI", "pittsburgh-steelers": "PIT",
+    "san-francisco-49ers": "SF", "seattle-seahawks": "SEA", "tampa-bay-buccaneers": "TB",
+    "tennessee-titans": "TEN", "washington-commanders": "WAS",
+}
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
-def load_injury_flags() -> Dict[str, Dict[str, Any]]:
+def load_nfl_injury_report() -> pd.DataFrame:
     """
-    Fetch ESPN injury report. Returns dict[team_abbr] = {
-      'flag': str summary, 'qb_out': bool, 'key_out': int, 'details': list
-    }
+    Scrape the official NFL.com injury report (https://www.nfl.com/injuries/).
+    Returns columns: Team, Player, Position, Injury, Practice Status, Game Status.
     """
-    ESPN_ABBR = {
-        "WSH": "WAS", "LAR": "LA", "JAC": "JAX",
-    }
-    out: Dict[str, Dict[str, Any]] = {}
+    rows = []
     try:
         r = requests.get(
-            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/injuries",
-            timeout=20,
+            "https://www.nfl.com/injuries/",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; NFLScanner/1.0)"},
+            timeout=30,
         )
         if r.status_code != 200:
-            return out
-        data = r.json()
-        # Build id -> abbr map
-        id_to_abbr = {}
+            return pd.DataFrame(columns=["Team", "Player", "Position", "Injury", "Practice Status", "Game Status"])
+        html = r.text
         try:
-            tr = requests.get(
-                "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams",
-                timeout=15,
-            )
-            if tr.status_code == 200:
-                teams = (
-                    tr.json()
-                    .get("sports", [{}])[0]
-                    .get("leagues", [{}])[0]
-                    .get("teams", [])
-                )
-                for t in teams:
-                    tm = t.get("team", t)
-                    abbr = ESPN_ABBR.get(tm.get("abbreviation"), tm.get("abbreviation"))
-                    if abbr and tm.get("id"):
-                        id_to_abbr[str(tm["id"])] = abbr
-        except Exception:
-            pass
+            from bs4 import BeautifulSoup
+        except ImportError:
+            # minimal fallback without bs4
+            return pd.DataFrame(columns=["Team", "Player", "Position", "Injury", "Practice Status", "Game Status"])
+        soup = BeautifulSoup(html, "html.parser")
 
-        for block in data.get("injuries") or []:
-            team_id = str(block.get("id") or "")
-            display = block.get("displayName") or ""
-            abbr = id_to_abbr.get(team_id) or to_abbr(display) or _normalize_team_abbr(display)
-            if not abbr or len(abbr) > 3:
-                # try map from display name
-                abbr = to_abbr(display) or ""
-            if not abbr:
-                continue
-            abbr = _normalize_team_abbr(abbr)
-            qb_out = False
-            key_out = 0
-            details = []
-            severe = {"out", "injured reserve", "doubtful", "ir"}
-            for inj in block.get("injuries") or []:
-                status = (inj.get("status") or "").strip()
-                status_l = status.lower()
-                ath = inj.get("athlete") or {}
-                name = ath.get("displayName") or ath.get("shortName") or "?"
-                pos = ath.get("position")
-                if isinstance(pos, dict):
-                    pos = pos.get("abbreviation") or pos.get("displayName") or ""
-                pos = (pos or "").upper()
-                if status_l in severe or status_l.startswith("out") or "reserve" in status_l:
-                    key_out += 1
-                    details.append(f"{name} ({pos}) {status}")
-                    if pos == "QB":
-                        qb_out = True
-                elif status_l in ("questionable", "q"):
-                    details.append(f"{name} ({pos}) Q")
-            flag_parts = []
-            if qb_out:
-                flag_parts.append("QB OUT")
-            if key_out:
-                flag_parts.append(f"{key_out} OUT/IR")
-            out[abbr] = {
-                "flag": " · ".join(flag_parts) if flag_parts else "",
-                "qb_out": qb_out,
-                "key_out": key_out,
-                "details": details[:8],
-            }
+        # Team order from /teams/<slug>/ links (deduped consecutive)
+        team_order = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/teams/" in href:
+                slug = href.strip("/").split("/")[-1]
+                if slug in SLUG_TO_ABBR:
+                    if not team_order or team_order[-1] != slug:
+                        team_order.append(slug)
+
+        tables = soup.find_all("table")
+        n = min(len(team_order), len(tables))
+        for i in range(n):
+            slug = team_order[i]
+            abbr = SLUG_TO_ABBR.get(slug, slug)
+            team_name = full_name(abbr)
+            table = tables[i]
+            for tr in table.find_all("tr")[1:]:
+                cols = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+                if len(cols) < 2:
+                    continue
+                # Expected: Player, Position, Injuries, Practice Status, Game Status
+                player = cols[0] if len(cols) > 0 else ""
+                pos = cols[1] if len(cols) > 1 else ""
+                injury = cols[2] if len(cols) > 2 else ""
+                practice = cols[3] if len(cols) > 3 else ""
+                game_status = cols[4] if len(cols) > 4 else ""
+                if not player:
+                    continue
+                rows.append({
+                    "Team": team_name,
+                    "Team Abbr": abbr,
+                    "Player": player,
+                    "Position": pos,
+                    "Injury": injury or "—",
+                    "Practice Status": practice or "—",
+                    "Game Status": game_status or "—",
+                })
     except Exception:
-        return out
-    return out
-
-
-def injury_label_for_game(home: str, away: str, injury_map: Dict[str, Dict]) -> str:
-    parts = []
-    for team, label in ((away, "Away"), (home, "Home")):
-        info = injury_map.get(team) or {}
-        if info.get("qb_out"):
-            parts.append(f"{label} QB OUT")
-        elif info.get("key_out", 0) >= 2:
-            parts.append(f"{label} {info['key_out']} OUT")
-        elif info.get("flag"):
-            parts.append(f"{label}: {info['flag']}")
-    return " · ".join(parts) if parts else "—"
-
-
-# ---- Bet log / unit tracker helpers ----
-BET_LOG_PATH = Path("/home/workdir/artifacts/bet_log.csv")
+        return pd.DataFrame(columns=["Team", "Team Abbr", "Player", "Position", "Injury", "Practice Status", "Game Status"])
+    if not rows:
+        return pd.DataFrame(columns=["Team", "Team Abbr", "Player", "Position", "Injury", "Practice Status", "Game Status"])
+    return pd.DataFrame(rows)
 
 
 def _load_bet_log() -> pd.DataFrame:
@@ -1798,10 +1778,11 @@ def monte_carlo_game(
 # -----------------------------
 # TABS
 # -----------------------------
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 Opportunities",
     "📅 Games & Odds",
     "🌤️ Weather",
+    "🏥 Injury Report",
     "🎯 Player Props",
     "📊 Bankroll & CLV",
     "📈 Backtest"
@@ -1823,10 +1804,6 @@ with tab1:
         # Source of truth: schedule-driven game list (includes every week 1–18 game)
         # Falls back to Odds API events if schedule rows are empty
         upcoming = build_upcoming_games(schedules, odds_data, days_ahead=90)
-        try:
-            injury_map = load_injury_flags()
-        except Exception:
-            injury_map = {}
         weather_cache = build_weather_cache_from_games(upcoming)
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -2019,17 +1996,6 @@ with tab1:
                 else:
                     edge_pct = edge_home
 
-                # Injury flags
-                try:
-                    inj_map = injury_map if isinstance(injury_map, dict) else {}
-                except NameError:
-                    inj_map = {}
-                inj_label = injury_label_for_game(home, away, inj_map)
-                if inj_label and inj_label != "—":
-                    signals.append(inj_label)
-                    if "QB OUT" in inj_label:
-                        total_score += 1.2
-
                 if roof in ("dome", "closed"):
                     wx_str = "Dome"
                 else:
@@ -2058,7 +2024,6 @@ with tab1:
                     "Model %": f"{model_home*100:.1f}%",
                     "Market %": f"{mkt_home*100:.1f}%" if mkt_home is not None else "—",
                     "Edge %": f"{edge_pct:+.1f}" if edge_pct is not None else "—",
-                    "Injury": inj_label,
                     "ML Home %": f"{ml_home*100:.1f}%",
                     "MC Home %": f"{mc['home_cover_prob']*100:.1f}%",
                     "MC Over %": f"{mc['over_prob']*100:.1f}%",
@@ -2411,8 +2376,75 @@ with tab3:
     else:
         st.info("No upcoming games / weather available yet. Load Opportunities first so weather is fetched.")
 
+
 with tab4:
+    st.subheader("NFL Injury Report")
+    st.caption(
+        "Official report from [NFL.com/injuries](https://www.nfl.com/injuries/). "
+        "Filter by team. Game Status reflects the league designation (Out / Doubtful / Questionable / etc.)."
+    )
+    with st.spinner("Loading NFL.com injury report..."):
+        inj_df = load_nfl_injury_report()
+    if inj_df is None or inj_df.empty:
+        st.warning(
+            "Could not load injury data from NFL.com right now. "
+            "Try again later or open https://www.nfl.com/injuries/ directly."
+        )
+    else:
+        teams = sorted(inj_df["Team"].dropna().unique().tolist())
+        c1, c2, c3 = st.columns([1.4, 1, 1])
+        with c1:
+            team_sel = st.multiselect(
+                "Team",
+                options=teams,
+                default=[],
+                placeholder="All teams",
+                key="inj_team_filter",
+            )
+        with c2:
+            statuses = sorted({s for s in inj_df["Game Status"].dropna().unique().tolist() if s and s != "—"})
+            status_sel = st.multiselect(
+                "Game Status",
+                options=statuses,
+                default=[],
+                placeholder="All statuses",
+                key="inj_status_filter",
+            )
+        with c3:
+            positions = sorted({p for p in inj_df["Position"].dropna().unique().tolist() if p})
+            pos_sel = st.multiselect(
+                "Position",
+                options=positions,
+                default=[],
+                placeholder="All positions",
+                key="inj_pos_filter",
+            )
+        view = inj_df.copy()
+        if team_sel:
+            view = view[view["Team"].isin(team_sel)]
+        if status_sel:
+            view = view[view["Game Status"].isin(status_sel)]
+        if pos_sel:
+            view = view[view["Position"].isin(pos_sel)]
+        # Highlight OUT / Doubtful
+        st.dataframe(
+            view.drop(columns=["Team Abbr"], errors="ignore"),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(f"{len(view)} players shown · Source: nfl.com/injuries")
+        outs = view[view["Game Status"].astype(str).str.lower().isin(["out", "doubtful"])]
+        if not outs.empty:
+            st.markdown("##### Out / Doubtful")
+            st.dataframe(
+                outs.drop(columns=["Team Abbr"], errors="ignore"),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+with tab5:
     st.subheader("Player Props")
+
 
     if not api_key:
         st.warning("Enter API key first.")
@@ -2449,7 +2481,7 @@ with tab4:
 
 # ========== TAB 4 ==========
 
-with tab5:
+with tab6:
     st.subheader("Bankroll & Closing Line Value")
     st.caption(
         "Log units on model leans, grade results, and track CLV (closing line value). "
@@ -2596,7 +2628,7 @@ with tab5:
                 st.error(f"Import failed: {e}")
 
 
-with tab6:
+with tab7:
     st.subheader("Simple Backtest")
     min_edge = st.slider("Minimum EPA edge", 0.03, 0.20, 0.05, 0.01)
     eval_seasons = st.multiselect("Evaluation seasons", [2021, 2022, 2023, 2024, 2025], default=[2023, 2024, 2025])
