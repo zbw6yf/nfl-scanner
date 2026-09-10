@@ -22,10 +22,154 @@ from sklearn.pipeline import Pipeline
 st.set_page_config(
     page_title="NFL Opportunity Scanner",
     page_icon="🏈",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
-st.title("🏈 NFL Betting Opportunity Scanner")
-st.caption("EPA + Rules + Rest + Weather + ML + Monte Carlo + Implied Totals + Form + Pace + Travel + Divisional · Research tool only")
+
+# ---- Theme + polish CSS ----
+if "ui_theme" not in st.session_state:
+    st.session_state["ui_theme"] = "Dark"
+
+TEAM_COLORS = {
+    "ARI": "#97233F", "ATL": "#A71930", "BAL": "#241773", "BUF": "#00338D",
+    "CAR": "#0085CA", "CHI": "#0B162A", "CIN": "#FB4F14", "CLE": "#311D00",
+    "DAL": "#003594", "DEN": "#FB4F14", "DET": "#0076B6", "GB": "#203731",
+    "HOU": "#03202F", "IND": "#002C5F", "JAX": "#006778", "KC": "#E31837",
+    "LAC": "#0080C6", "LA": "#003594", "LV": "#000000", "MIA": "#008E97",
+    "MIN": "#4F2683", "NE": "#002244", "NO": "#D3BC8D", "NYG": "#0B2265",
+    "NYJ": "#125740", "PHI": "#004C54", "PIT": "#FFB612", "SF": "#AA0000",
+    "SEA": "#002244", "TB": "#D50A0A", "TEN": "#0C2340", "WAS": "#5A1414",
+}
+
+CONF_COLORS = {"A": "#22c55e", "B": "#84cc16", "C": "#eab308", "D": "#f97316", "E": "#ef4444", "F": "#6b7280"}
+
+
+def inject_theme_css(theme: str) -> None:
+    dark = theme == "Dark"
+    bg = "#0e1117" if dark else "#f7f8fa"
+    card = "#1a1f2e" if dark else "#ffffff"
+    text = "#e8eaed" if dark else "#1a1d26"
+    muted = "#9aa0a6" if dark else "#5f6368"
+    accent = "#3b82f6"
+    border = "#2d3348" if dark else "#e5e7eb"
+    st.markdown(
+        f"""
+<style>
+    .stApp {{ background-color: {bg}; color: {text}; }}
+    .block-container {{ padding-top: 1.2rem; padding-bottom: 2rem; }}
+    h1, h2, h3, h4 {{ letter-spacing: -0.02em; }}
+    div[data-testid="stMetric"] {{
+        background: {card};
+        border: 1px solid {border};
+        border-radius: 12px;
+        padding: 12px 14px;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+    }}
+    div[data-testid="stMetric"] label {{ color: {muted} !important; }}
+    .nsc-hero {{
+        background: linear-gradient(135deg, #0b1220 0%, #1e3a5f 55%, #1d4ed8 100%);
+        border-radius: 16px;
+        padding: 1.25rem 1.5rem;
+        margin-bottom: 1rem;
+        color: #f8fafc;
+        border: 1px solid rgba(255,255,255,0.08);
+    }}
+    .nsc-hero h1 {{
+        margin: 0;
+        font-size: 1.75rem;
+        font-weight: 700;
+        color: #f8fafc !important;
+    }}
+    .nsc-hero p {{
+        margin: 0.35rem 0 0 0;
+        color: #cbd5e1;
+        font-size: 0.95rem;
+    }}
+    .nsc-badge {{
+        display: inline-block;
+        padding: 2px 10px;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        margin-right: 6px;
+        background: rgba(255,255,255,0.12);
+        color: #e2e8f0;
+    }}
+    .nsc-card {{
+        background: {card};
+        border: 1px solid {border};
+        border-radius: 12px;
+        padding: 0.9rem 1rem;
+        margin-bottom: 0.65rem;
+    }}
+    .nsc-card-title {{ font-weight: 650; font-size: 1.02rem; margin-bottom: 0.25rem; color: {text}; }}
+    .nsc-muted {{ color: {muted}; font-size: 0.85rem; }}
+    .nsc-pill {{
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 6px;
+        font-size: 0.78rem;
+        font-weight: 600;
+        margin-right: 4px;
+    }}
+    .nsc-stamp {{
+        color: {muted};
+        font-size: 0.8rem;
+        margin: 0.15rem 0 0.75rem 0;
+    }}
+    .nsc-footer {{
+        margin-top: 2rem;
+        padding-top: 0.75rem;
+        border-top: 1px solid {border};
+        color: {muted};
+        font-size: 0.8rem;
+    }}
+    [data-testid="stSidebar"] {{
+        background: {"#111827" if dark else "#ffffff"};
+        border-right: 1px solid {border};
+    }}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def stamp_now(key: str) -> None:
+    st.session_state[f"updated_{key}"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def stamp_text(key: str, label: str) -> str:
+    val = st.session_state.get(f"updated_{key}")
+    return f"{label}: **{val}**" if val else f"{label}: —"
+
+
+def current_nfl_week() -> Optional[int]:
+    """Best-effort current NFL week from today's date."""
+    try:
+        return estimate_week_from_date(datetime.now().strftime("%Y-%m-%d"))
+    except Exception:
+        return None
+
+
+def conf_pill(grade: str) -> str:
+    g = (grade or "F").upper()[:1]
+    color = CONF_COLORS.get(g, "#6b7280")
+    return f'<span class="nsc-pill" style="background:{color}22;color:{color};border:1px solid {color}55">{g}</span>'
+
+
+inject_theme_css(st.session_state.get("ui_theme", "Dark"))
+
+st.markdown(
+    """
+<div class="nsc-hero">
+  <span class="nsc-badge">Research tool</span>
+  <span class="nsc-badge">EPA · ML · Monte Carlo</span>
+  <h1>🏈 NFL Opportunity Scanner</h1>
+  <p>Model-driven lean board with schedule, weather, injuries, and depth charts — not betting advice.</p>
+</div>
+    """,
+    unsafe_allow_html=True,
+)
 # -----------------------------
 # CONSTANTS
 # -----------------------------
@@ -165,6 +309,18 @@ def travel_direction(home: str, away: str) -> str:
 # SIDEBAR
 # -----------------------------
 st.sidebar.header("Settings")
+theme_choice = st.sidebar.radio(
+    "Theme",
+    options=["Dark", "Light"],
+    index=0 if st.session_state.get("ui_theme", "Dark") == "Dark" else 1,
+    horizontal=True,
+    key="theme_radio",
+)
+if theme_choice != st.session_state.get("ui_theme"):
+    st.session_state["ui_theme"] = theme_choice
+    inject_theme_css(theme_choice)
+    st.rerun()
+
 api_key = st.sidebar.text_input("The Odds API Key", type="password")
 n_simulations = st.sidebar.slider("Monte Carlo simulations", 2000, 15000, 8000, 1000)
 form_window = st.sidebar.slider("Recent form window (games)", 4, 8, 6, 1)
@@ -172,9 +328,17 @@ if st.sidebar.button("Clear all caches"):
     st.cache_data.clear()
     st.cache_resource.clear()
     for k in list(st.session_state.keys()):
-        if "weather" in k.lower():
+        if "weather" in k.lower() or k.startswith("updated_"):
             del st.session_state[k]
     st.rerun()
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Data freshness**")
+st.sidebar.caption(stamp_text("odds", "Odds"))
+st.sidebar.caption(stamp_text("schedule", "Schedule"))
+st.sidebar.caption(stamp_text("weather", "Weather"))
+st.sidebar.caption(stamp_text("injuries", "Injuries"))
+st.sidebar.caption(stamp_text("depth", "Depth charts"))
 st.sidebar.caption("Weather is unique per stadium + kickoff.")
 # -----------------------------
 # DATA FUNCTIONS
@@ -991,6 +1155,51 @@ ESPN_TEAM_IDS = {
 
 # Ourlads uses LAR for Rams
 OURLADS_ABBR = {**{a: a for a in ESPN_TEAM_IDS}, "LA": "LAR", "WAS": "WAS"}
+
+
+
+
+def american_profit(units: float, american_odds: float, won: bool) -> float:
+    if not won:
+        return -abs(units)
+    try:
+        o = float(american_odds)
+    except Exception:
+        o = -110.0
+    if o < 0:
+        return abs(units) * (100.0 / (-o))
+    return abs(units) * (o / 100.0)
+
+
+BET_LOG_PATH = Path("/home/workdir/artifacts/bet_log.csv")
+
+
+def _load_bet_log() -> pd.DataFrame:
+    cols = [
+        "id", "logged_at", "week", "game", "bet_type", "side", "line_taken",
+        "odds", "units", "model_prob", "market_prob", "edge_pct",
+        "closing_line", "result", "profit_units", "clv", "notes",
+    ]
+    if "bet_log_df" in st.session_state and isinstance(st.session_state.get("bet_log_df"), pd.DataFrame):
+        return st.session_state["bet_log_df"]
+    try:
+        if BET_LOG_PATH.exists():
+            df = pd.read_csv(BET_LOG_PATH)
+            st.session_state["bet_log_df"] = df
+            return df
+    except Exception:
+        pass
+    df = pd.DataFrame(columns=cols)
+    st.session_state["bet_log_df"] = df
+    return df
+
+
+def _save_bet_log(df: pd.DataFrame) -> None:
+    st.session_state["bet_log_df"] = df
+    try:
+        df.to_csv(BET_LOG_PATH, index=False)
+    except Exception:
+        pass
 
 
 def _strip_html(s: str) -> str:
@@ -1971,7 +2180,11 @@ with tab1:
         # Source of truth: schedule-driven game list (includes every week 1–18 game)
         # Falls back to Odds API events if schedule rows are empty
         upcoming = build_upcoming_games(schedules, odds_data, days_ahead=90)
+        stamp_now("schedule")
+        if odds_data:
+            stamp_now("odds")
         weather_cache = build_weather_cache_from_games(upcoming)
+        stamp_now("weather")
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("EPA teams", 0 if team_epa.empty else len(team_epa))
@@ -2245,10 +2458,24 @@ with tab1:
                 df["_Week_num"] = pd.to_numeric(df["Week"], errors="coerce")
                 available_weeks = sorted(df["_Week_num"].dropna().unique().tolist())
                 week_choices = ["All weeks"] + [f"Week {int(w)}" for w in available_weeks]
+                # Default to current NFL week when available
+                cur_wk = current_nfl_week()
+                default_week_idx = 0
+                if cur_wk is not None and available_weeks:
+                    label = f"Week {int(cur_wk)}"
+                    if label in week_choices:
+                        default_week_idx = week_choices.index(label)
+                    else:
+                        # nearest upcoming week in list
+                        future = [w for w in available_weeks if w >= cur_wk]
+                        pick = int(future[0]) if future else int(available_weeks[0])
+                        label = f"Week {pick}"
+                        if label in week_choices:
+                            default_week_idx = week_choices.index(label)
                 selected_week_filter = st.selectbox(
                     "Week",
                     options=week_choices,
-                    index=0,
+                    index=default_week_idx,
                     key="opp_week_filter",
                 )
 
@@ -2281,8 +2508,65 @@ with tab1:
                 + ")"
                 + week_note
             )
+            st.markdown(
+                f'<div class="nsc-stamp">{stamp_text("odds", "Odds")} · {stamp_text("schedule", "Schedule")} · {stamp_text("weather", "Weather")}</div>',
+                unsafe_allow_html=True,
+            )
+
+            # ---- Week summary metrics ----
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Games shown", len(filtered))
+            top_row = filtered.iloc[0] if len(filtered) else None
+            m2.metric(
+                "Top lean",
+                (top_row.get("Recommendation") if top_row is not None else "—") or "—",
+            )
+            # average edge numeric
+            def _edge_num(x):
+                try:
+                    return float(str(x).replace("+", "").replace("%", ""))
+                except Exception:
+                    return None
+            edges = []
+            if "Edge %" in filtered.columns:
+                edges = [e for e in (_edge_num(v) for v in filtered["Edge %"].tolist()) if e is not None]
+            avg_edge = sum(edges) / len(edges) if edges else None
+            m3.metric("Avg Edge %", f"{avg_edge:+.1f}" if avg_edge is not None else "—")
+            if "Confidence" in filtered.columns and len(filtered):
+                conf_counts = filtered["Confidence"].astype(str).str.upper().value_counts()
+                top_conf = conf_counts.index[0] if len(conf_counts) else "—"
+                m4.metric("Most common grade", str(top_conf))
+            else:
+                m4.metric("Most common grade", "—")
+
+            # ---- Top opportunity cards ----
+            st.markdown("##### Top opportunities")
+            card_n = min(5, len(filtered))
+            if card_n:
+                for i in range(card_n):
+                    row = filtered.iloc[i]
+                    conf = str(row.get("Confidence", "—"))
+                    rec = str(row.get("Recommendation", "—"))
+                    game = str(row.get("Game", "—"))
+                    kick = str(row.get("Kickoff", "—"))
+                    score = row.get("Score", "—")
+                    edge = row.get("Edge %", "—")
+                    spread = row.get("Spread", "—")
+                    total = row.get("Total", "—")
+                    signals = str(row.get("Signals", "—"))
+                    with st.expander(f"{conf} · {rec} · {game}", expanded=(i == 0)):
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Score", score)
+                        c2.metric("Edge %", edge)
+                        c3.metric("Spread", spread)
+                        c4.metric("Total", total)
+                        st.caption(f"Kickoff: {kick}")
+                        st.write(signals)
+
             helper_cols = [c for c in filtered.columns if c.startswith("_")]
             display_df = filtered.drop(columns=["_Week_num"] + helper_cols, errors="ignore")
+            # Color-ish confidence sort already by score
+            st.markdown("##### Full board")
             st.dataframe(display_df, use_container_width=True, hide_index=True)
 
             # ---- TOP 5 SIGNALED GAMES BY WEEK ----
@@ -2303,6 +2587,16 @@ with tab1:
                 weeks_sorted = sorted(df_known["Week_num"].unique())
                 week_labels = {int(w): f"Week {int(w)}" for w in weeks_sorted}
                 default_idx = 0
+                cur_wk = current_nfl_week()
+                if cur_wk is not None:
+                    if int(cur_wk) in week_labels:
+                        default_idx = list(weeks_sorted).index(
+                            [w for w in weeks_sorted if int(w) == int(cur_wk)][0]
+                        )
+                    else:
+                        future = [w for w in weeks_sorted if int(w) >= int(cur_wk)]
+                        if future:
+                            default_idx = list(weeks_sorted).index(future[0])
                 selected_label = st.selectbox(
                     "Select week",
                     options=[week_labels[int(w)] for w in weeks_sorted],
@@ -2552,6 +2846,8 @@ with tab4:
     )
     with st.spinner("Loading NFL.com injury report..."):
         inj_df = load_nfl_injury_report()
+        if inj_df is not None and not inj_df.empty:
+            stamp_now("injuries")
     if inj_df is None or inj_df.empty:
         st.warning(
             "Could not load injury data from NFL.com or ESPN right now. "
@@ -2615,34 +2911,49 @@ with tab5:
     st.subheader("Depth Charts")
     st.caption(
         "Current team depth charts from [Ourlads](https://www.ourlads.com/nfldepthcharts/). "
-        "Filter by team and unit (Offense / Defense / Special Teams)."
+        "Pick a team to view starters first, then full depth."
     )
     with st.spinner("Loading depth charts..."):
         dc_df = load_depth_charts()
+        if dc_df is not None and not dc_df.empty:
+            stamp_now("depth")
     if dc_df is None or dc_df.empty:
         st.warning("Could not load depth charts right now. Try clearing caches and reloading.")
     else:
         teams = sorted(dc_df["Team"].dropna().unique().tolist())
-        c1, c2 = st.columns(2)
+        c1, c2 = st.columns([2, 1])
         with c1:
             team_sel = st.selectbox("Team", options=teams, key="dc_team")
         with c2:
             units = ["All"] + sorted(dc_df["Unit"].dropna().unique().tolist())
             unit_sel = st.selectbox("Unit", options=units, key="dc_unit")
-        view = dc_df[dc_df["Team"] == team_sel]
+
+        view = dc_df[dc_df["Team"] == team_sel].copy()
         if unit_sel != "All":
             view = view[view["Unit"] == unit_sel]
-        # Pivot-style readable table: Position x Rank
-        if not view.empty:
-            show = view[["Unit", "Position", "Rank", "Player"]].sort_values(["Unit", "Position", "Rank"])
-            st.dataframe(show, use_container_width=True, hide_index=True)
-            st.caption(f"{len(show)} entries · {team_sel}")
-            # Compact starter view (Rank 1)
-            starters = view[view["Rank"] == 1][["Unit", "Position", "Player"]].sort_values(["Unit", "Position"])
-            with st.expander("Starters only (Rank 1)", expanded=True):
-                st.dataframe(starters, use_container_width=True, hide_index=True)
-        else:
+
+        if view.empty:
             st.info("No depth chart rows for this selection.")
+        else:
+            # ---- Starters at top ----
+            st.markdown(f"##### Starters — {team_sel}")
+            starters = (
+                view[view["Rank"] == 1][["Unit", "Position", "Player"]]
+                .sort_values(["Unit", "Position"])
+                .reset_index(drop=True)
+            )
+            st.dataframe(starters, use_container_width=True, hide_index=True)
+            st.caption(f"{len(starters)} starters")
+
+            st.markdown("---")
+            st.markdown(f"##### Full depth chart — {team_sel}")
+            show = (
+                view[["Unit", "Position", "Rank", "Player"]]
+                .sort_values(["Unit", "Position", "Rank"])
+                .reset_index(drop=True)
+            )
+            st.dataframe(show, use_container_width=True, hide_index=True)
+            st.caption(f"{len(show)} entries · source: Ourlads")
 
 with tab6:
     st.subheader("Player Props")
