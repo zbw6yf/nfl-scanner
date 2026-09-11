@@ -164,6 +164,93 @@ def _save_api_key(key: str) -> None:
         pass
 
 
+
+# ---------------------------------------------------------------------------
+# Feature flags (Stripe-ready)
+# Free vs Pro gating. Flip flags or set secrets without rewriting UI code.
+# Streamlit secrets example:
+#   [features]
+#   stripe_enabled = true
+#   require_pro_for_props = true
+#   [stripe]
+#   price_id_pro = "price_xxx"
+#   payment_link = "https://buy.stripe.com/xxx"
+# ---------------------------------------------------------------------------
+DEFAULT_FEATURE_FLAGS = {
+    "stripe_enabled": False,          # master switch for paywall CTAs
+    "require_pro_for_props": False,    # gate Player Props
+    "require_pro_for_bankroll": False, # gate Bankroll & CLV
+    "require_pro_for_history": False,  # gate Signal History detail
+    "require_pro_for_backtest": False,
+    "today_card": True,               # Homepage Today's Card
+    "show_upgrade_cta": True,
+}
+
+
+def _secrets_features() -> dict:
+    try:
+        feat = st.secrets.get("features", {})
+        return dict(feat) if feat else {}
+    except Exception:
+        return {}
+
+
+def feature_enabled(name: str) -> bool:
+    flags = dict(DEFAULT_FEATURE_FLAGS)
+    flags.update(_secrets_features())
+    # session overrides for testing
+    overrides = st.session_state.get("feature_flag_overrides") or {}
+    flags.update(overrides)
+    return bool(flags.get(name, False))
+
+
+def user_tier() -> str:
+    """free | pro — set via session after Stripe webhook / login (future)."""
+    tier = st.session_state.get("user_tier")
+    if tier in ("free", "pro"):
+        return tier
+    try:
+        if st.secrets.get("user_tier") in ("free", "pro"):
+            return str(st.secrets.get("user_tier"))
+    except Exception:
+        pass
+    return "free"
+
+
+def require_pro(flag_name: str) -> bool:
+    """Return True if the user is blocked (needs Pro)."""
+    if not feature_enabled(flag_name):
+        return False
+    if not feature_enabled("stripe_enabled"):
+        return False  # soft launch: flags on but stripe off = allow all
+    return user_tier() != "pro"
+
+
+def stripe_payment_link() -> str:
+    try:
+        return str(st.secrets.get("stripe", {}).get("payment_link") or "")
+    except Exception:
+        return ""
+
+
+def render_upgrade_cta(context: str = "") -> None:
+    if not feature_enabled("show_upgrade_cta"):
+        return
+    if not feature_enabled("stripe_enabled"):
+        return
+    if user_tier() == "pro":
+        return
+    link = stripe_payment_link()
+    msg = "Pro unlocks full Signal History, props, bankroll tools, and priority board refresh."
+    if context:
+        msg = f"{context} {msg}"
+    st.warning(msg)
+    if link:
+        st.link_button("Upgrade to Pro", link, type="primary")
+    else:
+        st.caption("Set secrets.stripe.payment_link to enable checkout.")
+
+
 def stamp_now(key: str) -> None:
     st.session_state[f"updated_{key}"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -410,6 +497,17 @@ if theme_choice != st.session_state.get("ui_theme"):
     st.session_state["ui_theme"] = theme_choice
     inject_theme_css(theme_choice)
     st.rerun()
+
+# Account tier (Stripe-ready)
+_tier = user_tier()
+st.sidebar.markdown(f"**Plan:** {'Pro ✨' if _tier == 'pro' else 'Free'}")
+if feature_enabled("stripe_enabled") and _tier != "pro":
+    _plink = stripe_payment_link()
+    if _plink:
+        st.sidebar.link_button("Upgrade to Pro", _plink)
+    else:
+        st.sidebar.caption("Pro checkout link not configured")
+st.sidebar.markdown("---")
 
 # Persist Odds API key across sessions (local file + session_state)
 _saved_key = _load_saved_api_key()
@@ -3400,25 +3498,6 @@ with tab1:
     st.markdown(
         """
 <style>
-.tm-home-hero {
-  position: relative;
-  border-radius: 18px;
-  overflow: hidden;
-  margin-bottom: 1.25rem;
-  min-height: 200px;
-  border: 1px solid rgba(255,255,255,0.1);
-  box-shadow: 0 12px 40px rgba(0,0,0,0.35);
-}
-.tm-home-hero__bg {
-  position: absolute; inset: 0;
-  background:
-    linear-gradient(120deg, rgba(7,12,24,0.94) 0%, rgba(15,23,42,0.78) 50%, rgba(14,116,144,0.45) 100%),
-    url('https://images.unsplash.com/photo-1508098682722-e99c43a406b2?auto=format&fit=crop&w=1600&q=80') center/cover no-repeat;
-}
-.tm-home-hero__content { position: relative; z-index: 1; padding: 1.75rem 1.75rem 1.5rem; color: #f8fafc; }
-.tm-home-hero h2 { margin: 0 0 0.35rem 0; font-size: 2rem; font-weight: 800; letter-spacing: 0.04em; }
-.tm-home-hero .ai { color: #38bdf8; text-shadow: 0 0 16px rgba(56,189,248,0.5); }
-.tm-home-hero p { margin: 0; color: #cbd5e1; max-width: 36rem; line-height: 1.5; }
 .tm-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -3431,21 +3510,13 @@ with tab1:
   border-radius: 14px;
   padding: 1rem 1.05rem 1.05rem;
   box-shadow: 0 6px 20px rgba(0,0,0,0.22);
-  transition: border-color 0.15s ease;
 }
-.tm-card:hover { border-color: #38bdf8; }
 .tm-card .icon { font-size: 1.55rem; margin-bottom: 0.35rem; }
 .tm-card h4 { margin: 0 0 0.3rem 0; color: #f1f5f9; font-size: 1rem; }
 .tm-card p { margin: 0; color: #94a3b8; font-size: 0.88rem; line-height: 1.45; }
 .tm-section-title {
-  color: #e2e8f0; font-size: 1.1rem; font-weight: 700;
-  margin: 1.1rem 0 0.55rem 0; letter-spacing: 0.02em;
-}
-.tm-pill-row { display: flex; flex-wrap: wrap; gap: 0.45rem; margin: 0.5rem 0 1rem 0; }
-.tm-pill {
-  background: rgba(56,189,248,0.12); color: #7dd3fc;
-  border: 1px solid rgba(56,189,248,0.25);
-  border-radius: 999px; padding: 0.28rem 0.7rem; font-size: 0.78rem; font-weight: 600;
+  color: #e2e8f0; font-size: 1.15rem; font-weight: 700;
+  margin: 0.5rem 0 0.55rem 0; letter-spacing: 0.02em;
 }
 .tm-diff {
   display: grid;
@@ -3481,22 +3552,103 @@ with tab1:
   background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.2);
   color: #fcd34d; font-size: 0.85rem;
 }
+.tm-today-header {
+  background: linear-gradient(90deg, #0f172a, #1e3a5f);
+  border-radius: 14px; padding: 14px 18px; margin-bottom: 12px;
+  border: 1px solid rgba(255,255,255,0.08);
+}
+.tm-today-header h3 { margin: 0; color: #f8fafc; font-size: 1.2rem; }
+.tm-today-header p { margin: 4px 0 0 0; color: #94a3b8; font-size: 0.88rem; }
+.tm-ticket {
+  background: #111827; border: 1px solid #1f2937; border-radius: 12px;
+  padding: 12px 14px; margin-bottom: 8px;
+}
 </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-<div class="tm-home-hero">
-  <div class="tm-home-hero__bg"></div>
-  <div class="tm-home-hero__content">
-    <div class="tm-pill-row">
-      <span class="tm-pill">NFL analytics</span>
-      <span class="tm-pill">Model leans</span>
-      <span class="tm-pill">Open → Curr lines</span>
-      <span class="tm-pill">Research tool</span>
+    # ---- Today's Card ----
+    if feature_enabled("today_card"):
+        cur_wk = current_nfl_week() or 1
+        st.markdown(
+            f"""
+<div class="tm-today-header">
+  <h3>Today's Card · Week {int(cur_wk)}</h3>
+  <p>This week's slate at a glance — lines, moves, and kickoffs. Open <b>Game Signals</b> for full model leans.</p>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+        an_home = {}
+        try:
+            an_home = fetch_action_network_lines()
+        except Exception:
+            an_home = {}
+        week_games = [r for r in EMBEDDED_2026_SCHEDULE if int(r.get("week") or 0) == int(cur_wk)]
+        # Prefer games today / next 3 days first
+        today = pd.Timestamp.now().normalize()
+        def _sort_key(r):
+            gd = pd.to_datetime(r.get("gameday"), errors="coerce")
+            return gd if pd.notna(gd) else pd.Timestamp.max
+        week_games = sorted(week_games, key=_sort_key)
+        # show up to 8 games for the week
+        show_games = week_games[:8] if week_games else []
+        if not show_games:
+            st.info("No games found for the current week in the embedded schedule.")
+        else:
+            for r in show_games:
+                home = str(r.get("home") or "").upper()
+                away = str(r.get("away") or "").upper()
+                gameday = r.get("gameday")
+                gametime = r.get("gametime") or "13:00"
+                kickoff = format_schedule_kickoff(gameday, gametime)
+                an = an_home.get(f"{away}_{home}") or {}
+                os_ = an.get("open_spread")
+                cs = an.get("cur_spread")
+                ot = an.get("open_total")
+                ct = an.get("cur_total")
+                sm = (float(cs) - float(os_)) if (cs is not None and os_ is not None) else None
+                tm = (float(ct) - float(ot)) if (ct is not None and ot is not None) else None
+                os_s = f"{os_:+.1f}" if os_ is not None else "—"
+                cs_s = f"{cs:+.1f}" if cs is not None else "—"
+                ot_s = f"{ot:.1f}" if ot is not None else "—"
+                ct_s = f"{ct:.1f}" if ct is not None else "—"
+                sm_s = f"{sm:+.1f}" if sm is not None else "—"
+                tm_s = f"{tm:+.1f}" if tm is not None else "—"
+                move_color = "#94a3b8"
+                try:
+                    if sm is not None and abs(sm) >= 1.5:
+                        move_color = "#fbbf24"
+                    elif sm is not None and abs(sm) >= 0.5:
+                        move_color = "#38bdf8"
+                except Exception:
+                    pass
+                st.markdown(
+                    f"""
+<div class="tm-ticket">
+  <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+    <div>
+      <div style="color:#f8fafc;font-weight:700;">{full_name(away)} <span style="color:#64748b;">@</span> {full_name(home)}</div>
+      <div style="color:#94a3b8;font-size:0.82rem;">Kickoff {kickoff}</div>
     </div>
-    <h2>Welcome to T<span class="ai">AI</span>L ME</h2>
-    <p>AI-powered NFL lean board for people who want the <b>why</b> behind a side or total — not another wall of random picks.</p>
+    <div style="text-align:right;">
+      <div style="color:#94a3b8;font-size:0.75rem;">SPREAD open → curr</div>
+      <div style="color:#e2e8f0;font-weight:600;">{os_s} → {cs_s} <span style="color:{move_color};">({sm_s})</span></div>
+      <div style="color:#94a3b8;font-size:0.75rem;margin-top:4px;">TOTAL open → curr</div>
+      <div style="color:#e2e8f0;font-weight:600;">{ot_s} → {ct_s} <span style="color:#94a3b8;">({tm_s})</span></div>
+    </div>
   </div>
 </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            st.caption(last_update_caption("odds", "schedule", label="Last update (Today's Card)"))
+        st.markdown("---")
 
+    # ---- Rest of homepage (no hero) ----
+    st.markdown(
+        """
 <div class="tm-section-title">What you can do</div>
 <div class="tm-grid">
   <div class="tm-card"><div class="icon">🎯</div><h4>Game Signals</h4><p>Ranked ATS & total leans with confidence grades, edge %, and the NFL Big Board.</p></div>
@@ -4864,6 +5016,9 @@ with tab9:
     st.markdown("---")
     if adv == "Player Props":
         st.markdown("##### Player Props")
+        if require_pro("require_pro_for_props"):
+            render_upgrade_cta("Player Props is a Pro feature.")
+            st.stop()
 
 
 
@@ -4905,6 +5060,9 @@ with tab9:
 
     elif adv == "Signal History":
         st.markdown("##### Signal History")
+        if require_pro("require_pro_for_history"):
+            render_upgrade_cta("Full Signal History is a Pro feature.")
+            st.stop()
         st.caption(
             "Tracks Game Signals recommendations and grades them when results are in. "
             "Sorted by confidence. Record by grade (e.g. D: 0-1) counts Correct-Incorrect (pushes excluded)."
@@ -5019,6 +5177,10 @@ with tab9:
                 st.rerun()
 
     elif adv == "Bankroll & CLV":
+        if require_pro("require_pro_for_bankroll"):
+            st.markdown("##### Bankroll & CLV")
+            render_upgrade_cta("Bankroll tracking is a Pro feature.")
+            st.stop()
         st.markdown("##### Bankroll & Closing Line Value")
         st.caption(
             "Log units on model leans, grade results, and track CLV (closing line value). "
@@ -5165,6 +5327,10 @@ with tab9:
                     st.error(f"Import failed: {e}")
 
     elif adv == "Backtest":
+        if require_pro("require_pro_for_backtest"):
+            st.markdown("##### Backtest")
+            render_upgrade_cta("Backtests are a Pro feature.")
+            st.stop()
         st.markdown("##### Simple Backtest")
         min_edge = st.slider("Minimum EPA edge", 0.03, 0.20, 0.05, 0.01)
         eval_seasons = st.multiselect("Evaluation seasons", [2021, 2022, 2023, 2024, 2025], default=[2023, 2024, 2025])
