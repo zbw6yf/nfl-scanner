@@ -134,6 +134,36 @@ def inject_theme_css(theme: str) -> None:
     )
 
 
+
+API_KEY_PATH = Path("/home/workdir/artifacts/odds_api_key.txt")
+
+
+def _load_saved_api_key() -> str:
+    try:
+        if "odds_api_key" in st.session_state and st.session_state.get("odds_api_key"):
+            return str(st.session_state.get("odds_api_key") or "")
+        if API_KEY_PATH.exists():
+            key = API_KEY_PATH.read_text(encoding="utf-8").strip()
+            if key:
+                st.session_state["odds_api_key"] = key
+                return key
+    except Exception:
+        pass
+    return ""
+
+
+def _save_api_key(key: str) -> None:
+    key = (key or "").strip()
+    st.session_state["odds_api_key"] = key
+    try:
+        if key:
+            API_KEY_PATH.write_text(key, encoding="utf-8")
+        elif API_KEY_PATH.exists():
+            API_KEY_PATH.unlink()
+    except Exception:
+        pass
+
+
 def stamp_now(key: str) -> None:
     st.session_state[f"updated_{key}"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -365,7 +395,22 @@ if theme_choice != st.session_state.get("ui_theme"):
     inject_theme_css(theme_choice)
     st.rerun()
 
-api_key = st.sidebar.text_input("The Odds API Key", type="password")
+# Persist Odds API key across sessions (local file + session_state)
+_saved_key = _load_saved_api_key()
+api_key = st.sidebar.text_input(
+    "The Odds API Key",
+    value=_saved_key,
+    type="password",
+    help="Saved on this app instance so you do not have to re-enter it each visit.",
+)
+if api_key and api_key != _saved_key:
+    _save_api_key(api_key)
+elif api_key:
+    # Ensure session has it even if unchanged
+    st.session_state["odds_api_key"] = api_key
+if st.sidebar.checkbox("Clear saved API key", value=False, key="clear_api_key_cb"):
+    _save_api_key("")
+    st.sidebar.success("Saved API key cleared. Refresh to apply.")
 n_simulations = st.sidebar.slider("Monte Carlo simulations", 2000, 15000, 8000, 1000)
 form_window = st.sidebar.slider("Recent form window (games)", 4, 8, 6, 1)
 if st.sidebar.button("Clear all caches"):
