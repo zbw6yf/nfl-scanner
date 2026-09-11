@@ -1786,12 +1786,12 @@ def confidence_grade(
         return "F"
 
     # Strength of the lean itself
-    if rec in ("Lean Home ATS", "Lean Away ATS"):
-        side_prob = mc.get("home_cover_prob", 0.5) if rec == "Lean Home ATS" else (1.0 - mc.get("home_cover_prob", 0.5))
-        model_side = ml_home if rec == "Lean Home ATS" else (1.0 - ml_home)
-        side_ev = mc.get("home_ev", 0.0) if rec == "Lean Home ATS" else mc.get("away_ev", 0.0)
+    if rec in ("Home ATS", "Away ATS"):
+        side_prob = mc.get("home_cover_prob", 0.5) if rec == "Home ATS" else (1.0 - mc.get("home_cover_prob", 0.5))
+        model_side = ml_home if rec == "Home ATS" else (1.0 - ml_home)
+        side_ev = mc.get("home_ev", 0.0) if rec == "Home ATS" else mc.get("away_ev", 0.0)
     else:
-        side_prob = mc.get("over_prob", 0.5) if rec == "Lean Over" else mc.get("under_prob", 0.5)
+        side_prob = mc.get("over_prob", 0.5) if rec == "Over" else mc.get("under_prob", 0.5)
         model_side = side_prob
         side_ev = max(0.0, side_prob - 0.5)
 
@@ -2160,25 +2160,25 @@ def _grade_signal_history(schedules: pd.DataFrame) -> pd.DataFrame:
 
         new_result = None
         new_correct = None
-        if rec == "Lean Home ATS" and spread is not None:
+        if rec == "Home ATS" and spread is not None:
             if abs(margin - spread) < 1e-9:
                 new_result, new_correct = "Push", None
             else:
                 ok = margin > spread
                 new_result, new_correct = ("Correct" if ok else "Incorrect"), bool(ok)
-        elif rec == "Lean Away ATS" and spread is not None:
+        elif rec == "Away ATS" and spread is not None:
             if abs(margin - spread) < 1e-9:
                 new_result, new_correct = "Push", None
             else:
                 ok = margin < spread
                 new_result, new_correct = ("Correct" if ok else "Incorrect"), bool(ok)
-        elif rec == "Lean Over" and total_line is not None:
+        elif rec == "Over" and total_line is not None:
             if abs(total_pts - total_line) < 1e-9:
                 new_result, new_correct = "Push", None
             else:
                 ok = total_pts > total_line
                 new_result, new_correct = ("Correct" if ok else "Incorrect"), bool(ok)
-        elif rec == "Lean Under" and total_line is not None:
+        elif rec == "Under" and total_line is not None:
             if abs(total_pts - total_line) < 1e-9:
                 new_result, new_correct = "Push", None
             else:
@@ -3624,13 +3624,13 @@ with tab1:
                                 (ml_home < 0.5 and mc["home_cover_prob"] < 0.48)) else 0.0
                 total_score = rule_score + ml_edge + mc_edge + agree
                 if mc["home_ev"] > 0.03 and ml_home > 0.53:
-                    rec = "Lean Home ATS"
+                    rec = "Home ATS"
                 elif mc["away_ev"] > 0.03 and ml_home < 0.47:
-                    rec = "Lean Away ATS"
+                    rec = "Away ATS"
                 elif mc["over_prob"] > 0.56:
-                    rec = "Lean Over"
+                    rec = "Over"
                 elif mc["under_prob"] > 0.56:
-                    rec = "Lean Under"
+                    rec = "Under"
                 else:
                     rec = "No strong lean"
 
@@ -3640,13 +3640,13 @@ with tab1:
                 mkt_home = market_home_win_prob(odds_ev, home_full, away_full, avg_spread)
                 edge_home = compute_edge(model_home, mkt_home)
                 # Side edge aligned to recommendation
-                if rec == "Lean Away ATS":
+                if rec == "Away ATS":
                     model_side = 1.0 - model_home
                     mkt_side = (1.0 - mkt_home) if mkt_home is not None else None
                     edge_pct = compute_edge(model_side, mkt_side)
-                elif rec in ("Lean Over", "Lean Under"):
+                elif rec in ("Over", "Under"):
                     # totals edge vs 50/50 market baseline adjusted by under bias already in MC
-                    if rec == "Lean Over":
+                    if rec == "Over":
                         edge_pct = (mc["over_prob"] - 0.5) * 100.0
                     else:
                         edge_pct = (mc["under_prob"] - 0.5) * 100.0
@@ -3737,10 +3737,10 @@ with tab1:
                 )
             with f2:
                 rec_options = {
-                    "Home ATS": "Lean Home ATS",
-                    "Away ATS": "Lean Away ATS",
-                    "Over": "Lean Over",
-                    "Under": "Lean Under",
+                    "Home ATS": "Home ATS",
+                    "Away ATS": "Away ATS",
+                    "Over": "Over",
+                    "Under": "Under",
                     "No strong lean": "No strong lean",
                 }
                 selected_recs = st.multiselect(
@@ -3833,6 +3833,23 @@ with tab1:
             display_df = filtered.drop(columns=[c for c in drop_cols if c in filtered.columns], errors="ignore")
             if "key" in display_df.columns:
                 display_df = display_df.drop(columns=["key"])
+            # Strip "Lean " from recommendation labels if any remain
+            if "Recommendation" in display_df.columns:
+                display_df["Recommendation"] = (
+                    display_df["Recommendation"].astype(str)
+                    .str.replace(r"^Lean\s+", "", regex=True)
+                )
+            # Recommendation & Confidence as 4th and 5th columns
+            preferred = [
+                "Week", "Game", "Kickoff", "Recommendation", "Confidence",
+                "Score", "Edge %", "Spread", "Total", "Home Imp", "Away Imp",
+                "EPA Edge", "Form Δ", "Pace", "TZ Diff", "Div",
+                "Model %", "Market %", "ML Home %", "MC Home %", "MC Over %",
+                "Roof", "Weather", "Signals",
+            ]
+            ordered = [c for c in preferred if c in display_df.columns]
+            ordered += [c for c in display_df.columns if c not in ordered]
+            display_df = display_df[ordered]
             st.markdown("##### The NFL Big Board")
             st.caption("Values lock at kickoff — lines, scores, and signals stop updating once a game starts.")
             st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -4579,10 +4596,10 @@ with tab8:
         """
 Leans are assigned in this order (first match wins):
 
-1. **Lean Home ATS** — Monte Carlo home EV > 0.03 **and** logistic model P(home covers) > 0.53
-2. **Lean Away ATS** — away EV > 0.03 **and** model P(home covers) < 0.47
-3. **Lean Over** — simulated over probability > 0.56
-4. **Lean Under** — simulated under probability > 0.56
+1. **Home ATS** — Monte Carlo home EV > 0.03 **and** logistic model P(home covers) > 0.53
+2. **Away ATS** — away EV > 0.03 **and** model P(home covers) < 0.47
+3. **Over** — simulated over probability > 0.56
+4. **Under** — simulated under probability > 0.56
 5. **No strong lean** — none of the above
 
 ATS leans require **both** positive simulated EV at −110 **and** model confidence past those thresholds. Totals only require the Monte Carlo probability gate.
@@ -4698,7 +4715,7 @@ with tab9:
             # Only truly graded rows (Correct/Incorrect). Pending/Push/N/A excluded.
             graded = hist[hist["result"].isin(["Correct", "Incorrect"])].copy()
             conf_order = ["A", "B", "C", "D", "F"]
-            rec_order = ["Lean Home ATS", "Lean Away ATS", "Lean Over", "Lean Under"]
+            rec_order = ["Home ATS", "Away ATS", "Over", "Under"]
             summary_rows = []
             detail_rows = []
             if not graded.empty:
