@@ -1235,93 +1235,109 @@ def resolve_open_lines(
     cur_total,
 ) -> Dict[str, Optional[float]]:
     """
-    Prefer true market open from Odds API historical snapshot (~5 days before kickoff).
-    Fall back to first-seen tracking in this app.
+    Open = earliest available market line (historical Odds API preferred, else first stored).
+    Current = latest live line only (never copied onto open once open is set).
     """
     line_key = f"{away}_{home}_{str(gameday)[:10]}"
-    open_s = open_t = None
-    source = "tracked"
+    opens = _load_line_opens()
+    entry = dict(opens.get(line_key) or {})
+    source = entry.get("source") or "none"
 
-    # Try historical snapshots: 5d, 4d, 3d before game (when NFL sides often open)
-    if api_key and gameday:
+    # Parse live current
+    try:
+        cur_s = float(cur_spread) if cur_spread is not None and str(cur_spread) not in ("", "None", "nan", "—") else None
+    except Exception:
+        cur_s = None
+    try:
+        cur_t = float(cur_total) if cur_total is not None and str(cur_total) not in ("", "None", "nan", "—") else None
+    except Exception:
+        cur_t = None
+
+    # Existing stored open (immutable once real numbers exist)
+    try:
+        open_s = float(entry["open_spread"]) if entry.get("open_spread") is not None and str(entry.get("open_spread")) not in ("", "nan", "None") else None
+    except Exception:
+        open_s = None
+    try:
+        open_t = float(entry["open_total"]) if entry.get("open_total") is not None and str(entry.get("open_total")) not in ("", "nan", "None") else None
+    except Exception:
+        open_t = None
+
+    # Historical open lookup only when we don't already have a stored open
+    if api_key and gameday and (open_s is None or open_t is None):
         try:
             gd = pd.to_datetime(str(gameday)[:10], errors="coerce")
             if pd.notna(gd):
-                for days_back in (5, 4, 3, 6, 2, 7):
-                    snap = gd - pd.Timedelta(days=days_back)
-                    iso = snap.strftime("%Y-%m-%dT17:00:00Z")
-                    hist = fetch_historical_nfl_odds(api_key, iso)
-                    if not hist:
-                        continue
-                    ev = find_odds_event(hist, home, away)
-                    if not ev:
-                        continue
-                    s, t = _extract_odds_lines(ev, home)
-                    if s is not None or t is not None:
-                        open_s, open_t = s, t
-                        source = f"historical_{days_back}d"
+                # NFL sides often open ~6–7 days out; try earliest first
+                for days_back in (7, 6, 5, 8, 4, 9, 3, 2):
+                    for hour in ("12:00:00", "17:00:00", "21:00:00"):
+                        snap = gd - pd.Timedelta(days=days_back)
+                        iso = snap.strftime(f"%Y-%m-%dT{hour}Z")
+                        hist = fetch_historical_nfl_odds(api_key, iso)
+                        if not hist:
+                            continue
+                        ev = find_odds_event(hist, home, away)
+                        if not ev:
+                            continue
+                        s, t = _extract_odds_lines(ev, home)
+                        if open_s is None and s is not None:
+                            open_s = float(s)
+                        if open_t is None and t is not None:
+                            open_t = float(t)
+                        if open_s is not None or open_t is not None:
+                            source = f"historical_{days_back}d"
+                            break
+                    if source.startswith("historical"):
                         break
         except Exception:
             pass
 
-    # Seed / merge with tracked opens
-    tracked = track_open_lines(line_key, cur_spread if cur_spread is not None else open_s, cur_total if cur_total is not None else open_t)
-    if open_s is None:
-        open_s = tracked.get("open_spread")
-    if open_t is None:
-        open_t = tracked.get("open_total")
-
-    # If we found historical open, persist it as the official open for this key
-    if source.startswith("historical"):
-        opens = _load_line_opens()
-        opens[line_key] = {
-            "open_spread": open_s,
-            "open_total": open_t,
-            "first_seen": opens.get(line_key, {}).get("first_seen") or datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "source": source,
-        }
-        _save_line_opens(opens)
-
-    cur_s = cur_spread if cur_spread is not None else tracked.get("cur_spread")
-    cur_t = cur_total if cur_total is not None else tracked.get("cur_total")
-    # Recover last known current from tracker
-    if cur_s is None:
-        try:
-            cur_s = float(tracked.get("last_spread")) if tracked.get("last_spread") is not None else None
-        except Exception:
-            cur_s = None
-    if cur_t is None:
-        try:
-            cur_t = float(tracked.get("last_total")) if tracked.get("last_total") is not None else None
-        except Exception:
-            cur_t = None
-    # If we still have no open but have a current line, that current IS the open (first listing)
+    # First-seen live line becomes open ONLY if we still have no open
     if open_s is None and cur_s is not None:
         open_s = cur_s
-        source = source if source.startswith("historical") else "first_seen_as_open"
+        source = "first_live_as_open"
     if open_t is None and cur_t is not None:
         open_t = cur_t
-        source = source if source.startswith("historical") else "first_seen_as_open"
-    # Persist non-null opens
-    if open_s is not None or open_t is not None:
-        opens = _load_line_opens()
-        prev = opens.get(line_key) or {}
-        opens[line_key] = {
-            "open_spread": open_s if open_s is not None else prev.get("open_spread"),
-            "open_total": open_t if open_t is not None else prev.get("open_total"),
-            "last_spread": cur_s if cur_s is not None else prev.get("last_spread"),
-            "last_total": cur_t if cur_t is not None else prev.get("last_total"),
-            "first_seen": prev.get("first_seen") or datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "source": source,
-        }
-        _save_line_opens(opens)
-    # After kickoff, live may vanish — keep last current / open
+        if source == "none":
+            source = "first_live_as_open"
+
+    # Update last-known current; never overwrite a stored open with a newer current
+    if cur_s is not None:
+        entry["last_spread"] = cur_s
+    if cur_t is not None:
+        entry["last_total"] = cur_t
+    if open_s is not None:
+        entry["open_spread"] = open_s  # keep first real open (already set)
+    if open_t is not None:
+        entry["open_total"] = open_t
+    # Protect: if entry already had open, don't replace with different current-driven value
+    # (open_s/open_t already preferred stored values above)
+
+    entry["source"] = source
+    entry["first_seen"] = entry.get("first_seen") or datetime.now().strftime("%Y-%m-%d %H:%M")
+    entry["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    opens[line_key] = entry
+    _save_line_opens(opens)
+
+    # Current display: live first, else last known (not open, unless that's all we have)
+    if cur_s is None and entry.get("last_spread") is not None:
+        try:
+            cur_s = float(entry["last_spread"])
+        except Exception:
+            pass
+    if cur_t is None and entry.get("last_total") is not None:
+        try:
+            cur_t = float(entry["last_total"])
+        except Exception:
+            pass
     if cur_s is None:
         cur_s = open_s
     if cur_t is None:
         cur_t = open_t
-    spread_move = (float(cur_s) - float(open_s)) if (cur_s is not None and open_s is not None) else None
-    total_move = (float(cur_t) - float(open_t)) if (cur_t is not None and open_t is not None) else None
+
+    spread_move = round(float(cur_s) - float(open_s), 1) if (cur_s is not None and open_s is not None) else None
+    total_move = round(float(cur_t) - float(open_t), 1) if (cur_t is not None and open_t is not None) else None
+
     return {
         "open_spread": open_s,
         "open_total": open_t,
@@ -1331,6 +1347,54 @@ def resolve_open_lines(
         "total_move": total_move,
         "source": source,
     }
+
+
+@st.cache_data(ttl=3 * 3600, show_spinner=False)
+def bulk_opening_lines(api_key: str, game_keys: tuple) -> Dict[str, Dict]:
+    """
+    game_keys: tuple of (home, away, gameday) strings.
+    Returns map key -> {open_spread, open_total, source} from historical API.
+    Uses the earliest successful snapshot per matchup.
+    """
+    out: Dict[str, Dict] = {}
+    if not api_key or not game_keys:
+        return out
+    # Group by gameday to limit API calls
+    by_day: Dict[str, list] = {}
+    for home, away, gd in game_keys:
+        by_day.setdefault(str(gd)[:10], []).append((home, away))
+    for gd, matchups in by_day.items():
+        try:
+            day = pd.to_datetime(gd, errors="coerce")
+            if pd.isna(day):
+                continue
+            found = set()
+            for days_back in (7, 6, 5, 8, 4, 3):
+                iso = (day - pd.Timedelta(days=days_back)).strftime("%Y-%m-%dT17:00:00Z")
+                hist = fetch_historical_nfl_odds(api_key, iso)
+                if not hist:
+                    continue
+                for home, away in matchups:
+                    key = f"{away}_{home}_{gd}"
+                    if key in found:
+                        continue
+                    ev = find_odds_event(hist, home, away)
+                    if not ev:
+                        continue
+                    s, t = _extract_odds_lines(ev, home)
+                    if s is None and t is None:
+                        continue
+                    out[key] = {
+                        "open_spread": float(s) if s is not None else None,
+                        "open_total": float(t) if t is not None else None,
+                        "source": f"historical_{days_back}d",
+                    }
+                    found.add(key)
+                if len(found) >= len(matchups):
+                    break
+        except Exception:
+            continue
+    return out
 
 
 def fetch_player_props(api_key: str, event_id: str) -> Optional[Dict]:
@@ -3736,7 +3800,7 @@ with tab2:
     st.subheader("Upcoming Games (full schedule)")
     st.caption(
         "Official slate with open / current lines. "
-        "Open = historical market snapshot when available (else first tracked line). "
+        "Open = earliest historical line (Odds API) when available; otherwise first live line seen. "
         "Curr = live Odds API. Move = Curr − Open."
     )
 
@@ -3756,19 +3820,30 @@ with tab2:
         except Exception:
             local_odds = None
 
-    # Optional: one historical snapshot (~5 days ago) for opens
-    hist_snapshot = None
+    # Bulk historical opens for every game we will show (true early lines)
+    upcoming_keys = []
+    _today = pd.Timestamp.now().normalize()
+    for _row in EMBEDDED_2026_SCHEDULE:
+        try:
+            _gd = pd.to_datetime(_row.get("gameday"), errors="coerce")
+            if pd.isna(_gd) or _gd < _today - pd.Timedelta(days=3):
+                continue
+            upcoming_keys.append((str(_row["home"]).upper(), str(_row["away"]).upper(), str(_row["gameday"])[:10]))
+        except Exception:
+            continue
+    bulk_opens = {}
     try:
-        if api_key:
-            snap_day = (pd.Timestamp.now().normalize() - pd.Timedelta(days=5)).strftime("%Y-%m-%dT17:00:00Z")
-            hist_snapshot = fetch_historical_nfl_odds(api_key, snap_day)
+        if api_key and upcoming_keys:
+            bulk_opens = bulk_opening_lines(api_key, tuple(upcoming_keys))
     except Exception:
-        hist_snapshot = None
+        bulk_opens = {}
 
     def _lines_for_game(home: str, away: str, gameday: str):
-        """Return open/curr spread & total for a matchup."""
-        cur_s = cur_t = open_s = open_t = None
-        # Current from live odds
+        """Open = earliest market line; Curr = latest live line."""
+        cur_s = cur_t = None
+        open_s = open_t = None
+        source = "none"
+        # Live current
         try:
             if local_odds:
                 ev = find_odds_event(local_odds, home, away)
@@ -3776,38 +3851,35 @@ with tab2:
                     cur_s, cur_t = _extract_odds_lines(ev, home)
         except Exception:
             pass
-        # Open from historical snapshot
-        try:
-            if hist_snapshot:
-                evh = find_odds_event(hist_snapshot, home, away)
-                if evh:
-                    open_s, open_t = _extract_odds_lines(evh, home)
-        except Exception:
-            pass
-        # Schedule lines fallback for current
-        try:
-            if (cur_s is None or cur_t is None) and schedules is not None and not getattr(schedules, "empty", True):
-                sm = schedules.copy()
-                if "home_team" in sm.columns:
-                    sm = sm[
-                        (sm["home_team"].astype(str).str.upper() == str(home).upper())
-                        & (sm["away_team"].astype(str).str.upper() == str(away).upper())
-                    ]
-                    if "gameday" in sm.columns and gameday:
-                        sm2 = sm[sm["gameday"].astype(str).str[:10] == str(gameday)[:10]]
-                        if not sm2.empty:
-                            sm = sm2
-                    if not sm.empty:
-                        r0 = sm.iloc[0]
-                        if cur_s is None and pd.notna(r0.get("spread_line")):
-                            cur_s = float(r0["spread_line"])
-                        if cur_t is None and pd.notna(r0.get("total_line")):
-                            cur_t = float(r0["total_line"])
-        except Exception:
-            pass
-        # Tracked open / merge
+        # Bulk historical open
+        bkey = f"{away}_{home}_{str(gameday)[:10]}"
+        if bkey in bulk_opens:
+            bo = bulk_opens[bkey]
+            open_s = bo.get("open_spread")
+            open_t = bo.get("open_total")
+            source = bo.get("source") or "historical"
+            # Persist so Big Board / later loads keep true open
+            try:
+                opens = _load_line_opens()
+                prev = dict(opens.get(bkey) or {})
+                if open_s is not None:
+                    prev["open_spread"] = open_s
+                if open_t is not None:
+                    prev["open_total"] = open_t
+                if cur_s is not None:
+                    prev["last_spread"] = cur_s
+                if cur_t is not None:
+                    prev["last_total"] = cur_t
+                prev["source"] = source
+                prev["first_seen"] = prev.get("first_seen") or datetime.now().strftime("%Y-%m-%d %H:%M")
+                opens[bkey] = prev
+                _save_line_opens(opens)
+            except Exception:
+                pass
+        # Resolve merges stored open + live current (does not overwrite open with current)
         try:
             info = resolve_open_lines(api_key or "", home, away, gameday, cur_s, cur_t)
+            # Prefer bulk historical open when present
             if open_s is None:
                 open_s = info.get("open_spread")
             if open_t is None:
@@ -3816,9 +3888,10 @@ with tab2:
                 cur_s = info.get("cur_spread")
             if cur_t is None:
                 cur_t = info.get("cur_total")
+            source = info.get("source") or source
         except Exception:
             try:
-                info = track_open_lines(f"{away}_{home}_{str(gameday)[:10]}", cur_s, cur_t)
+                info = track_open_lines(bkey, cur_s, cur_t)
                 if open_s is None:
                     open_s = info.get("open_spread")
                 if open_t is None:
@@ -3829,16 +3902,21 @@ with tab2:
                     cur_t = info.get("cur_total")
             except Exception:
                 pass
+        # Do NOT force open = current when both exist and differ.
+        # Only if open still missing, fall back to current (documented as first_live).
         if open_s is None and cur_s is not None:
             open_s = cur_s
+            source = "first_live_as_open"
         if open_t is None and cur_t is not None:
             open_t = cur_t
+            if source == "none":
+                source = "first_live_as_open"
         if cur_s is None and open_s is not None:
             cur_s = open_s
         if cur_t is None and open_t is not None:
             cur_t = open_t
-        s_move = (float(cur_s) - float(open_s)) if (cur_s is not None and open_s is not None) else None
-        t_move = (float(cur_t) - float(open_t)) if (cur_t is not None and open_t is not None) else None
+        s_move = round(float(cur_s) - float(open_s), 1) if (cur_s is not None and open_s is not None) else None
+        t_move = round(float(cur_t) - float(open_t), 1) if (cur_t is not None and open_t is not None) else None
         return open_s, open_t, cur_s, cur_t, s_move, t_move
 
     today = pd.Timestamp.now().normalize()
