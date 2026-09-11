@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import re
+import base64
 import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,9 +20,18 @@ from sklearn.pipeline import Pipeline
 # -----------------------------
 # PAGE CONFIG
 # -----------------------------
+_page_icon = "🏈"
+for _p in [
+    Path(__file__).resolve().parent / "tailme_logo.png",
+    Path("/home/workdir/artifacts/tailme_logo.png"),
+    Path("tailme_logo.png"),
+]:
+    if _p.exists():
+        _page_icon = str(_p)
+        break
 st.set_page_config(
-    page_title="TAIL ME",
-    page_icon="🏈",
+    page_title="TAIL ME Sports",
+    page_icon=_page_icon,
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -133,6 +143,28 @@ def inject_theme_css(theme: str) -> None:
         unsafe_allow_html=True,
     )
 
+
+
+
+LOGO_CANDIDATES = [
+    Path(__file__).resolve().parent / "tailme_logo.png",
+    Path("/home/workdir/artifacts/tailme_logo.png"),
+    Path("tailme_logo.png"),
+    Path("assets/tailme_logo.png"),
+]
+
+
+def get_logo_data_uri() -> Optional[str]:
+    """Load company logo as a data URI for the header."""
+    try:
+        for p in LOGO_CANDIDATES:
+            if p.exists() and p.is_file():
+                raw = p.read_bytes()
+                b64 = base64.b64encode(raw).decode("ascii")
+                return f"data:image/png;base64,{b64}"
+    except Exception:
+        pass
+    return None
 
 
 API_KEY_PATH = Path("/home/workdir/artifacts/odds_api_key.txt")
@@ -292,56 +324,79 @@ def conf_pill(grade: str) -> str:
 
 inject_theme_css(st.session_state.get("ui_theme", "Dark"))
 
+# Site header with company logo
+_logo_uri = get_logo_data_uri()
+_logo_img = (
+    f'<img src="{_logo_uri}" alt="TAIL ME Sports" class="tailme-logo"/>'
+    if _logo_uri
+    else '<div class="tailme-title">T<span class="ai">AI</span>L ME <span class="tailme-sports">SPORTS</span></div>'
+)
 st.markdown(
-    """
+    f"""
 <style>
-  .tailme-hero {
+  .tailme-hero {{
     position: relative;
     border-radius: 16px;
     overflow: hidden;
     margin-bottom: 1rem;
-    min-height: 168px;
-    border: 1px solid rgba(255,255,255,0.1);
-    box-shadow: 0 8px 28px rgba(0,0,0,0.25);
-  }
-  .tailme-hero__bg {
-    position: absolute; inset: 0;
-    background:
-      linear-gradient(105deg, rgba(7,12,24,0.92) 0%, rgba(15,23,42,0.72) 45%, rgba(30,58,138,0.55) 100%),
-      url('https://images.unsplash.com/photo-1566577739112-ce14f5c8536a?auto=format&fit=crop&w=1600&q=80') center/cover no-repeat;
-  }
-  .tailme-hero__content {
+    min-height: 120px;
+    border: 1px solid rgba(56, 189, 248, 0.2);
+    box-shadow: 0 8px 28px rgba(0,0,0,0.35);
+    background: #000;
+  }}
+  .tailme-hero__content {{
     position: relative; z-index: 1;
-    padding: 1.4rem 1.6rem 1.3rem 1.6rem;
+    padding: 0.85rem 1.25rem 1rem 1.25rem;
     color: #f8fafc;
-  }
-  .tailme-title {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+  }}
+  .tailme-logo {{
+    width: min(420px, 92vw);
+    height: auto;
+    display: block;
+    margin: 0 auto 0.35rem auto;
+    object-fit: contain;
+  }}
+  .tailme-title {{
     margin: 0.25rem 0 0.2rem 0;
-    font-size: 2.55rem;
+    font-size: 2.2rem;
     font-weight: 800;
     letter-spacing: 0.08em;
     line-height: 1.05;
-  }
-  .tailme-title .ai {
+    color: #fff;
+  }}
+  .tailme-title .ai {{
     color: #38bdf8;
-    text-shadow: 0 0 18px rgba(56,189,248,0.55), 0 0 4px rgba(56,189,248,0.8);
-    padding: 0 0.02em;
-  }
-  .tailme-sub {
-    margin: 0.35rem 0 0 0;
-    color: #cbd5e1;
-    font-size: 0.98rem;
-    max-width: 42rem;
-  }
+    text-shadow: 0 0 18px rgba(56,189,248,0.55);
+  }}
+  .tailme-sports {{
+    color: #b8f722;
+    display: block;
+    font-size: 1.6rem;
+    letter-spacing: 0.12em;
+  }}
+  .tailme-sub {{
+    margin: 0.25rem 0 0 0;
+    color: #94a3b8;
+    font-size: 0.9rem;
+    max-width: 40rem;
+  }}
+  .tailme-hero .nsc-badge {{
+    margin-bottom: 0.35rem;
+  }}
 </style>
 <div class="tailme-hero">
-  <div class="tailme-hero__bg"></div>
   <div class="tailme-hero__content">
-    <span class="nsc-badge">Research tool</span>
-    <span class="nsc-badge">EPA · ML · Monte Carlo</span>
-    <span class="nsc-badge">Sports betting analytics</span>
-    <h1 class="tailme-title">T<span class="ai">AI</span>L ME</h1>
-    <p class="tailme-sub">AI-powered NFL lean board — schedule, weather, injuries, depth charts, and model signals. Not betting advice.</p>
+    {_logo_img}
+    <div>
+      <span class="nsc-badge">Research tool</span>
+      <span class="nsc-badge">EPA · ML · Monte Carlo</span>
+      <span class="nsc-badge">AI-powered NFL betting</span>
+    </div>
+    <p class="tailme-sub">Schedule, weather, injuries, depth charts, and model signals — not betting advice.</p>
   </div>
 </div>
     """,
