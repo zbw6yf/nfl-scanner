@@ -575,35 +575,34 @@ def _save_line_opens(opens: Dict[str, Dict]) -> None:
         pass
 
 
-def track_open_lines(games_key: str, spread, total) -> Dict[str, Optional[float]]:
+def track_open_lines(game_key: str, spread, total) -> Dict[str, Optional[float]]:
     """
-    First observed spread/total becomes the 'open' line for this app.
-    Returns open_spread, open_total, cur_spread, cur_total, spread_move, total_move.
+    First *real* observed spread/total becomes the open line.
+    Never stores null opens (avoids permanent blank Open columns).
     """
     opens = _load_line_opens()
-    cur_s = float(spread) if spread is not None and str(spread) not in ("", "None", "nan") else None
-    cur_t = float(total) if total is not None and str(total) not in ("", "None", "nan") else None
-    if game_key not in opens:
-        opens[game_key] = {
-            "open_spread": cur_s,
-            "open_total": cur_t,
-            "first_seen": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        }
+    cur_s = float(spread) if spread is not None and str(spread) not in ("", "None", "nan", "—") else None
+    cur_t = float(total) if total is not None and str(total) not in ("", "None", "nan", "—") else None
+    entry = dict(opens.get(game_key) or {})
+    if cur_s is not None or cur_t is not None:
+        if not entry:
+            entry = {
+                "open_spread": cur_s,
+                "open_total": cur_t,
+                "first_seen": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "source": "first_seen",
+            }
+        else:
+            if entry.get("open_spread") is None and cur_s is not None:
+                entry["open_spread"] = cur_s
+            if entry.get("open_total") is None and cur_t is not None:
+                entry["open_total"] = cur_t
+        if cur_s is not None:
+            entry["last_spread"] = cur_s
+        if cur_t is not None:
+            entry["last_total"] = cur_t
+        opens[game_key] = entry
         _save_line_opens(opens)
-    else:
-        # Fill missing opens if we only just got a line
-        entry = opens[game_key]
-        updated = False
-        if entry.get("open_spread") is None and cur_s is not None:
-            entry["open_spread"] = cur_s
-            updated = True
-        if entry.get("open_total") is None and cur_t is not None:
-            entry["open_total"] = cur_t
-            updated = True
-        if updated:
-            opens[game_key] = entry
-            _save_line_opens(opens)
-    entry = opens.get(game_key) or {}
     try:
         open_s = float(entry["open_spread"]) if entry.get("open_spread") is not None and str(entry.get("open_spread")) not in ("", "nan", "None") else None
     except Exception:
@@ -612,6 +611,26 @@ def track_open_lines(games_key: str, spread, total) -> Dict[str, Optional[float]
         open_t = float(entry["open_total"]) if entry.get("open_total") is not None and str(entry.get("open_total")) not in ("", "nan", "None") else None
     except Exception:
         open_t = None
+    if open_s is None and cur_s is not None:
+        open_s = cur_s
+        entry["open_spread"] = cur_s
+        opens[game_key] = entry
+        _save_line_opens(opens)
+    if open_t is None and cur_t is not None:
+        open_t = cur_t
+        entry["open_total"] = cur_t
+        opens[game_key] = entry
+        _save_line_opens(opens)
+    if cur_s is None and entry.get("last_spread") is not None:
+        try:
+            cur_s = float(entry["last_spread"])
+        except Exception:
+            pass
+    if cur_t is None and entry.get("last_total") is not None:
+        try:
+            cur_t = float(entry["last_total"])
+        except Exception:
+            pass
     spread_move = (cur_s - open_s) if (cur_s is not None and open_s is not None) else None
     total_move = (cur_t - open_t) if (cur_t is not None and open_t is not None) else None
     return {
@@ -621,6 +640,8 @@ def track_open_lines(games_key: str, spread, total) -> Dict[str, Optional[float]
         "cur_total": cur_t,
         "spread_move": spread_move,
         "total_move": total_move,
+        "last_spread": entry.get("last_spread"),
+        "last_total": entry.get("last_total"),
     }
 
 
@@ -736,47 +757,102 @@ def clear_board_lock_for_game(away: str, home: str, gameday: str = "") -> int:
     return len(remove)
 
 
+def _row_has_spread(row: Dict) -> bool:
+    sp = row.get("Spread")
+    if sp is None:
+        return False
+    s = str(sp).strip()
+    return s not in ("", "—", "None", "nan", "-")
+
+
+def _enrich_row_from_line_opens(row: Dict) -> Dict:
+    """Fill blank Spread/Total from tracked open/last lines."""
+    try:
+        away = str(row.get("_away") or "")
+        home = str(row.get("_home") or "")
+        gd = str(row.get("_gameday") or row.get("Kickoff") or "")[:10]
+        key = f"{away}_{home}_{gd}"
+        opens = _load_line_opens()
+        entry = opens.get(key) or {}
+        # try alternate key patterns
+        if not entry:
+            for k, v in opens.items():
+                if away.upper() in k.upper() and home.upper() in k.upper() and (not gd or gd in k):
+                    entry = v
+                    break
+        sp = entry.get("last_spread")
+        if sp is None:
+            sp = entry.get("open_spread")
+        tot = entry.get("last_total")
+        if tot is None:
+            tot = entry.get("open_total")
+        out = dict(row)
+        if not _row_has_spread(out) and sp is not None:
+            try:
+                out["Spread"] = f"{float(sp):+.1f}"
+                out["_spread"] = float(sp)
+            except Exception:
+                pass
+        if (out.get("Total") in (None, "—", "", "nan") or str(out.get("Total")) == "nan") and tot is not None:
+            try:
+                out["Total"] = f"{float(tot):.1f}"
+                out["_total"] = float(tot)
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return row
+
+
 def freeze_or_update_board_row(row: Dict, started: bool) -> Dict:
     """
-    Before kickoff: keep refreshing the live row and store as lock snapshot.
+    Before kickoff: keep refreshing the live row and store as lock snapshot
+    (only when Spread is present).
     After kickoff: return the frozen pre-kickoff snapshot (never overwrite once locked).
     """
-    gd = row.get("_gameday") or str(row.get("Kickoff") or "")[:10]
+    gd = str(row.get("_gameday") or row.get("Kickoff") or "")[:10]
     key = board_lock_key(row.get("Week"), row.get("_away"), row.get("_home"), gd)
     locks = _load_board_locks()
     existing = locks.get(key)
+    row = _enrich_row_from_line_opens(row)
 
     if started:
-        # Prefer an existing pre-kickoff snapshot — never replace with live post-start data
         if existing and existing.get("_locked"):
-            frozen = dict(existing)
+            frozen = _enrich_row_from_line_opens(dict(existing))
             frozen.setdefault("Game", row.get("Game"))
+            # Preserve recommendation/confidence from lock
             return frozen
         if existing and not existing.get("_locked"):
-            # Promote last pre-game snapshot to locked
-            snap = dict(existing)
+            snap = _enrich_row_from_line_opens(dict(existing))
             snap["key"] = key
             snap["_locked"] = True
             locks[key] = snap
             _save_board_locks(locks)
             return snap
-        # No snapshot at all — lock current once (best effort)
-        snap = dict(row)
+        # No prior snapshot — lock current if it has a spread; else enrich first
+        snap = _enrich_row_from_line_opens(dict(row))
         snap["key"] = key
         snap["_locked"] = True
         locks[key] = snap
         _save_board_locks(locks)
         return snap
 
-    # Pre-game only: refresh snapshot while unlocked
+    # Pre-game: refresh unlocked snapshot only when we have a real spread
     if existing and existing.get("_locked"):
-        return dict(existing)
+        return _enrich_row_from_line_opens(dict(existing))
     snap = dict(row)
     snap["key"] = key
     snap["_locked"] = False
-    locks[key] = snap
-    _save_board_locks(locks)
-    return row
+    if _row_has_spread(snap) or not existing:
+        locks[key] = snap
+        _save_board_locks(locks)
+    elif existing and _row_has_spread(existing) and not _row_has_spread(snap):
+        # keep better existing pre-game snapshot
+        return dict(existing)
+    else:
+        locks[key] = snap
+        _save_board_locks(locks)
+    return snap
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -1208,6 +1284,37 @@ def resolve_open_lines(
 
     cur_s = cur_spread if cur_spread is not None else tracked.get("cur_spread")
     cur_t = cur_total if cur_total is not None else tracked.get("cur_total")
+    # Recover last known current from tracker
+    if cur_s is None:
+        try:
+            cur_s = float(tracked.get("last_spread")) if tracked.get("last_spread") is not None else None
+        except Exception:
+            cur_s = None
+    if cur_t is None:
+        try:
+            cur_t = float(tracked.get("last_total")) if tracked.get("last_total") is not None else None
+        except Exception:
+            cur_t = None
+    # If we still have no open but have a current line, that current IS the open (first listing)
+    if open_s is None and cur_s is not None:
+        open_s = cur_s
+        source = source if source.startswith("historical") else "first_seen_as_open"
+    if open_t is None and cur_t is not None:
+        open_t = cur_t
+        source = source if source.startswith("historical") else "first_seen_as_open"
+    # Persist non-null opens
+    if open_s is not None or open_t is not None:
+        opens = _load_line_opens()
+        prev = opens.get(line_key) or {}
+        opens[line_key] = {
+            "open_spread": open_s if open_s is not None else prev.get("open_spread"),
+            "open_total": open_t if open_t is not None else prev.get("open_total"),
+            "last_spread": cur_s if cur_s is not None else prev.get("last_spread"),
+            "last_total": cur_t if cur_t is not None else prev.get("last_total"),
+            "first_seen": prev.get("first_seen") or datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "source": source,
+        }
+        _save_line_opens(opens)
     # After kickoff, live may vanish — keep last current / open
     if cur_s is None:
         cur_s = open_s
@@ -3115,6 +3222,41 @@ with tab1:
                 wx_adj = weather_adjustments(roof, weather)
                 avg_spread = g.get("avg_spread")
                 avg_total = g.get("avg_total") if g.get("avg_total") is not None else 45.0
+                commence_raw = g.get("commence_raw") or ""
+                commence = g.get("kickoff") or ""
+                game_date = g.get("gameday") or (commence[:10] if commence else datetime.now().strftime("%Y-%m-%d"))
+
+                # If game already started and we have a locked pre-kickoff board row, use it and skip live recalc
+                _started_early = game_has_started(
+                    kickoff=str(commence or ""),
+                    gameday=str(game_date or ""),
+                    gametime=str(g.get("gametime") or ""),
+                    commence_raw=str(commence_raw or ""),
+                )
+                if _started_early:
+                    _lk = board_lock_key(g.get("week"), away, home, game_date)
+                    _locks = _load_board_locks()
+                    if _lk in _locks and (
+                        _locks[_lk].get("_locked")
+                        or _row_has_spread(_locks[_lk])
+                    ):
+                        frozen = _enrich_row_from_line_opens(dict(_locks[_lk]))
+                        frozen["_locked"] = True
+                        opportunities.append(frozen)
+                        continue
+                    # Recover lines from tracker so spread doesn't go blank mid-calc
+                    try:
+                        info = resolve_open_lines(api_key or "", home, away, game_date, avg_spread, avg_total)
+                        if avg_spread is None and info.get("cur_spread") is not None:
+                            avg_spread = info.get("cur_spread")
+                        if avg_spread is None and info.get("open_spread") is not None:
+                            avg_spread = info.get("open_spread")
+                        if (avg_total is None or avg_total == 45.0) and info.get("cur_total") is not None:
+                            avg_total = info.get("cur_total")
+                        if (avg_total is None or avg_total == 45.0) and info.get("open_total") is not None:
+                            avg_total = info.get("open_total")
+                    except Exception:
+                        pass
 
                 # Use team EPA when available; otherwise neutral league averages (never drop the game)
                 # League means for shrinkage (early season)
@@ -3687,6 +3829,10 @@ with tab2:
                     cur_t = info.get("cur_total")
             except Exception:
                 pass
+        if open_s is None and cur_s is not None:
+            open_s = cur_s
+        if open_t is None and cur_t is not None:
+            open_t = cur_t
         if cur_s is None and open_s is not None:
             cur_s = open_s
         if cur_t is None and open_t is not None:
