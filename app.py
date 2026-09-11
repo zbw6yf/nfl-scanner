@@ -3481,9 +3481,150 @@ def monte_carlo_game(
 # -----------------------------
 # TABS
 # -----------------------------
+
+@st.cache_data(ttl=30 * 60, show_spinner=False)
+def build_play_of_the_day(week: int, api_key: str = "") -> Optional[Dict]:
+    """
+    Single best current-week lean by confidence then Score.
+    Uses the same core signals as The Big Board (EPA, form, MC, lines).
+    """
+    try:
+        week = int(week)
+        team_epa = get_team_epa()
+        recent_form = get_recent_form(n_games=6)
+        schedules = load_schedules()
+        odds_data = None
+        if api_key:
+            try:
+                odds_data, _ = fetch_nfl_odds(api_key)
+            except Exception:
+                odds_data = None
+        try:
+            an_lines = fetch_action_network_lines()
+        except Exception:
+            an_lines = {}
+        games = [r for r in EMBEDDED_2026_SCHEDULE if int(r.get("week") or 0) == week]
+        if not games:
+            return None
+        candidates = []
+        for row in games:
+            home = str(row.get("home") or "").upper()
+            away = str(row.get("away") or "").upper()
+            gameday = row.get("gameday")
+            gametime = row.get("gametime") or "13:00"
+            kickoff = format_schedule_kickoff(gameday, gametime)
+            # lines
+            avg_spread = avg_total = None
+            an = an_lines.get(f"{away}_{home}") or {}
+            if an.get("cur_spread") is not None:
+                avg_spread = an.get("cur_spread")
+            if an.get("cur_total") is not None:
+                avg_total = an.get("cur_total")
+            if odds_data:
+                ev = find_odds_event(odds_data, home, away)
+                if ev:
+                    s, t = _extract_odds_lines(ev, home)
+                    if avg_spread is None:
+                        avg_spread = s
+                    if avg_total is None:
+                        avg_total = t
+            if avg_total is None:
+                avg_total = 45.0
+            # EPA
+            if not team_epa.empty and home in team_epa.index and away in team_epa.index:
+                home_off = float(team_epa.loc[home, "off_epa"])
+                home_def = float(team_epa.loc[home, "def_epa"])
+                away_off = float(team_epa.loc[away, "off_epa"])
+                away_def = float(team_epa.loc[away, "def_epa"])
+            else:
+                home_off = home_def = away_off = away_def = 0.0
+            epa_edge = (home_off - away_def) - (away_off - home_def)
+            home_form = recent_form.get(home, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
+            away_form = recent_form.get(away, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
+            form_margin_diff = float(home_form.get("form_margin") or 0) - float(away_form.get("form_margin") or 0)
+            form_margin_diff = shrink_to_mean(form_margin_diff, min(float(home_form.get("n") or 0), float(away_form.get("n") or 0)), 0.0, prior_n=6.0)
+            rest_diff = 0.0
+            try:
+                rest_diff = float(rest_differential(schedules, home, away, str(gameday)[:10], week=week) or 0)
+            except Exception:
+                rest_diff = 0.0
+            rule_score = 0.0
+            signals = []
+            if epa_edge > 0.08:
+                signals.append(f"Home EPA +{epa_edge:.3f}"); rule_score += 2.2
+            elif epa_edge < -0.08:
+                signals.append(f"Away EPA {epa_edge:.3f}"); rule_score += 2.0
+            if form_margin_diff >= 7:
+                signals.append(f"Home form +{form_margin_diff:.1f}"); rule_score += 1.6
+            elif form_margin_diff <= -7:
+                signals.append(f"Away form {form_margin_diff:.1f}"); rule_score += 1.5
+            if rest_diff >= 3:
+                signals.append(f"Home rest +{rest_diff}d"); rule_score += 1.1
+            elif rest_diff <= -3:
+                signals.append(f"Away rest {rest_diff}d"); rule_score += 1.0
+            form_margin_adj = form_margin_diff * 0.15
+            mc = monte_carlo_game(
+                home_off, home_def, away_off, away_def,
+                avg_spread if avg_spread is not None else 0.0,
+                avg_total, n_sims=2500,
+                total_adj=0.0, noise_extra=0.0, under_bias=0.0,
+                pace_adj=0.0, form_margin_adj=form_margin_adj,
+            )
+            # lean rules (aligned with main board)
+            rec = "No strong lean"
+            if mc.get("home_ev", 0) > 0.03 and mc.get("home_cover_prob", 0.5) > 0.53:
+                rec = "Home ATS"
+            elif mc.get("away_ev", 0) > 0.03 and mc.get("home_cover_prob", 0.5) < 0.47:
+                rec = "Away ATS"
+            elif mc.get("over_prob", 0.5) > 0.56:
+                rec = "Over"
+            elif mc.get("under_prob", 0.5) > 0.56:
+                rec = "Under"
+            ml_home = 0.5 + max(-0.15, min(0.15, epa_edge))
+            edge_pct = (mc.get("home_cover_prob", 0.5) - 0.5) * 100.0
+            if rec == "Away ATS":
+                edge_pct = -edge_pct
+            elif rec == "Over":
+                edge_pct = (mc.get("over_prob", 0.5) - 0.5) * 100.0
+            elif rec == "Under":
+                edge_pct = (mc.get("under_prob", 0.5) - 0.5) * 100.0
+            agree = 0.0
+            if rec == "Home ATS" and epa_edge > 0:
+                agree = 1.0
+            elif rec == "Away ATS" and epa_edge < 0:
+                agree = 1.0
+            total_score = rule_score + agree
+            conf = confidence_grade(rec, total_score, ml_home, mc, edge_pct, len(signals), agree)
+            candidates.append({
+                "Week": week,
+                "Game": f"{full_name(away)} @ {full_name(home)}",
+                "Kickoff": kickoff,
+                "Recommendation": rec,
+                "Confidence": conf,
+                "Score": round(total_score, 2),
+                "Spread": f"{avg_spread:+.1f}" if avg_spread is not None else "—",
+                "Total": f"{avg_total:.1f}" if avg_total is not None else "—",
+                "Open Spread": f"{an.get('open_spread'):+.1f}" if an.get("open_spread") is not None else "—",
+                "Curr Spread": f"{an.get('cur_spread'):+.1f}" if an.get("cur_spread") is not None else "—",
+                "Open Total": f"{an.get('open_total'):.1f}" if an.get("open_total") is not None else "—",
+                "Curr Total": f"{an.get('cur_total'):.1f}" if an.get("cur_total") is not None else "—",
+                "Signals": " • ".join(signals) if signals else "—",
+                "_home": home,
+                "_away": away,
+            })
+        if not candidates:
+            return None
+        conf_rank = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
+        candidates.sort(key=lambda x: (conf_rank.get(str(x.get("Confidence")), 9), -float(x.get("Score") or 0)))
+        return candidates[0]
+    except Exception:
+        return None
+
+
+
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "🏠 Homepage",
-    "🎯 Game Signals",
+    "🏈 The Big Board",
     "📅 Games & Odds",
     "🌤️ Weather",
     "🏥 Injury Report",
@@ -3568,82 +3709,57 @@ with tab1:
         unsafe_allow_html=True,
     )
 
-    # ---- Today's Card ----
+    # ---- Play Of The Day ----
     if feature_enabled("today_card"):
         cur_wk = current_nfl_week() or 1
+        with st.spinner("Selecting Play Of The Day..."):
+            potd = build_play_of_the_day(int(cur_wk), api_key or "")
         st.markdown(
             f"""
 <div class="tm-today-header">
-  <h3>Today's Card · Week {int(cur_wk)}</h3>
-  <p>This week's slate at a glance — lines, moves, and kickoffs. Open <b>Game Signals</b> for full model leans.</p>
+  <h3>Play Of The Day · Week {int(cur_wk)}</h3>
+  <p>Highest confidence, then highest model Score on this week's slate.</p>
 </div>
             """,
             unsafe_allow_html=True,
         )
-        an_home = {}
-        try:
-            an_home = fetch_action_network_lines()
-        except Exception:
-            an_home = {}
-        week_games = [r for r in EMBEDDED_2026_SCHEDULE if int(r.get("week") or 0) == int(cur_wk)]
-        # Prefer games today / next 3 days first
-        today = pd.Timestamp.now().normalize()
-        def _sort_key(r):
-            gd = pd.to_datetime(r.get("gameday"), errors="coerce")
-            return gd if pd.notna(gd) else pd.Timestamp.max
-        week_games = sorted(week_games, key=_sort_key)
-        # show up to 8 games for the week
-        show_games = week_games[:8] if week_games else []
-        if not show_games:
-            st.info("No games found for the current week in the embedded schedule.")
+        if not potd:
+            st.info("Could not determine Play Of The Day yet. Try again after lines load, or open **The Big Board**.")
         else:
-            for r in show_games:
-                home = str(r.get("home") or "").upper()
-                away = str(r.get("away") or "").upper()
-                gameday = r.get("gameday")
-                gametime = r.get("gametime") or "13:00"
-                kickoff = format_schedule_kickoff(gameday, gametime)
-                an = an_home.get(f"{away}_{home}") or {}
-                os_ = an.get("open_spread")
-                cs = an.get("cur_spread")
-                ot = an.get("open_total")
-                ct = an.get("cur_total")
-                sm = (float(cs) - float(os_)) if (cs is not None and os_ is not None) else None
-                tm = (float(ct) - float(ot)) if (ct is not None and ot is not None) else None
-                os_s = f"{os_:+.1f}" if os_ is not None else "—"
-                cs_s = f"{cs:+.1f}" if cs is not None else "—"
-                ot_s = f"{ot:.1f}" if ot is not None else "—"
-                ct_s = f"{ct:.1f}" if ct is not None else "—"
-                sm_s = f"{sm:+.1f}" if sm is not None else "—"
-                tm_s = f"{tm:+.1f}" if tm is not None else "—"
-                move_color = "#94a3b8"
-                try:
-                    if sm is not None and abs(sm) >= 1.5:
-                        move_color = "#fbbf24"
-                    elif sm is not None and abs(sm) >= 0.5:
-                        move_color = "#38bdf8"
-                except Exception:
-                    pass
-                st.markdown(
-                    f"""
-<div class="tm-ticket">
-  <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+            conf = potd.get("Confidence", "—")
+            rec = potd.get("Recommendation", "—")
+            game = potd.get("Game", "—")
+            kick = potd.get("Kickoff", "—")
+            score = potd.get("Score", "—")
+            spread = potd.get("Spread", "—")
+            total = potd.get("Total", "—")
+            signals = potd.get("Signals", "—")
+            conf_color = {"A": "#4ade80", "B": "#38bdf8", "C": "#fbbf24", "D": "#fb923c", "F": "#f87171"}.get(str(conf), "#94a3b8")
+            st.markdown(
+                f"""
+<div class="tm-ticket" style="border-color:{conf_color};box-shadow:0 0 0 1px {conf_color}33;">
+  <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:flex-start;">
     <div>
-      <div style="color:#f8fafc;font-weight:700;">{full_name(away)} <span style="color:#64748b;">@</span> {full_name(home)}</div>
-      <div style="color:#94a3b8;font-size:0.82rem;">Kickoff {kickoff}</div>
+      <div style="color:{conf_color};font-weight:800;font-size:0.85rem;letter-spacing:0.06em;">{conf} · {rec}</div>
+      <div style="color:#f8fafc;font-weight:700;font-size:1.15rem;margin-top:4px;">{game}</div>
+      <div style="color:#94a3b8;font-size:0.85rem;margin-top:2px;">Kickoff {kick}</div>
+      <div style="color:#cbd5e1;font-size:0.85rem;margin-top:8px;">{signals}</div>
     </div>
     <div style="text-align:right;">
-      <div style="color:#94a3b8;font-size:0.75rem;">SPREAD open → curr</div>
-      <div style="color:#e2e8f0;font-weight:600;">{os_s} → {cs_s} <span style="color:{move_color};">({sm_s})</span></div>
-      <div style="color:#94a3b8;font-size:0.75rem;margin-top:4px;">TOTAL open → curr</div>
-      <div style="color:#e2e8f0;font-weight:600;">{ot_s} → {ct_s} <span style="color:#94a3b8;">({tm_s})</span></div>
+      <div style="color:#94a3b8;font-size:0.75rem;">SCORE</div>
+      <div style="color:#f8fafc;font-weight:800;font-size:1.4rem;">{score}</div>
+      <div style="color:#94a3b8;font-size:0.75rem;margin-top:8px;">SPREAD · TOTAL</div>
+      <div style="color:#e2e8f0;font-weight:600;">{spread} · {total}</div>
+      <div style="color:#94a3b8;font-size:0.75rem;margin-top:8px;">OPEN → CURR</div>
+      <div style="color:#e2e8f0;font-size:0.9rem;">{potd.get("Open Spread","—")} → {potd.get("Curr Spread","—")}</div>
+      <div style="color:#e2e8f0;font-size:0.9rem;">{potd.get("Open Total","—")} → {potd.get("Curr Total","—")}</div>
     </div>
   </div>
 </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            st.caption(last_update_caption("odds", "schedule", label="Last update (Today's Card)"))
+                """,
+                unsafe_allow_html=True,
+            )
+            st.caption(last_update_caption("odds", "schedule", label="Last update (Play Of The Day)"))
         st.markdown("---")
 
     # ---- Rest of homepage (no hero) ----
@@ -3651,7 +3767,7 @@ with tab1:
         """
 <div class="tm-section-title">What you can do</div>
 <div class="tm-grid">
-  <div class="tm-card"><div class="icon">🎯</div><h4>Game Signals</h4><p>Ranked ATS & total leans with confidence grades, edge %, and the NFL Big Board.</p></div>
+  <div class="tm-card"><div class="icon">🎯</div><h4>The Big Board</h4><p>Ranked ATS & total leans with confidence grades, edge %, and the NFL Big Board.</p></div>
   <div class="tm-card"><div class="icon">📈</div><h4>Games & Odds</h4><p>Full slate tickets with open → current spreads/totals and line movement.</p></div>
   <div class="tm-card"><div class="icon">🌤️</div><h4>Weather</h4><p>Stadium forecasts near kickoff that feed total and under-bias adjustments.</p></div>
   <div class="tm-card"><div class="icon">🏥</div><h4>Injuries & Depth</h4><p>Filterable injury report and depth charts so context sits next to the lean.</p></div>
@@ -3672,7 +3788,7 @@ with tab1:
 <div class="tm-section-title">Quick start</div>
 <div class="tm-steps">
   <div class="tm-step"><div class="n">1</div><div>Save your Odds API key in the sidebar</div></div>
-  <div class="tm-step"><div class="n">2</div><div>Open Game Signals for leans & Big Board</div></div>
+  <div class="tm-step"><div class="n">2</div><div>Open The Big Board for full leans</div></div>
   <div class="tm-step"><div class="n">3</div><div>Check Games & Odds for line moves</div></div>
   <div class="tm-step"><div class="n">4</div><div>Sanity-check weather / injuries / depth</div></div>
   <div class="tm-step"><div class="n">5</div><div>Review Advanced → Signal History</div></div>
@@ -3683,9 +3799,9 @@ with tab1:
         unsafe_allow_html=True,
     )
 
-# ========== TAB 2: Game Signals ==========
+# ========== TAB 2: The Big Board ==========
 with tab2:
-    st.subheader("Game Signals")
+    st.subheader("The Big Board")
     with st.spinner("Loading EPA, Pace, Form, Schedule, Odds and unique weather..."):
         team_epa = get_team_epa()
         team_pace = get_team_pace()
@@ -4154,30 +4270,6 @@ with tab2:
                 + week_note
             )
 
-            # ---- Top opportunity cards ----
-            st.markdown("##### Strongest Signals")
-            card_n = min(5, len(filtered))
-            if card_n:
-                for i in range(card_n):
-                    row = filtered.iloc[i]
-                    conf = str(row.get("Confidence", "—"))
-                    rec = str(row.get("Recommendation", "—"))
-                    game = str(row.get("Game", "—"))
-                    kick = str(row.get("Kickoff", "—"))
-                    score = row.get("Score", "—")
-                    edge = row.get("Edge %", "—")
-                    spread = row.get("Spread", "—")
-                    total = row.get("Total", "—")
-                    signals = str(row.get("Signals", "—"))
-                    with st.expander(f"{conf} · {rec} · {game}", expanded=(i == 0)):
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("Score", score)
-                        c2.metric("Edge %", edge)
-                        c3.metric("Spread", spread)
-                        c4.metric("Total", total)
-                        st.caption(f"Kickoff: {kick}")
-                        st.write(signals)
-
             helper_cols = [c for c in filtered.columns if c.startswith("_")]
             drop_cols = ["_Week_num", "key"] + helper_cols
             display_df = filtered.drop(columns=[c for c in drop_cols if c in filtered.columns], errors="ignore")
@@ -4299,7 +4391,7 @@ with tab3:
         local_odds_status = f"Odds fetch error: {e}"
     if not local_odds:
         try:
-            local_odds = odds_data  # from Game Signals load if present
+            local_odds = odds_data  # from The Big Board load if present
         except Exception:
             local_odds = None
 
@@ -4693,7 +4785,7 @@ with tab4:
             pass
         st.caption(last_update_caption("weather", "schedule", label="Last update (Weather)"))
     else:
-        st.info("No upcoming games / weather available yet. Load Game Signals first so weather is fetched.")
+        st.info("No upcoming games / weather available yet. Load The Big Board first so weather is fetched.")
         st.caption(last_update_caption("weather", "schedule", label="Last update (Weather)"))
 
 
@@ -5077,7 +5169,7 @@ with tab9:
 
         if hist is None or hist.empty:
             st.info(
-                "No signals logged yet. Open **Game Signals** so recommendations are saved, "
+                "No signals logged yet. Open **The Big Board** so recommendations are saved, "
                 "then return here after games complete to see graded results."
             )
         else:
@@ -5234,7 +5326,7 @@ with tab9:
         st.markdown("---")
         st.markdown("##### Open & settled bets")
         if bet_df is None or bet_df.empty:
-            st.info("No bets logged yet. Add one above, or use Edge % from Game Signals to size spots.")
+            st.info("No bets logged yet. Add one above, or use Edge % from The Big Board to size spots.")
         else:
             st.dataframe(bet_df.drop(columns=["id"], errors="ignore"), use_container_width=True, hide_index=True)
 
