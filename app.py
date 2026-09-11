@@ -1273,55 +1273,116 @@ def _upsert_signals_from_opportunities(opps: list) -> None:
 
 
 def _grade_signal_history(schedules: pd.DataFrame) -> pd.DataFrame:
-    """Grade pending signals against completed schedule results."""
+    """
+    Grade pending signals only when the matching game is fully completed:
+    - gameday strictly before today (ET calendar)
+    - home_score and away_score both present
+    - result (margin) present
+    Matchup must align with the signal's scheduled week/date when available.
+    """
     hist = _load_signal_history()
     if hist.empty or schedules is None or getattr(schedules, "empty", True):
         return hist
+
+    # Reset rows graded too early (kickoff/gameday still in the future)
+    today = pd.Timestamp.now().normalize()
+    reset = False
+    for idx, row in hist.iterrows():
+        if str(row.get("result") or "") in ("Pending", "N/A", "nan", "None", ""):
+            continue
+        kick = str(row.get("kickoff") or "")[:10]
+        if kick and len(kick) >= 10:
+            try:
+                kd = pd.to_datetime(kick[:10], errors="coerce")
+                if pd.notna(kd) and kd.normalize() >= today:
+                    hist.at[idx, "result"] = "Pending"
+                    hist.at[idx, "correct"] = None
+                    hist.at[idx, "graded_at"] = None
+                    reset = True
+            except Exception:
+                pass
+    if reset:
+        _save_signal_history(hist)
+
     s = schedules.copy()
-    if "gameday" not in s.columns:
+    # Normalize
+    for col in ("home_team", "away_team"):
+        if col in s.columns:
+            s[col] = s[col].astype(str).str.upper().str.strip()
+    if "gameday" in s.columns:
+        s["_gd"] = pd.to_datetime(s["gameday"], errors="coerce")
+    else:
         return hist
-    s["_gd"] = pd.to_datetime(s["gameday"], errors="coerce")
+
+    today = pd.Timestamp.now().normalize()
+
+    # Completed games only: past date + real scores
+    completed = s[s["_gd"].notna() & (s["_gd"] < today)].copy()
+    if "home_score" in completed.columns and "away_score" in completed.columns:
+        completed = completed[
+            completed["home_score"].notna()
+            & completed["away_score"].notna()
+        ]
+    elif "result" in completed.columns:
+        completed = completed[completed["result"].notna()]
+    else:
+        return hist
+
+    if completed.empty:
+        return hist
+
     changed = False
     for idx, row in hist.iterrows():
-        if str(row.get("result") or "") not in ("Pending", "nan", "None", ""):
-            if row.get("result") not in (None, "Pending"):
-                continue
+        status = str(row.get("result") or "Pending")
+        if status not in ("Pending", "nan", "None", ""):
+            continue
+
         home = row.get("home")
         away = row.get("away")
-        if not home or not away or home is None or away is None or str(home) == "nan":
-            # try parse from game string "Away @ Home"
-            game = str(row.get("game") or "")
-            if " @ " in game:
-                # full names - skip team match via schedule names
-                pass
+        if home is None or away is None or str(home) in ("", "nan", "None") or str(away) in ("", "nan", "None"):
             continue
-        try:
-            home = str(home).upper()
-            away = str(away).upper()
-        except Exception:
-            continue
+        home = str(home).upper().strip()
+        away = str(away).upper().strip()
+
         mask = (
-            (s.get("home_team", pd.Series(dtype=str)).astype(str).str.upper() == home)
-            & (s.get("away_team", pd.Series(dtype=str)).astype(str).str.upper() == away)
+            (completed["home_team"] == home)
+            & (completed["away_team"] == away)
         )
-        if "result" in s.columns:
-            mask = mask & s["result"].notna()
-        matches = s.loc[mask]
+        # Prefer same week when available
+        week = row.get("week")
+        try:
+            week_i = int(week) if week is not None and str(week) not in ("", "—", "nan", "None") else None
+        except Exception:
+            week_i = None
+        matches = completed.loc[mask]
+        if week_i is not None and "week" in matches.columns and not matches.empty:
+            same_week = matches[pd.to_numeric(matches["week"], errors="coerce") == week_i]
+            if not same_week.empty:
+                matches = same_week
+        # Also try matching by kickoff/gameday if present
+        kick = str(row.get("kickoff") or "")[:10]
+        if kick and re.match(r"\d{4}-\d{2}-\d{2}", kick) and not matches.empty:
+            by_day = matches[matches["_gd"].astype(str).str[:10] == kick]
+            if not by_day.empty:
+                matches = by_day
+
         if matches.empty:
             continue
-        m = matches.sort_values("_gd").iloc[-1]
-        try:
-            margin = float(m["result"])  # home - away score differential
-        except Exception:
+
+        mrow = matches.sort_values("_gd").iloc[-1]
+        # Final safety: game date must be before today
+        gd = mrow.get("_gd")
+        if pd.isna(gd) or gd >= today:
             continue
-        if pd.isna(margin):
-            continue
-        home_score = m.get("home_score")
-        away_score = m.get("away_score")
         try:
-            total_pts = float(home_score) + float(away_score) if pd.notna(home_score) and pd.notna(away_score) else None
+            hs = float(mrow["home_score"]) if "home_score" in mrow.index and pd.notna(mrow["home_score"]) else None
+            aws = float(mrow["away_score"]) if "away_score" in mrow.index and pd.notna(mrow["away_score"]) else None
         except Exception:
-            total_pts = None
+            hs = aws = None
+        if hs is None or aws is None:
+            continue
+        margin = hs - aws
+        total_pts = hs + aws
 
         rec = str(row.get("recommendation") or "")
         spread = row.get("spread")
@@ -1329,61 +1390,162 @@ def _grade_signal_history(schedules: pd.DataFrame) -> pd.DataFrame:
         try:
             if spread is not None and str(spread) not in ("—", "nan", "None", ""):
                 spread = float(str(spread).replace("+", ""))
+            elif pd.notna(mrow.get("spread_line")):
+                spread = float(mrow["spread_line"])
             else:
-                spread = float(m["spread_line"]) if pd.notna(m.get("spread_line")) else None
+                spread = None
         except Exception:
             spread = None
         try:
             if total_line is not None and str(total_line) not in ("—", "nan", "None", ""):
                 total_line = float(str(total_line).replace("+", ""))
+            elif pd.notna(mrow.get("total_line")):
+                total_line = float(mrow["total_line"])
             else:
-                total_line = float(m["total_line"]) if pd.notna(m.get("total_line")) else None
+                total_line = None
         except Exception:
             total_line = None
 
-        outcome = None  # True=correct, False=incorrect, None=push/unknown
         if rec == "Lean Home ATS" and spread is not None:
-            # home covers if margin > spread (spread is home line, e.g. -3)
-            if margin == spread:
-                outcome = None  # push
+            if abs(margin - spread) < 1e-9:
                 hist.at[idx, "result"] = "Push"
+                hist.at[idx, "correct"] = None
             else:
-                outcome = margin > spread
-                hist.at[idx, "result"] = "Correct" if outcome else "Incorrect"
+                ok = margin > spread
+                hist.at[idx, "result"] = "Correct" if ok else "Incorrect"
+                hist.at[idx, "correct"] = bool(ok)
         elif rec == "Lean Away ATS" and spread is not None:
-            if margin == spread:
-                outcome = None
+            if abs(margin - spread) < 1e-9:
                 hist.at[idx, "result"] = "Push"
+                hist.at[idx, "correct"] = None
             else:
-                outcome = margin < spread
-                hist.at[idx, "result"] = "Correct" if outcome else "Incorrect"
-        elif rec == "Lean Over" and total_line is not None and total_pts is not None:
-            if total_pts == total_line:
+                ok = margin < spread
+                hist.at[idx, "result"] = "Correct" if ok else "Incorrect"
+                hist.at[idx, "correct"] = bool(ok)
+        elif rec == "Lean Over" and total_line is not None:
+            if abs(total_pts - total_line) < 1e-9:
                 hist.at[idx, "result"] = "Push"
-                outcome = None
+                hist.at[idx, "correct"] = None
             else:
-                outcome = total_pts > total_line
-                hist.at[idx, "result"] = "Correct" if outcome else "Incorrect"
-        elif rec == "Lean Under" and total_line is not None and total_pts is not None:
-            if total_pts == total_line:
+                ok = total_pts > total_line
+                hist.at[idx, "result"] = "Correct" if ok else "Incorrect"
+                hist.at[idx, "correct"] = bool(ok)
+        elif rec == "Lean Under" and total_line is not None:
+            if abs(total_pts - total_line) < 1e-9:
                 hist.at[idx, "result"] = "Push"
-                outcome = None
+                hist.at[idx, "correct"] = None
             else:
-                outcome = total_pts < total_line
-                hist.at[idx, "result"] = "Correct" if outcome else "Incorrect"
+                ok = total_pts < total_line
+                hist.at[idx, "result"] = "Correct" if ok else "Incorrect"
+                hist.at[idx, "correct"] = bool(ok)
         elif rec == "No strong lean":
             hist.at[idx, "result"] = "N/A"
-            outcome = None
+            hist.at[idx, "correct"] = None
         else:
             continue
 
-        hist.at[idx, "correct"] = outcome if outcome is not None else None
         hist.at[idx, "graded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         changed = True
 
     if changed:
         _save_signal_history(hist)
     return hist
+
+
+def build_team_history(seasons: Optional[List[int]] = None) -> pd.DataFrame:
+    """
+    Per-team ATS and Over/Under results for the last ~5 seasons.
+    One row per team-game with columns used for filtering/aggregation.
+    """
+    try:
+        try:
+            current = int(nfl.get_current_season())
+        except Exception:
+            current = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
+        cal_year = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
+        current = max(current, cal_year)
+        if seasons is None:
+            seasons = list(range(current - 4, current + 1))
+        sched = load_schedules(seasons=seasons)
+        if sched is None or sched.empty:
+            return pd.DataFrame()
+        s = sched.copy()
+        need = {"home_team", "away_team", "home_score", "away_score"}
+        if not need.issubset(set(s.columns)):
+            return pd.DataFrame()
+        s = s[s["home_score"].notna() & s["away_score"].notna()].copy()
+        if "game_type" in s.columns:
+            s = s[s["game_type"].astype(str).str.upper().isin(["REG", "REGULAR"])]
+        if s.empty:
+            return pd.DataFrame()
+
+        rows = []
+        for _, g in s.iterrows():
+            try:
+                hs = float(g["home_score"])
+                aws = float(g["away_score"])
+            except Exception:
+                continue
+            margin = hs - aws
+            total_pts = hs + aws
+            spread = g.get("spread_line")
+            total_line = g.get("total_line")
+            try:
+                spread = float(spread) if pd.notna(spread) else None
+            except Exception:
+                spread = None
+            try:
+                total_line = float(total_line) if pd.notna(total_line) else None
+            except Exception:
+                total_line = None
+            season = int(g["season"]) if pd.notna(g.get("season")) else None
+            week = g.get("week")
+            gameday = str(g.get("gameday", ""))[:10]
+            home = str(g["home_team"]).upper()
+            away = str(g["away_team"]).upper()
+
+            # Home perspective
+            if spread is not None:
+                if abs(margin - spread) < 1e-9:
+                    home_ats = "Push"
+                else:
+                    home_ats = "Cover" if margin > spread else "Not Cover"
+            else:
+                home_ats = None
+            if total_line is not None:
+                if abs(total_pts - total_line) < 1e-9:
+                    ou = "Push"
+                else:
+                    ou = "Over" if total_pts > total_line else "Under"
+            else:
+                ou = None
+
+            rows.append({
+                "season": season, "week": week, "gameday": gameday,
+                "team": home, "opponent": away, "home_away": "Home",
+                "spread": spread, "margin": margin, "ats": home_ats,
+                "total_line": total_line, "total_pts": total_pts, "ou": ou,
+            })
+            # Away perspective (away spread is -home spread)
+            if spread is not None:
+                away_spread = -spread
+                away_margin = -margin
+                if abs(away_margin - away_spread) < 1e-9:
+                    away_ats = "Push"
+                else:
+                    away_ats = "Cover" if away_margin > away_spread else "Not Cover"
+            else:
+                away_ats = None
+            rows.append({
+                "season": season, "week": week, "gameday": gameday,
+                "team": away, "opponent": home, "home_away": "Away",
+                "spread": -spread if spread is not None else None,
+                "margin": -margin, "ats": away_ats,
+                "total_line": total_line, "total_pts": total_pts, "ou": ou,
+            })
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame()
 
 
 
@@ -2338,13 +2500,14 @@ def monte_carlo_game(
 # -----------------------------
 # TABS
 # -----------------------------
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "🎯 Game Signals",
     "📅 Games & Odds",
     "🎯 Player Props",
     "🌤️ Weather",
     "🏥 Injury Report",
     "📋 Depth Charts",
+    "📊 Team History",
     "📘 Methodology",
     "⚙️ Advanced",
 ])
@@ -3141,7 +3304,101 @@ with tab6:
             st.caption(f"{len(show)} entries · source: Ourlads")
 
 
+
 with tab7:
+    st.subheader("Team History")
+    st.caption(
+        "ATS (against the spread) and Over/Under records by team — last 5 seasons of completed games. "
+        "Filter by team and year."
+    )
+    with st.spinner("Loading team history (5 seasons)..."):
+        th = build_team_history()
+    if th is None or th.empty:
+        st.warning("Could not load historical schedule results. Try Clear all caches.")
+    else:
+        teams = sorted(th["team"].dropna().unique().tolist())
+        years = sorted([int(y) for y in th["season"].dropna().unique().tolist()], reverse=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            team_sel = st.selectbox(
+                "Team",
+                options=["All teams"] + [f"{full_name(t)} ({t})" for t in teams],
+                key="th_team",
+            )
+        with c2:
+            year_sel = st.selectbox(
+                "Year",
+                options=["All years"] + [str(y) for y in years],
+                key="th_year",
+            )
+        view = th.copy()
+        if team_sel != "All teams":
+            abbr = team_sel.split("(")[-1].replace(")", "").strip()
+            view = view[view["team"] == abbr]
+        if year_sel != "All years":
+            view = view[view["season"] == int(year_sel)]
+
+        # Summary metrics
+        ats = view[view["ats"].isin(["Cover", "Not Cover"])]
+        covers = int((ats["ats"] == "Cover").sum())
+        ncovers = int((ats["ats"] == "Not Cover").sum())
+        ats_n = covers + ncovers
+        ou = view[view["ou"].isin(["Over", "Under"])]
+        # For team filter, each game appears once for that team so OU is fine;
+        # for All teams each game appears twice — dedupe for OU summary
+        if team_sel == "All teams":
+            ou_dedupe = view.drop_duplicates(subset=["season", "gameday", "team", "opponent"])
+            # still double - use home only
+            ou_dedupe = view[view["home_away"] == "Home"]
+            ou = ou_dedupe[ou_dedupe["ou"].isin(["Over", "Under"])]
+        overs = int((ou["ou"] == "Over").sum())
+        unders = int((ou["ou"] == "Under").sum())
+        ou_n = overs + unders
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("ATS", f"{covers}-{ncovers}", delta=f"{covers/ats_n:.0%} cover" if ats_n else None)
+        m2.metric("ATS games", ats_n)
+        m3.metric("O/U", f"{overs}-{unders}", delta=f"{overs/ou_n:.0%} over" if ou_n else None)
+        m4.metric("O/U games", ou_n)
+
+        # By season breakdown when all years
+        if year_sel == "All years" and not view.empty:
+            st.markdown("##### By season")
+            season_rows = []
+            for season, grp in view.groupby("season"):
+                a = grp[grp["ats"].isin(["Cover", "Not Cover"])]
+                c = int((a["ats"] == "Cover").sum())
+                nc = int((a["ats"] == "Not Cover").sum())
+                ogrp = grp if team_sel != "All teams" else grp[grp["home_away"] == "Home"]
+                o = ogrp[ogrp["ou"].isin(["Over", "Under"])]
+                ov = int((o["ou"] == "Over").sum())
+                un = int((o["ou"] == "Under").sum())
+                season_rows.append({
+                    "Season": int(season),
+                    "ATS": f"{c}-{nc}",
+                    "ATS Cover %": f"{c/(c+nc):.0%}" if (c+nc) else "—",
+                    "O/U": f"{ov}-{un}",
+                    "Over %": f"{ov/(ov+un):.0%}" if (ov+un) else "—",
+                })
+            st.dataframe(pd.DataFrame(season_rows).sort_values("Season", ascending=False), use_container_width=True, hide_index=True)
+
+        st.markdown("##### Game log")
+        log = view.copy()
+        log["Team"] = log["team"].map(lambda a: full_name(a) if a else a)
+        log["Opponent"] = log["opponent"].map(lambda a: full_name(a) if a else a)
+        show = log[[
+            "season", "week", "gameday", "Team", "home_away", "Opponent",
+            "spread", "margin", "ats", "total_line", "total_pts", "ou"
+        ]].rename(columns={
+            "season": "Season", "week": "Week", "gameday": "Date",
+            "home_away": "H/A", "spread": "Spread", "margin": "Margin",
+            "ats": "ATS", "total_line": "Total Line", "total_pts": "Points", "ou": "O/U",
+        }).sort_values(["Season", "Date"], ascending=[False, False])
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.caption(f"{len(show)} team-games · spreads/totals from historical schedule lines when available")
+
+
+with tab8:
     st.subheader("Methodology")
     st.caption("How Score, Confidence, and Lean recommendations are produced. Research tool only — not betting advice.")
 
@@ -3236,7 +3493,7 @@ Over/under probabilities are taken from simulated totals vs the market line (wit
         """
     )
 
-with tab8:
+with tab9:
     st.subheader("Advanced")
     st.caption("Less frequently used tools — props, bankroll tracking, and historical backtests.")
     adv = st.radio(
