@@ -1274,117 +1274,123 @@ def _upsert_signals_from_opportunities(opps: list) -> None:
 
 def _grade_signal_history(schedules: pd.DataFrame) -> pd.DataFrame:
     """
-    Grade pending signals only when the matching game is fully completed:
-    - gameday strictly before today (ET calendar)
-    - home_score and away_score both present
-    - result (margin) present
-    Matchup must align with the signal's scheduled week/date when available.
+    Grade signals ONLY for fully completed games.
+
+    A game is completed when:
+      - kickoff/gameday calendar date is strictly before today
+      - home_score and away_score are both present (not null)
+      - schedule row matches the SAME matchup on that date (not a prior-year meeting)
+
+    Any previously graded row that fails these checks is reset to Pending.
     """
     hist = _load_signal_history()
-    if hist.empty or schedules is None or getattr(schedules, "empty", True):
-        return hist
-
-    # Reset rows graded too early (kickoff/gameday still in the future)
-    today = pd.Timestamp.now().normalize()
-    reset = False
-    for idx, row in hist.iterrows():
-        if str(row.get("result") or "") in ("Pending", "N/A", "nan", "None", ""):
-            continue
-        kick = str(row.get("kickoff") or "")[:10]
-        if kick and len(kick) >= 10:
-            try:
-                kd = pd.to_datetime(kick[:10], errors="coerce")
-                if pd.notna(kd) and kd.normalize() >= today:
-                    hist.at[idx, "result"] = "Pending"
-                    hist.at[idx, "correct"] = None
-                    hist.at[idx, "graded_at"] = None
-                    reset = True
-            except Exception:
-                pass
-    if reset:
-        _save_signal_history(hist)
-
-    s = schedules.copy()
-    # Normalize
-    for col in ("home_team", "away_team"):
-        if col in s.columns:
-            s[col] = s[col].astype(str).str.upper().str.strip()
-    if "gameday" in s.columns:
-        s["_gd"] = pd.to_datetime(s["gameday"], errors="coerce")
-    else:
+    if hist.empty:
         return hist
 
     today = pd.Timestamp.now().normalize()
 
-    # Completed games only: past date + real scores
-    completed = s[s["_gd"].notna() & (s["_gd"] < today)].copy()
-    if "home_score" in completed.columns and "away_score" in completed.columns:
-        completed = completed[
-            completed["home_score"].notna()
-            & completed["away_score"].notna()
-        ]
-    elif "result" in completed.columns:
-        completed = completed[completed["result"].notna()]
-    else:
-        return hist
+    def _parse_day(val) -> Optional[pd.Timestamp]:
+        try:
+            ts = pd.to_datetime(str(val)[:10], errors="coerce")
+            if pd.isna(ts):
+                return None
+            return pd.Timestamp(ts).normalize()
+        except Exception:
+            return None
 
-    if completed.empty:
-        return hist
+    # ---- Build completed-game index from schedule ----
+    completed = pd.DataFrame()
+    if schedules is not None and not getattr(schedules, "empty", True):
+        s = schedules.copy()
+        for col in ("home_team", "away_team"):
+            if col in s.columns:
+                s[col] = s[col].astype(str).str.upper().str.strip()
+        if "gameday" in s.columns:
+            s["_gd"] = pd.to_datetime(s["gameday"], errors="coerce")
+            s = s[s["_gd"].notna() & (s["_gd"] < today)]
+            if "home_score" in s.columns and "away_score" in s.columns:
+                s = s[s["home_score"].notna() & s["away_score"].notna()]
+                # Drop bogus 0-0 placeholders on missing finals when possible:
+                # keep rows that have a non-null result OR any points scored OR explicit final
+                if "result" in s.columns:
+                    s = s[s["result"].notna() | ((s["home_score"].astype(float) + s["away_score"].astype(float)) > 0)]
+            completed = s
 
     changed = False
+
     for idx, row in hist.iterrows():
+        kick_day = _parse_day(row.get("kickoff"))
+        home = str(row.get("home") or "").upper().strip()
+        away = str(row.get("away") or "").upper().strip()
+        rec = str(row.get("recommendation") or "")
         status = str(row.get("result") or "Pending")
-        if status not in ("Pending", "nan", "None", ""):
+
+        # Future kickoff → always Pending
+        if kick_day is not None and kick_day >= today:
+            if status != "Pending":
+                hist.at[idx, "result"] = "Pending"
+                hist.at[idx, "correct"] = None
+                hist.at[idx, "graded_at"] = None
+                changed = True
             continue
 
-        home = row.get("home")
-        away = row.get("away")
-        if home is None or away is None or str(home) in ("", "nan", "None") or str(away) in ("", "nan", "None"):
+        # No strong lean never grades as win/loss
+        if rec == "No strong lean":
+            if status != "N/A":
+                hist.at[idx, "result"] = "N/A"
+                hist.at[idx, "correct"] = None
+                hist.at[idx, "graded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                changed = True
             continue
-        home = str(home).upper().strip()
-        away = str(away).upper().strip()
 
+        if not home or not away or home in ("NAN", "NONE") or away in ("NAN", "NONE"):
+            if status not in ("Pending", "N/A"):
+                hist.at[idx, "result"] = "Pending"
+                hist.at[idx, "correct"] = None
+                hist.at[idx, "graded_at"] = None
+                changed = True
+            continue
+
+        if completed.empty or kick_day is None:
+            # Without a kickoff date we refuse to grade (prevents prior-year matchup hits)
+            if status not in ("Pending", "N/A"):
+                hist.at[idx, "result"] = "Pending"
+                hist.at[idx, "correct"] = None
+                hist.at[idx, "graded_at"] = None
+                changed = True
+            continue
+
+        # Strict match: same teams + gameday within 1 day of kickoff date
         mask = (
             (completed["home_team"] == home)
             & (completed["away_team"] == away)
+            & (completed["_gd"] >= kick_day - pd.Timedelta(days=1))
+            & (completed["_gd"] <= kick_day + pd.Timedelta(days=1))
         )
-        # Prefer same week when available
-        week = row.get("week")
-        try:
-            week_i = int(week) if week is not None and str(week) not in ("", "—", "nan", "None") else None
-        except Exception:
-            week_i = None
         matches = completed.loc[mask]
-        if week_i is not None and "week" in matches.columns and not matches.empty:
-            same_week = matches[pd.to_numeric(matches["week"], errors="coerce") == week_i]
-            if not same_week.empty:
-                matches = same_week
-        # Also try matching by kickoff/gameday if present
-        kick = str(row.get("kickoff") or "")[:10]
-        if kick and re.match(r"\d{4}-\d{2}-\d{2}", kick) and not matches.empty:
-            by_day = matches[matches["_gd"].astype(str).str[:10] == kick]
-            if not by_day.empty:
-                matches = by_day
-
         if matches.empty:
+            if status not in ("Pending", "N/A"):
+                hist.at[idx, "result"] = "Pending"
+                hist.at[idx, "correct"] = None
+                hist.at[idx, "graded_at"] = None
+                changed = True
             continue
 
         mrow = matches.sort_values("_gd").iloc[-1]
-        # Final safety: game date must be before today
-        gd = mrow.get("_gd")
-        if pd.isna(gd) or gd >= today:
-            continue
         try:
-            hs = float(mrow["home_score"]) if "home_score" in mrow.index and pd.notna(mrow["home_score"]) else None
-            aws = float(mrow["away_score"]) if "away_score" in mrow.index and pd.notna(mrow["away_score"]) else None
+            hs = float(mrow["home_score"])
+            aws = float(mrow["away_score"])
         except Exception:
-            hs = aws = None
-        if hs is None or aws is None:
+            if status not in ("Pending", "N/A"):
+                hist.at[idx, "result"] = "Pending"
+                hist.at[idx, "correct"] = None
+                hist.at[idx, "graded_at"] = None
+                changed = True
             continue
+
         margin = hs - aws
         total_pts = hs + aws
 
-        rec = str(row.get("recommendation") or "")
         spread = row.get("spread")
         total_line = row.get("total")
         try:
@@ -1406,50 +1412,51 @@ def _grade_signal_history(schedules: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             total_line = None
 
+        new_result = None
+        new_correct = None
         if rec == "Lean Home ATS" and spread is not None:
             if abs(margin - spread) < 1e-9:
-                hist.at[idx, "result"] = "Push"
-                hist.at[idx, "correct"] = None
+                new_result, new_correct = "Push", None
             else:
                 ok = margin > spread
-                hist.at[idx, "result"] = "Correct" if ok else "Incorrect"
-                hist.at[idx, "correct"] = bool(ok)
+                new_result, new_correct = ("Correct" if ok else "Incorrect"), bool(ok)
         elif rec == "Lean Away ATS" and spread is not None:
             if abs(margin - spread) < 1e-9:
-                hist.at[idx, "result"] = "Push"
-                hist.at[idx, "correct"] = None
+                new_result, new_correct = "Push", None
             else:
                 ok = margin < spread
-                hist.at[idx, "result"] = "Correct" if ok else "Incorrect"
-                hist.at[idx, "correct"] = bool(ok)
+                new_result, new_correct = ("Correct" if ok else "Incorrect"), bool(ok)
         elif rec == "Lean Over" and total_line is not None:
             if abs(total_pts - total_line) < 1e-9:
-                hist.at[idx, "result"] = "Push"
-                hist.at[idx, "correct"] = None
+                new_result, new_correct = "Push", None
             else:
                 ok = total_pts > total_line
-                hist.at[idx, "result"] = "Correct" if ok else "Incorrect"
-                hist.at[idx, "correct"] = bool(ok)
+                new_result, new_correct = ("Correct" if ok else "Incorrect"), bool(ok)
         elif rec == "Lean Under" and total_line is not None:
             if abs(total_pts - total_line) < 1e-9:
-                hist.at[idx, "result"] = "Push"
-                hist.at[idx, "correct"] = None
+                new_result, new_correct = "Push", None
             else:
                 ok = total_pts < total_line
-                hist.at[idx, "result"] = "Correct" if ok else "Incorrect"
-                hist.at[idx, "correct"] = bool(ok)
-        elif rec == "No strong lean":
-            hist.at[idx, "result"] = "N/A"
-            hist.at[idx, "correct"] = None
+                new_result, new_correct = ("Correct" if ok else "Incorrect"), bool(ok)
         else:
+            # Cannot grade without lines
+            if status not in ("Pending", "N/A"):
+                hist.at[idx, "result"] = "Pending"
+                hist.at[idx, "correct"] = None
+                hist.at[idx, "graded_at"] = None
+                changed = True
             continue
 
-        hist.at[idx, "graded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-        changed = True
+        if status != new_result or (hist.at[idx, "correct"] != new_correct):
+            hist.at[idx, "result"] = new_result
+            hist.at[idx, "correct"] = new_correct
+            hist.at[idx, "graded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            changed = True
 
     if changed:
         _save_signal_history(hist)
     return hist
+
 
 
 def build_team_history(seasons: Optional[List[int]] = None) -> pd.DataFrame:
@@ -3523,10 +3530,12 @@ with tab9:
                 "then return here after games complete to see graded results."
             )
         else:
-            # Summary by confidence
+            # Only truly graded rows (Correct/Incorrect). Pending/Push/N/A excluded.
             graded = hist[hist["result"].isin(["Correct", "Incorrect"])].copy()
             conf_order = ["A", "B", "C", "D", "F"]
+            rec_order = ["Lean Home ATS", "Lean Away ATS", "Lean Over", "Lean Under"]
             summary_rows = []
+            detail_rows = []
             if not graded.empty:
                 graded["confidence"] = graded["confidence"].astype(str).str.upper().str[:1]
                 for conf in conf_order:
@@ -3536,14 +3545,26 @@ with tab9:
                     wins = int((sub["result"] == "Correct").sum())
                     losses = int((sub["result"] == "Incorrect").sum())
                     total = wins + losses
-                    pct = f"{wins / total:.0%}" if total else "—"
                     summary_rows.append({
                         "Confidence": conf,
                         "Record": f"{wins}-{losses}",
-                        "Win %": pct,
+                        "Win %": f"{wins / total:.0%}" if total else "—",
                         "N": total,
                     })
-                # overall
+                    for rec in rec_order:
+                        rsub = sub[sub["recommendation"].astype(str) == rec]
+                        if rsub.empty:
+                            continue
+                        rw = int((rsub["result"] == "Correct").sum())
+                        rl = int((rsub["result"] == "Incorrect").sum())
+                        rt = rw + rl
+                        detail_rows.append({
+                            "Confidence": conf,
+                            "Recommendation": rec.replace("Lean ", ""),
+                            "Record": f"{rw}-{rl}",
+                            "Win %": f"{rw / rt:.0%}" if rt else "—",
+                            "N": rt,
+                        })
                 ow = int((graded["result"] == "Correct").sum())
                 ol = int((graded["result"] == "Incorrect").sum())
                 summary_rows.append({
@@ -3552,9 +3573,16 @@ with tab9:
                     "Win %": f"{ow / (ow + ol):.0%}" if (ow + ol) else "—",
                     "N": ow + ol,
                 })
+            pending_n = int((hist["result"].astype(str) == "Pending").sum()) if not hist.empty else 0
+            st.caption(f"Graded completed games only · **{pending_n}** still Pending")
             if summary_rows:
                 st.markdown("**Record by confidence**")
                 st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+            if detail_rows:
+                st.markdown("**By confidence × recommendation type**")
+                st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+            if not summary_rows:
+                st.info("No completed/graded signals yet. Only finished games appear in the records above.")
 
             # Full table sorted by confidence then date
             show = hist.copy()
