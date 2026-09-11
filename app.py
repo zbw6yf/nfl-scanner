@@ -170,7 +170,23 @@ def stamp_now(key: str) -> None:
 
 def stamp_text(key: str, label: str) -> str:
     val = st.session_state.get(f"updated_{key}")
-    return f"{label}: **{val}**" if val else f"{label}: —"
+    if not val:
+        return f"{label}: —"
+    return f"{label}: {val}"
+
+
+def last_update_caption(*keys: str, label: str = "Last update") -> str:
+    """Best (most recent) timestamp among keys, for section footers."""
+    times = []
+    for key in keys:
+        val = st.session_state.get(f"updated_{key}")
+        if val:
+            times.append(str(val))
+    if not times:
+        # fall back to "now" if section is actively rendering with data
+        return f"{label}: not yet refreshed this session"
+    times.sort()
+    return f"{label}: {times[-1]}"
 
 
 def current_nfl_week() -> Optional[int]:
@@ -3898,6 +3914,7 @@ with tab1:
             st.markdown("##### The NFL Big Board")
             st.caption("Values lock at kickoff — lines, scores, and signals stop updating once a game starts.")
             st.dataframe(display_df, use_container_width=True, hide_index=True)
+            st.caption(last_update_caption("odds", "schedule", "weather", label="Last update (Big Board)"))
 
             # ---- TOP 5 SIGNALED GAMES BY WEEK ----
             st.markdown("---")
@@ -4305,6 +4322,11 @@ with tab2:
             f"{len(display)} games · Open from earliest Action Network book line when available; "
             "Curr from latest book line / Odds API."
         )
+        try:
+            stamp_now("odds")
+        except Exception:
+            pass
+        st.caption(last_update_caption("odds", "schedule", label="Last update (Games & Odds)"))
     else:
         st.error(
             f"No games could be built from the embedded schedule "
@@ -4416,8 +4438,14 @@ with tab4:
                 pass
         st.dataframe(show, use_container_width=True, hide_index=True)
         st.caption(f"{len(show)} games shown")
+        try:
+            stamp_now("weather")
+        except Exception:
+            pass
+        st.caption(last_update_caption("weather", "schedule", label="Last update (Weather)"))
     else:
         st.info("No upcoming games / weather available yet. Load Game Signals first so weather is fetched.")
+        st.caption(last_update_caption("weather", "schedule", label="Last update (Weather)"))
 
 
 with tab5:
@@ -5063,4 +5091,3 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
