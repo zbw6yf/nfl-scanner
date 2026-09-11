@@ -3384,9 +3384,9 @@ def monte_carlo_game(
 # TABS
 # -----------------------------
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    "🏠 Homepage",
     "🎯 Game Signals",
     "📅 Games & Odds",
-    "🎯 Player Props",
     "🌤️ Weather",
     "🏥 Injury Report",
     "📋 Depth Charts",
@@ -3394,8 +3394,55 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "📘 Methodology",
     "⚙️ Advanced",
 ])
-# ========== TAB 1 ==========
+
+# ========== TAB 1: Homepage ==========
 with tab1:
+    st.markdown(
+        """
+### Welcome to **T<span style="color:#38bdf8">AI</span>L ME**
+*AI-powered NFL lean board for serious football bettors*
+
+**TAIL ME** is built for one job: help you decide *what to follow* on the NFL slate — and *why* — without drowning in noise.
+
+#### What you can do here
+| Tab | Purpose |
+|-----|---------|
+| **Game Signals** | Model leans (Home/Away ATS, Over/Under) with confidence grades, edge %, and a locked **NFL Big Board** |
+| **Games & Odds** | Full weekly slate with **open → current** spreads/totals, line moves, and game-day ticket cards |
+| **Weather** | Stadium forecasts near kickoff that feed total/under adjustments |
+| **Injury Report** | Filterable injury statuses by team |
+| **Depth Charts** | Current depth charts by team |
+| **Team History** | Multi-year ATS and Over/Under records with game logs |
+| **Methodology** | How Score, Confidence, and recommendations are produced |
+| **Advanced** | Signal History grading, bankroll/CLV, backtests, and player props |
+
+#### What makes TAIL ME different
+1. **Signals, not just odds** — EPA, success/explosive rates, form (current season), rest × travel × primetime, weather, and Monte Carlo + ML layers roll into a single Score and Confidence grade (A–F).
+2. **Full-slate honesty** — Every scheduled game can appear on the board, not only “hot” picks, so you see the week in context.
+3. **Lines that move** — Open vs current spreads/totals with move tracking so steam and line value are visible next to the model lean.
+4. **Lock at kickoff** — Big Board values freeze when a game starts so recommendations aren’t rewritten mid-game.
+5. **Accountability** — Signal History grades past leans by confidence and type so you can see what’s actually working.
+6. **One workflow** — Schedule, weather, injuries, depth, history, and props live in the same tool you use to scan the week.
+
+#### How to use it (quick start)
+1. Enter your **Odds API key** in the sidebar (saved for next visits).
+2. Open **Game Signals** for ranked leans and the **NFL Big Board**.
+3. Check **Games & Odds** for open/current lines and steam.
+4. Use **Weather**, **Injuries**, and **Depth Charts** to sanity-check the lean.
+5. Track results under **Advanced → Signal History**.
+
+> Research only — not betting advice. Past model performance does not guarantee future results.
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown("---")
+    c1, c2, c3 = st.columns(3)
+    c1.markdown("**🎯 Scan the slate**  \nGame Signals + Big Board")
+    c2.markdown("**📈 Read the market**  \nOpen → Curr lines & moves")
+    c3.markdown("**🧾 Grade yourself**  \nSignal History by confidence")
+
+# ========== TAB 2: Game Signals ==========
+with tab2:
     st.subheader("Game Signals")
     with st.spinner("Loading EPA, Pace, Form, Schedule, Odds and unique weather..."):
         team_epa = get_team_epa()
@@ -3990,7 +4037,7 @@ with tab1:
             st.warning("No opportunities to display.")
 
 # ========== TAB 2 ==========
-with tab2:
+with tab3:
     st.subheader("Upcoming Games (full schedule)")
     st.caption(
         "Official slate with open / current lines. "
@@ -4333,46 +4380,6 @@ with tab2:
             f"(len={len(EMBEDDED_2026_SCHEDULE)}). Redeploy app.py with EMBEDDED_2026_SCHEDULE intact."
         )
 
-
-with tab3:
-    st.subheader("Player Props")
-
-
-
-    if not api_key:
-        st.warning("Enter API key first.")
-    elif not odds_data:
-        st.info("No games with live odds available.")
-    else:
-        options = {f"{g.get('away_team')} @ {g.get('home_team')}": g.get("id") for g in odds_data}
-        selected = st.selectbox("Select game", list(options.keys()))
-        if st.button("Load Player Props", type="primary"):
-            with st.spinner("Fetching..."):
-                props = fetch_player_props(api_key, options[selected])
-            if not props:
-                st.error("Failed to fetch")
-            elif "error" in props:
-                st.error(props.get("error"))
-                st.caption("Player props usually require a paid plan.")
-            else:
-                rows = []
-                for book in props.get("bookmakers", []):
-                    for market in book.get("markets", []):
-                        for o in market.get("outcomes", []):
-                            rows.append({
-                                "Book": book.get("title"),
-                                "Market": (market.get("key") or "").replace("player_", "").replace("_", " ").title(),
-                                "Player": o.get("description") or o.get("name"),
-                                "Side": o.get("name"),
-                                "Line": o.get("point"),
-                                "Odds": o.get("price")
-                            })
-                if rows:
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                else:
-                    st.warning("No props returned.")
-
-    # ========== TAB 4 ==========
 
 with tab4:
     st.subheader("Game Weather")
@@ -4760,12 +4767,53 @@ with tab9:
     st.caption("Less frequently used tools — props, bankroll tracking, and historical backtests.")
     adv = st.radio(
         "Section",
-        options=["Signal History", "Bankroll & CLV", "Backtest"],
+        options=["Signal History", "Bankroll & CLV", "Backtest", "Player Props"],
         horizontal=True,
         key="advanced_section",
     )
     st.markdown("---")
-    if adv == "Signal History":
+    if adv == "Player Props":
+        st.markdown("##### Player Props")
+
+
+
+        if not api_key:
+            st.warning("Enter API key first.")
+        elif not odds_data:
+            st.info("No games with live odds available.")
+        else:
+            options = {f"{g.get('away_team')} @ {g.get('home_team')}": g.get("id") for g in odds_data}
+            selected = st.selectbox("Select game", list(options.keys()))
+            if st.button("Load Player Props", type="primary"):
+                with st.spinner("Fetching..."):
+                    props = fetch_player_props(api_key, options[selected])
+                if not props:
+                    st.error("Failed to fetch")
+                elif "error" in props:
+                    st.error(props.get("error"))
+                    st.caption("Player props usually require a paid plan.")
+                else:
+                    rows = []
+                    for book in props.get("bookmakers", []):
+                        for market in book.get("markets", []):
+                            for o in market.get("outcomes", []):
+                                rows.append({
+                                    "Book": book.get("title"),
+                                    "Market": (market.get("key") or "").replace("player_", "").replace("_", " ").title(),
+                                    "Player": o.get("description") or o.get("name"),
+                                    "Side": o.get("name"),
+                                    "Line": o.get("point"),
+                                    "Odds": o.get("price")
+                                })
+                    if rows:
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("No props returned.")
+
+        # ========== TAB 4 ==========
+
+
+    elif adv == "Signal History":
         st.markdown("##### Signal History")
         st.caption(
             "Tracks Game Signals recommendations and grades them when results are in. "
@@ -5091,3 +5139,4 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
