@@ -3482,16 +3482,38 @@ def monte_carlo_game(
 # TABS
 # -----------------------------
 
-@st.cache_data(ttl=30 * 60, show_spinner=False)
-def build_play_of_the_day(week: int, api_key: str = "") -> Optional[Dict]:
+def build_play_of_the_day(
+    week: int,
+    api_key: str = "",
+    n_simulations: int = 8000,
+    form_window: int = 6,
+) -> Optional[Dict]:
     """
-    Single best current-week lean by confidence then Score.
-    Uses the same core signals as The Big Board (EPA, form, MC, lines).
+    Pick the current-week play using the SAME Score / Confidence / Recommendation
+    rules as The Big Board (full signal stack for that week's games only).
     """
     try:
         week = int(week)
+        # Prefer live Big Board results from this session when available
+        cached = st.session_state.get("bb_opportunities")
+        if isinstance(cached, list) and cached:
+            week_rows = []
+            for o in cached:
+                try:
+                    w = o.get("Week")
+                    if w is not None and str(w) not in ("—", "nan", "None", ""):
+                        if int(float(w)) == week:
+                            week_rows.append(o)
+                except Exception:
+                    continue
+            if week_rows:
+                return _pick_top_play(week_rows)
+
         team_epa = get_team_epa()
-        recent_form = get_recent_form(n_games=6)
+        team_pace = get_team_pace()
+        team_success = get_team_success_metrics()
+        team_ou_rate = get_team_ou_tendency()
+        recent_form = get_recent_form(n_games=form_window)
         schedules = load_schedules()
         odds_data = None
         if api_key:
@@ -3500,125 +3522,251 @@ def build_play_of_the_day(week: int, api_key: str = "") -> Optional[Dict]:
             except Exception:
                 odds_data = None
         try:
-            an_lines = fetch_action_network_lines()
+            current_season = int(nfl.get_current_season())
         except Exception:
-            an_lines = {}
-        games = [r for r in EMBEDDED_2026_SCHEDULE if int(r.get("week") or 0) == week]
-        if not games:
-            return None
-        candidates = []
-        for row in games:
-            home = str(row.get("home") or "").upper()
-            away = str(row.get("away") or "").upper()
-            gameday = row.get("gameday")
-            gametime = row.get("gametime") or "13:00"
-            kickoff = format_schedule_kickoff(gameday, gametime)
-            # lines
-            avg_spread = avg_total = None
-            an = an_lines.get(f"{away}_{home}") or {}
-            if an.get("cur_spread") is not None:
-                avg_spread = an.get("cur_spread")
-            if an.get("cur_total") is not None:
-                avg_total = an.get("cur_total")
-            if odds_data:
-                ev = find_odds_event(odds_data, home, away)
-                if ev:
-                    s, t = _extract_odds_lines(ev, home)
-                    if avg_spread is None:
-                        avg_spread = s
-                    if avg_total is None:
-                        avg_total = t
-            if avg_total is None:
-                avg_total = 45.0
-            # EPA
-            if not team_epa.empty and home in team_epa.index and away in team_epa.index:
-                home_off = float(team_epa.loc[home, "off_epa"])
-                home_def = float(team_epa.loc[home, "def_epa"])
-                away_off = float(team_epa.loc[away, "off_epa"])
-                away_def = float(team_epa.loc[away, "def_epa"])
-            else:
-                home_off = home_def = away_off = away_def = 0.0
-            epa_edge = (home_off - away_def) - (away_off - home_def)
-            home_form = recent_form.get(home, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
-            away_form = recent_form.get(away, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
-            form_margin_diff = float(home_form.get("form_margin") or 0) - float(away_form.get("form_margin") or 0)
-            form_margin_diff = shrink_to_mean(form_margin_diff, min(float(home_form.get("n") or 0), float(away_form.get("n") or 0)), 0.0, prior_n=6.0)
-            rest_diff = 0.0
+            current_season = datetime.now().year if datetime.now().month >= 8 else datetime.now().year - 1
+        model_bundle = train_ats_model(list(range(current_season - 4, current_season)))
+        model = model_bundle[0] if model_bundle else None
+        feature_cols = model_bundle[1] if model_bundle and len(model_bundle) > 1 else None
+
+        upcoming = build_upcoming_games(schedules, odds_data, days_ahead=120)
+        upcoming = [g for g in (upcoming or []) if g.get("week") is not None and int(g.get("week")) == week]
+        if not upcoming:
+            # fallback: embed rows for the week
+            upcoming = []
+            for row in EMBEDDED_2026_SCHEDULE:
+                if int(row.get("week") or 0) != week:
+                    continue
+                home, away = row["home"], row["away"]
+                gameday, gametime = row["gameday"], row.get("gametime") or "13:00"
+                avg_spread = avg_total = None
+                if odds_data:
+                    ev = find_odds_event(odds_data, home, away)
+                    if ev:
+                        avg_spread, avg_total = _extract_odds_lines(ev, home)
+                upcoming.append({
+                    "home": home, "away": away, "week": week,
+                    "gameday": gameday, "gametime": gametime,
+                    "kickoff": format_schedule_kickoff(gameday, gametime),
+                    "avg_spread": avg_spread, "avg_total": avg_total,
+                    "roof": row.get("roof") or "outdoors",
+                    "home_full": full_name(home), "away_full": full_name(away),
+                    "commence_raw": f"{gameday}T{gametime}:00",
+                    "odds_event": find_odds_event(odds_data, home, away) if odds_data else None,
+                })
+
+        weather_cache = build_weather_cache_from_games(upcoming) if upcoming else {}
+        league_avg_pace = float(team_pace["plays_per_game"].mean()) if (not team_pace.empty and "plays_per_game" in team_pace.columns) else 65.0
+
+        opportunities = []
+        for g in upcoming:
             try:
-                rest_diff = float(rest_differential(schedules, home, away, str(gameday)[:10], week=week) or 0)
+                home = str(g.get("home") or "").upper()
+                away = str(g.get("away") or "").upper()
+                home_full = g.get("home_full") or full_name(home)
+                away_full = g.get("away_full") or full_name(away)
+                game_date = str(g.get("gameday") or "")[:10]
+                commence = g.get("kickoff") or ""
+                commence_raw = g.get("commence_raw") or ""
+                roof = str(g.get("roof") or "outdoors").lower()
+                avg_spread = g.get("avg_spread")
+                avg_total = g.get("avg_total") if g.get("avg_total") is not None else 45.0
+                # Overlay Action Network current if missing
+                try:
+                    an = fetch_action_network_lines().get(f"{away}_{home}") or {}
+                    if avg_spread is None and an.get("cur_spread") is not None:
+                        avg_spread = an.get("cur_spread")
+                    if (avg_total is None or avg_total == 45.0) and an.get("cur_total") is not None:
+                        avg_total = an.get("cur_total")
+                except Exception:
+                    an = {}
+
+                if not team_epa.empty and home in team_epa.index and away in team_epa.index:
+                    home_off = float(team_epa.loc[home, "off_epa"])
+                    home_def = float(team_epa.loc[home, "def_epa"])
+                    away_off = float(team_epa.loc[away, "off_epa"])
+                    away_def = float(team_epa.loc[away, "def_epa"])
+                else:
+                    home_off = home_def = away_off = away_def = 0.0
+                # Shrink early season
+                league_off = float(team_epa["off_epa"].mean()) if not team_epa.empty and "off_epa" in team_epa.columns else 0.0
+                league_def = float(team_epa["def_epa"].mean()) if not team_epa.empty and "def_epa" in team_epa.columns else 0.0
+                home_form = recent_form.get(home, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
+                away_form = recent_form.get(away, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
+                n_home = float(home_form.get("n") or 0)
+                n_away = float(away_form.get("n") or 0)
+                home_off = shrink_to_mean(home_off, max(n_home, 1.0) * 15.0, league_off, prior_n=8.0 * 15.0)
+                home_def = shrink_to_mean(home_def, max(n_home, 1.0) * 15.0, league_def, prior_n=8.0 * 15.0)
+                away_off = shrink_to_mean(away_off, max(n_away, 1.0) * 15.0, league_off, prior_n=8.0 * 15.0)
+                away_def = shrink_to_mean(away_def, max(n_away, 1.0) * 15.0, league_def, prior_n=8.0 * 15.0)
+                epa_edge = (home_off - away_def) - (away_off - home_def)
+                rest_diff = rest_differential(schedules, home, away, game_date, week=week)
+                if avg_spread is not None:
+                    home_imp, away_imp = implied_team_totals(avg_spread, avg_total)
+                else:
+                    home_imp = away_imp = avg_total / 2
+                form_margin_diff = home_form["form_margin"] - away_form["form_margin"]
+                form_epa_diff = home_form["form_epa"] - away_form["form_epa"]
+                form_margin_diff = shrink_to_mean(form_margin_diff, min(n_home, n_away), 0.0, prior_n=6.0)
+                form_epa_diff = shrink_to_mean(form_epa_diff, min(n_home, n_away), 0.0, prior_n=6.0)
+                home_pace = float(team_pace.loc[home, "plays_per_game"]) if (not team_pace.empty and home in team_pace.index) else league_avg_pace
+                away_pace = float(team_pace.loc[away, "plays_per_game"]) if (not team_pace.empty and away in team_pace.index) else league_avg_pace
+                combined_pace = (home_pace + away_pace) / 2.0
+                pace_vs_avg = combined_pace - league_avg_pace
+                pace_adj = pace_vs_avg * 0.35
+                tz_diff = timezone_diff(home, away)
+                travel_dir = travel_direction(home, away)
+                div_flag = is_divisional(home, away)
+                wx_key = make_weather_key(home, commence_raw or game_date)
+                weather = weather_cache.get(wx_key) or {"temp_f": 70, "wind_mph": 5, "precip_prob": 10}
+                wx_adj = weather_adjustments(roof, weather)
+
+                signals = []
+                rule_score = 0.0
+                if epa_edge > 0.08:
+                    signals.append(f"Home EPA +{epa_edge:.3f}"); rule_score += 2.2
+                elif epa_edge < -0.08:
+                    signals.append(f"Away EPA {epa_edge:.3f}"); rule_score += 2.0
+                if avg_spread is not None and avg_spread > 1.5:
+                    signals.append("Home underdog"); rule_score += 1.3
+                if avg_spread is not None and abs(avg_spread) >= 7:
+                    signals.append(f"Large spread {avg_spread:+.1f}"); rule_score += 0.7
+                if avg_total >= 48.5:
+                    signals.append(f"High total {avg_total:.1f}"); rule_score += 0.6
+                if rest_diff >= 3:
+                    signals.append(f"Home rest +{rest_diff}d"); rule_score += 1.1
+                elif rest_diff <= -3:
+                    signals.append(f"Away rest {rest_diff}d"); rule_score += 1.0
+                if wx_adj.get("rule_pts", 0) > 0:
+                    signals.append(wx_adj.get("label") or "Weather"); rule_score += wx_adj["rule_pts"]
+                if home_imp >= 27.5:
+                    signals.append(f"High Home Imp {home_imp:.1f}"); rule_score += 1.5
+                elif home_imp <= 17.5:
+                    signals.append(f"Low Home Imp {home_imp:.1f}"); rule_score += 1.2
+                if away_imp >= 27.5:
+                    signals.append(f"High Away Imp {away_imp:.1f}"); rule_score += 1.4
+                elif away_imp <= 17.5:
+                    signals.append(f"Low Away Imp {away_imp:.1f}"); rule_score += 1.1
+                if form_margin_diff >= 7:
+                    signals.append(f"Home form +{form_margin_diff:.1f}"); rule_score += 1.6
+                elif form_margin_diff <= -7:
+                    signals.append(f"Away form {form_margin_diff:.1f}"); rule_score += 1.5
+                if form_epa_diff > 0.12:
+                    signals.append(f"Home form EPA +{form_epa_diff:.3f}"); rule_score += 1.3
+                elif form_epa_diff < -0.12:
+                    signals.append(f"Away form EPA {form_epa_diff:.3f}"); rule_score += 1.2
+                if pace_vs_avg >= 4.0:
+                    signals.append(f"Fast pace +{pace_vs_avg:.1f}"); rule_score += 1.0
+                elif pace_vs_avg <= -4.0:
+                    signals.append(f"Slow pace {pace_vs_avg:.1f}"); rule_score += 0.9
+                if tz_diff >= 3:
+                    signals.append(f"Away TZ -{tz_diff}h"); rule_score += 1.0
+                if div_flag:
+                    signals.append("Divisional"); rule_score += 0.7
+                # success / explosive
+                if not team_success.empty and home in team_success.index and away in team_success.index:
+                    h_sr = float(team_success.loc[home, "off_success"]) - float(team_success.loc[away, "def_success"])
+                    a_sr = float(team_success.loc[away, "off_success"]) - float(team_success.loc[home, "def_success"])
+                    sr_edge = h_sr - a_sr
+                    if sr_edge > 0.04:
+                        signals.append(f"Home success +{sr_edge:.3f}"); rule_score += 1.4
+                    elif sr_edge < -0.04:
+                        signals.append(f"Away success {sr_edge:.3f}"); rule_score += 1.3
+                # O/U tendency
+                if team_ou_rate and avg_total is not None:
+                    combo_over = (float(team_ou_rate.get(home, 0.5)) + float(team_ou_rate.get(away, 0.5))) / 2.0
+                    if avg_total >= 47.5 and combo_over >= 0.55:
+                        signals.append(f"Over-prone teams ({combo_over:.0%})"); rule_score += 1.2
+                    elif avg_total <= 42.5 and combo_over <= 0.45:
+                        signals.append(f"Under-prone teams ({combo_over:.0%})"); rule_score += 1.2
+
+                form_margin_adj = form_margin_diff * 0.15
+                ml_home = 0.5
+                if model is not None and avg_spread is not None and feature_cols is not None:
+                    feat = pd.DataFrame([{
+                        "epa_edge": epa_edge, "spread": avg_spread, "rest_diff": rest_diff,
+                        "home_off": home_off, "home_def": home_def,
+                        "away_off": away_off, "away_def": away_def,
+                        "abs_spread": abs(avg_spread), "total_line": avg_total
+                    }])[feature_cols]
+                    ml_home = float(model.predict_proba(feat)[0, 1])
+                mc = monte_carlo_game(
+                    home_off, home_def, away_off, away_def,
+                    avg_spread if avg_spread is not None else 0.0,
+                    avg_total, n_sims=n_simulations,
+                    total_adj=wx_adj.get("total_adj", 0.0),
+                    noise_extra=wx_adj.get("noise_extra", 0.0),
+                    under_bias=wx_adj.get("under_bias", 0.0),
+                    pace_adj=pace_adj,
+                    form_margin_adj=form_margin_adj,
+                )
+                ml_edge = abs(ml_home - 0.5) * 4.0
+                mc_edge = max(mc["home_ev"], mc["away_ev"]) * 8.0
+                agree = 1.5 if ((ml_home > 0.5 and mc["home_cover_prob"] > 0.52) or
+                                (ml_home < 0.5 and mc["home_cover_prob"] < 0.48)) else 0.0
+                total_score = rule_score + ml_edge + mc_edge + agree
+                if mc["home_ev"] > 0.03 and ml_home > 0.53:
+                    rec = "Home ATS"
+                elif mc["away_ev"] > 0.03 and ml_home < 0.47:
+                    rec = "Away ATS"
+                elif mc["over_prob"] > 0.56:
+                    rec = "Over"
+                elif mc["under_prob"] > 0.56:
+                    rec = "Under"
+                else:
+                    rec = "No strong lean"
+                odds_ev = g.get("odds_event")
+                model_home = 0.5 * ml_home + 0.5 * mc["home_cover_prob"]
+                mkt_home = market_home_win_prob(odds_ev, home_full, away_full, avg_spread)
+                edge_home = compute_edge(model_home, mkt_home)
+                if rec == "Away ATS":
+                    edge_pct = compute_edge(1.0 - model_home, (1.0 - mkt_home) if mkt_home is not None else None)
+                elif rec == "Over":
+                    edge_pct = (mc["over_prob"] - 0.5) * 100.0
+                elif rec == "Under":
+                    edge_pct = (mc["under_prob"] - 0.5) * 100.0
+                else:
+                    edge_pct = edge_home
+                conf = confidence_grade(rec, total_score, ml_home, mc, edge_pct, len(signals), agree)
+                opportunities.append({
+                    "Week": week,
+                    "Game": f"{away_full} @ {home_full}",
+                    "Kickoff": commence,
+                    "Recommendation": rec,
+                    "Confidence": conf,
+                    "Score": round(total_score, 2),
+                    "Spread": f"{avg_spread:+.1f}" if avg_spread is not None else "—",
+                    "Total": f"{avg_total:.1f}" if avg_total is not None else "—",
+                    "Open Spread": f"{an.get('open_spread'):+.1f}" if an.get("open_spread") is not None else "—",
+                    "Curr Spread": f"{an.get('cur_spread'):+.1f}" if an.get("cur_spread") is not None else "—",
+                    "Open Total": f"{an.get('open_total'):.1f}" if an.get("open_total") is not None else "—",
+                    "Curr Total": f"{an.get('cur_total'):.1f}" if an.get("cur_total") is not None else "—",
+                    "Signals": " • ".join(signals) if signals else "—",
+                    "Edge %": f"{edge_pct:+.1f}" if edge_pct is not None else "—",
+                })
             except Exception:
-                rest_diff = 0.0
-            rule_score = 0.0
-            signals = []
-            if epa_edge > 0.08:
-                signals.append(f"Home EPA +{epa_edge:.3f}"); rule_score += 2.2
-            elif epa_edge < -0.08:
-                signals.append(f"Away EPA {epa_edge:.3f}"); rule_score += 2.0
-            if form_margin_diff >= 7:
-                signals.append(f"Home form +{form_margin_diff:.1f}"); rule_score += 1.6
-            elif form_margin_diff <= -7:
-                signals.append(f"Away form {form_margin_diff:.1f}"); rule_score += 1.5
-            if rest_diff >= 3:
-                signals.append(f"Home rest +{rest_diff}d"); rule_score += 1.1
-            elif rest_diff <= -3:
-                signals.append(f"Away rest {rest_diff}d"); rule_score += 1.0
-            form_margin_adj = form_margin_diff * 0.15
-            mc = monte_carlo_game(
-                home_off, home_def, away_off, away_def,
-                avg_spread if avg_spread is not None else 0.0,
-                avg_total, n_sims=2500,
-                total_adj=0.0, noise_extra=0.0, under_bias=0.0,
-                pace_adj=0.0, form_margin_adj=form_margin_adj,
-            )
-            # lean rules (aligned with main board)
-            rec = "No strong lean"
-            if mc.get("home_ev", 0) > 0.03 and mc.get("home_cover_prob", 0.5) > 0.53:
-                rec = "Home ATS"
-            elif mc.get("away_ev", 0) > 0.03 and mc.get("home_cover_prob", 0.5) < 0.47:
-                rec = "Away ATS"
-            elif mc.get("over_prob", 0.5) > 0.56:
-                rec = "Over"
-            elif mc.get("under_prob", 0.5) > 0.56:
-                rec = "Under"
-            ml_home = 0.5 + max(-0.15, min(0.15, epa_edge))
-            edge_pct = (mc.get("home_cover_prob", 0.5) - 0.5) * 100.0
-            if rec == "Away ATS":
-                edge_pct = -edge_pct
-            elif rec == "Over":
-                edge_pct = (mc.get("over_prob", 0.5) - 0.5) * 100.0
-            elif rec == "Under":
-                edge_pct = (mc.get("under_prob", 0.5) - 0.5) * 100.0
-            agree = 0.0
-            if rec == "Home ATS" and epa_edge > 0:
-                agree = 1.0
-            elif rec == "Away ATS" and epa_edge < 0:
-                agree = 1.0
-            total_score = rule_score + agree
-            conf = confidence_grade(rec, total_score, ml_home, mc, edge_pct, len(signals), agree)
-            candidates.append({
-                "Week": week,
-                "Game": f"{full_name(away)} @ {full_name(home)}",
-                "Kickoff": kickoff,
-                "Recommendation": rec,
-                "Confidence": conf,
-                "Score": round(total_score, 2),
-                "Spread": f"{avg_spread:+.1f}" if avg_spread is not None else "—",
-                "Total": f"{avg_total:.1f}" if avg_total is not None else "—",
-                "Open Spread": f"{an.get('open_spread'):+.1f}" if an.get("open_spread") is not None else "—",
-                "Curr Spread": f"{an.get('cur_spread'):+.1f}" if an.get("cur_spread") is not None else "—",
-                "Open Total": f"{an.get('open_total'):.1f}" if an.get("open_total") is not None else "—",
-                "Curr Total": f"{an.get('cur_total'):.1f}" if an.get("cur_total") is not None else "—",
-                "Signals": " • ".join(signals) if signals else "—",
-                "_home": home,
-                "_away": away,
-            })
-        if not candidates:
-            return None
-        conf_rank = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
-        candidates.sort(key=lambda x: (conf_rank.get(str(x.get("Confidence")), 9), -float(x.get("Score") or 0)))
-        return candidates[0]
+                continue
+        return _pick_top_play(opportunities)
     except Exception:
         return None
+
+
+def _pick_top_play(opportunities: list) -> Optional[Dict]:
+    """Highest Confidence (A→F), then highest Score. Prefer real leans over 'No strong lean'."""
+    if not opportunities:
+        return None
+    conf_rank = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
+    def sort_key(o):
+        rec = str(o.get("Recommendation") or "")
+        lean_penalty = 0 if rec not in ("No strong lean", "—", "") else 1
+        conf = conf_rank.get(str(o.get("Confidence") or "F"), 9)
+        try:
+            score = -float(o.get("Score") or 0)
+        except Exception:
+            score = 0
+        return (lean_penalty, conf, score)
+    ranked = sorted(opportunities, key=sort_key)
+    return ranked[0]
 
 
 
@@ -3713,7 +3861,7 @@ with tab1:
     if feature_enabled("today_card"):
         cur_wk = current_nfl_week() or 1
         with st.spinner("Selecting Play Of The Day..."):
-            potd = build_play_of_the_day(int(cur_wk), api_key or "")
+            potd = build_play_of_the_day(int(cur_wk), api_key or "", n_simulations=n_simulations, form_window=form_window)
         st.markdown(
             f"""
 <div class="tm-today-header">
@@ -4185,6 +4333,12 @@ with tab2:
         if opportunities:
             try:
                 _upsert_signals_from_opportunities(opportunities)
+            except Exception:
+                pass
+            # Cache for Play Of The Day so Homepage matches The Big Board exactly
+            try:
+                st.session_state["bb_opportunities"] = list(opportunities)
+                st.session_state["bb_play_of_day"] = _pick_top_play(list(opportunities))
             except Exception:
                 pass
             df = pd.DataFrame(opportunities).sort_values("Score", ascending=False)
