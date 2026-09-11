@@ -3399,47 +3399,137 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
 with tab1:
     st.markdown(
         """
-### Welcome to **T<span style="color:#38bdf8">AI</span>L ME**
-*AI-powered NFL lean board for serious football bettors*
+<style>
+.tm-home-hero {
+  position: relative;
+  border-radius: 18px;
+  overflow: hidden;
+  margin-bottom: 1.25rem;
+  min-height: 200px;
+  border: 1px solid rgba(255,255,255,0.1);
+  box-shadow: 0 12px 40px rgba(0,0,0,0.35);
+}
+.tm-home-hero__bg {
+  position: absolute; inset: 0;
+  background:
+    linear-gradient(120deg, rgba(7,12,24,0.94) 0%, rgba(15,23,42,0.78) 50%, rgba(14,116,144,0.45) 100%),
+    url('https://images.unsplash.com/photo-1508098682722-e99c43a406b2?auto=format&fit=crop&w=1600&q=80') center/cover no-repeat;
+}
+.tm-home-hero__content { position: relative; z-index: 1; padding: 1.75rem 1.75rem 1.5rem; color: #f8fafc; }
+.tm-home-hero h2 { margin: 0 0 0.35rem 0; font-size: 2rem; font-weight: 800; letter-spacing: 0.04em; }
+.tm-home-hero .ai { color: #38bdf8; text-shadow: 0 0 16px rgba(56,189,248,0.5); }
+.tm-home-hero p { margin: 0; color: #cbd5e1; max-width: 36rem; line-height: 1.5; }
+.tm-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0.85rem;
+  margin: 0.75rem 0 1.25rem 0;
+}
+.tm-card {
+  background: linear-gradient(160deg, #111827 0%, #0f172a 100%);
+  border: 1px solid #1f2937;
+  border-radius: 14px;
+  padding: 1rem 1.05rem 1.05rem;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.22);
+  transition: border-color 0.15s ease;
+}
+.tm-card:hover { border-color: #38bdf8; }
+.tm-card .icon { font-size: 1.55rem; margin-bottom: 0.35rem; }
+.tm-card h4 { margin: 0 0 0.3rem 0; color: #f1f5f9; font-size: 1rem; }
+.tm-card p { margin: 0; color: #94a3b8; font-size: 0.88rem; line-height: 1.45; }
+.tm-section-title {
+  color: #e2e8f0; font-size: 1.1rem; font-weight: 700;
+  margin: 1.1rem 0 0.55rem 0; letter-spacing: 0.02em;
+}
+.tm-pill-row { display: flex; flex-wrap: wrap; gap: 0.45rem; margin: 0.5rem 0 1rem 0; }
+.tm-pill {
+  background: rgba(56,189,248,0.12); color: #7dd3fc;
+  border: 1px solid rgba(56,189,248,0.25);
+  border-radius: 999px; padding: 0.28rem 0.7rem; font-size: 0.78rem; font-weight: 600;
+}
+.tm-diff {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+.tm-diff-item {
+  background: #0b1220;
+  border-left: 3px solid #38bdf8;
+  border-radius: 0 12px 12px 0;
+  padding: 0.85rem 1rem;
+}
+.tm-diff-item strong { color: #f8fafc; display: block; margin-bottom: 0.2rem; }
+.tm-diff-item span { color: #94a3b8; font-size: 0.88rem; line-height: 1.4; }
+.tm-steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 0.6rem;
+  margin: 0.5rem 0 1rem 0;
+}
+.tm-step {
+  background: #111827; border-radius: 12px; padding: 0.85rem;
+  text-align: center; border: 1px solid #1f2937;
+}
+.tm-step .n {
+  width: 28px; height: 28px; line-height: 28px; margin: 0 auto 0.4rem;
+  border-radius: 50%; background: #0ea5e9; color: #0f172a; font-weight: 800; font-size: 0.85rem;
+}
+.tm-step div { color: #cbd5e1; font-size: 0.82rem; }
+.tm-footnote {
+  margin-top: 0.75rem; padding: 0.75rem 1rem; border-radius: 10px;
+  background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.2);
+  color: #fcd34d; font-size: 0.85rem;
+}
+</style>
 
-**TAIL ME** is built for one job: help you decide *what to follow* on the NFL slate — and *why* — without drowning in noise.
+<div class="tm-home-hero">
+  <div class="tm-home-hero__bg"></div>
+  <div class="tm-home-hero__content">
+    <div class="tm-pill-row">
+      <span class="tm-pill">NFL analytics</span>
+      <span class="tm-pill">Model leans</span>
+      <span class="tm-pill">Open → Curr lines</span>
+      <span class="tm-pill">Research tool</span>
+    </div>
+    <h2>Welcome to T<span class="ai">AI</span>L ME</h2>
+    <p>AI-powered NFL lean board for people who want the <b>why</b> behind a side or total — not another wall of random picks.</p>
+  </div>
+</div>
 
-#### What you can do here
-| Tab | Purpose |
-|-----|---------|
-| **Game Signals** | Model leans (Home/Away ATS, Over/Under) with confidence grades, edge %, and a locked **NFL Big Board** |
-| **Games & Odds** | Full weekly slate with **open → current** spreads/totals, line moves, and game-day ticket cards |
-| **Weather** | Stadium forecasts near kickoff that feed total/under adjustments |
-| **Injury Report** | Filterable injury statuses by team |
-| **Depth Charts** | Current depth charts by team |
-| **Team History** | Multi-year ATS and Over/Under records with game logs |
-| **Methodology** | How Score, Confidence, and recommendations are produced |
-| **Advanced** | Signal History grading, bankroll/CLV, backtests, and player props |
+<div class="tm-section-title">What you can do</div>
+<div class="tm-grid">
+  <div class="tm-card"><div class="icon">🎯</div><h4>Game Signals</h4><p>Ranked ATS & total leans with confidence grades, edge %, and the NFL Big Board.</p></div>
+  <div class="tm-card"><div class="icon">📈</div><h4>Games & Odds</h4><p>Full slate tickets with open → current spreads/totals and line movement.</p></div>
+  <div class="tm-card"><div class="icon">🌤️</div><h4>Weather</h4><p>Stadium forecasts near kickoff that feed total and under-bias adjustments.</p></div>
+  <div class="tm-card"><div class="icon">🏥</div><h4>Injuries & Depth</h4><p>Filterable injury report and depth charts so context sits next to the lean.</p></div>
+  <div class="tm-card"><div class="icon">📊</div><h4>Team History</h4><p>Multi-year ATS and O/U records with game logs and pre-game lines.</p></div>
+  <div class="tm-card"><div class="icon">🧾</div><h4>Signal History</h4><p>Grade past recommendations by confidence so the model is accountable.</p></div>
+</div>
 
-#### What makes TAIL ME different
-1. **Signals, not just odds** — EPA, success/explosive rates, form (current season), rest × travel × primetime, weather, and Monte Carlo + ML layers roll into a single Score and Confidence grade (A–F).
-2. **Full-slate honesty** — Every scheduled game can appear on the board, not only “hot” picks, so you see the week in context.
-3. **Lines that move** — Open vs current spreads/totals with move tracking so steam and line value are visible next to the model lean.
-4. **Lock at kickoff** — Big Board values freeze when a game starts so recommendations aren’t rewritten mid-game.
-5. **Accountability** — Signal History grades past leans by confidence and type so you can see what’s actually working.
-6. **One workflow** — Schedule, weather, injuries, depth, history, and props live in the same tool you use to scan the week.
+<div class="tm-section-title">What makes TAIL ME different</div>
+<div class="tm-diff">
+  <div class="tm-diff-item"><strong>Signals, not noise</strong><span>EPA, success rates, form, rest × travel, weather, Monte Carlo & ML fused into Score + Confidence.</span></div>
+  <div class="tm-diff-item"><strong>Full-slate honesty</strong><span>See the whole week — not only “hot” picks — so context stays visible.</span></div>
+  <div class="tm-diff-item"><strong>Market awareness</strong><span>Open vs current lines and steam sit next to the model lean.</span></div>
+  <div class="tm-diff-item"><strong>Lock at kickoff</strong><span>Big Board freezes so mid-game noise doesn’t rewrite the recommendation.</span></div>
+  <div class="tm-diff-item"><strong>Track record</strong><span>Signal History grades A–F leans so you know what’s working.</span></div>
+  <div class="tm-diff-item"><strong>One workflow</strong><span>Schedule, weather, injuries, depth, and props in the same tool as the scan.</span></div>
+</div>
 
-#### How to use it (quick start)
-1. Enter your **Odds API key** in the sidebar (saved for next visits).
-2. Open **Game Signals** for ranked leans and the **NFL Big Board**.
-3. Check **Games & Odds** for open/current lines and steam.
-4. Use **Weather**, **Injuries**, and **Depth Charts** to sanity-check the lean.
-5. Track results under **Advanced → Signal History**.
+<div class="tm-section-title">Quick start</div>
+<div class="tm-steps">
+  <div class="tm-step"><div class="n">1</div><div>Save your Odds API key in the sidebar</div></div>
+  <div class="tm-step"><div class="n">2</div><div>Open Game Signals for leans & Big Board</div></div>
+  <div class="tm-step"><div class="n">3</div><div>Check Games & Odds for line moves</div></div>
+  <div class="tm-step"><div class="n">4</div><div>Sanity-check weather / injuries / depth</div></div>
+  <div class="tm-step"><div class="n">5</div><div>Review Advanced → Signal History</div></div>
+</div>
 
-> Research only — not betting advice. Past model performance does not guarantee future results.
+<div class="tm-footnote">Research only — not betting advice. Model output is for education and decision support. Wager responsibly and only where legal.</div>
         """,
         unsafe_allow_html=True,
     )
-    st.markdown("---")
-    c1, c2, c3 = st.columns(3)
-    c1.markdown("**🎯 Scan the slate**  \nGame Signals + Big Board")
-    c2.markdown("**📈 Read the market**  \nOpen → Curr lines & moves")
-    c3.markdown("**🧾 Grade yourself**  \nSignal History by confidence")
 
 # ========== TAB 2: Game Signals ==========
 with tab2:
