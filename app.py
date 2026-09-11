@@ -20,7 +20,7 @@ from sklearn.pipeline import Pipeline
 # PAGE CONFIG
 # -----------------------------
 st.set_page_config(
-    page_title="NFL Opportunity Scanner",
+    page_title="TAIL ME",
     page_icon="🏈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -161,11 +161,55 @@ inject_theme_css(st.session_state.get("ui_theme", "Dark"))
 
 st.markdown(
     """
-<div class="nsc-hero">
-  <span class="nsc-badge">Research tool</span>
-  <span class="nsc-badge">EPA · ML · Monte Carlo</span>
-  <h1>🏈 NFL Opportunity Scanner</h1>
-  <p>Model-driven lean board with schedule, weather, injuries, and depth charts — not betting advice.</p>
+<style>
+  .tailme-hero {
+    position: relative;
+    border-radius: 16px;
+    overflow: hidden;
+    margin-bottom: 1rem;
+    min-height: 168px;
+    border: 1px solid rgba(255,255,255,0.1);
+    box-shadow: 0 8px 28px rgba(0,0,0,0.25);
+  }
+  .tailme-hero__bg {
+    position: absolute; inset: 0;
+    background:
+      linear-gradient(105deg, rgba(7,12,24,0.92) 0%, rgba(15,23,42,0.72) 45%, rgba(30,58,138,0.55) 100%),
+      url('https://images.unsplash.com/photo-1566577739112-ce14f5c8536a?auto=format&fit=crop&w=1600&q=80') center/cover no-repeat;
+  }
+  .tailme-hero__content {
+    position: relative; z-index: 1;
+    padding: 1.4rem 1.6rem 1.3rem 1.6rem;
+    color: #f8fafc;
+  }
+  .tailme-title {
+    margin: 0.25rem 0 0.2rem 0;
+    font-size: 2.55rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    line-height: 1.05;
+  }
+  .tailme-title .ai {
+    color: #38bdf8;
+    text-shadow: 0 0 18px rgba(56,189,248,0.55), 0 0 4px rgba(56,189,248,0.8);
+    padding: 0 0.02em;
+  }
+  .tailme-sub {
+    margin: 0.35rem 0 0 0;
+    color: #cbd5e1;
+    font-size: 0.98rem;
+    max-width: 42rem;
+  }
+</style>
+<div class="tailme-hero">
+  <div class="tailme-hero__bg"></div>
+  <div class="tailme-hero__content">
+    <span class="nsc-badge">Research tool</span>
+    <span class="nsc-badge">EPA · ML · Monte Carlo</span>
+    <span class="nsc-badge">Sports betting analytics</span>
+    <h1 class="tailme-title">T<span class="ai">AI</span>L ME</h1>
+    <p class="tailme-sub">AI-powered NFL lean board — schedule, weather, injuries, depth charts, and model signals. Not betting advice.</p>
+  </div>
 </div>
     """,
     unsafe_allow_html=True,
@@ -598,6 +642,105 @@ def is_primetime_kickoff(kickoff: str, gametime: Optional[str] = None) -> bool:
         return hour >= 19
     except Exception:
         return False
+
+
+BOARD_LOCK_PATH = Path("/home/workdir/artifacts/board_locks.csv")
+
+
+def _parse_kickoff_ts(kickoff: str, gameday: str = "", gametime: str = "") -> Optional[pd.Timestamp]:
+    """Best-effort kickoff timestamp in local-naive ET-ish for started checks."""
+    try:
+        if kickoff:
+            # e.g. 2026-09-14 13:00 ET
+            cleaned = str(kickoff).replace(" ET", "").replace("ET", "").strip()
+            ts = pd.to_datetime(cleaned, errors="coerce")
+            if pd.notna(ts):
+                return ts
+        if gameday:
+            gt = str(gametime or "13:00")
+            ts = pd.to_datetime(f"{str(gameday)[:10]} {gt}", errors="coerce")
+            if pd.notna(ts):
+                return ts
+    except Exception:
+        pass
+    return None
+
+
+def game_has_started(kickoff: str = "", gameday: str = "", gametime: str = "", commence_raw: str = "") -> bool:
+    """True when kickoff is in the past (game underway or final)."""
+    try:
+        now = pd.Timestamp.now()
+        ts = _parse_kickoff_ts(kickoff, gameday, gametime)
+        if ts is None and commence_raw:
+            ts = pd.to_datetime(commence_raw, utc=True, errors="coerce")
+            if pd.notna(ts):
+                try:
+                    ts = ts.tz_convert(None) - pd.Timedelta(hours=4)
+                except Exception:
+                    ts = ts.tz_localize(None) if getattr(ts, "tzinfo", None) else ts
+        if ts is None or pd.isna(ts):
+            return False
+        return now >= ts
+    except Exception:
+        return False
+
+
+def _load_board_locks() -> Dict[str, Dict]:
+    if "board_locks" in st.session_state and isinstance(st.session_state.get("board_locks"), dict):
+        return st.session_state["board_locks"]
+    locks = {}
+    try:
+        if BOARD_LOCK_PATH.exists():
+            df = pd.read_csv(BOARD_LOCK_PATH)
+            for _, r in df.iterrows():
+                key = str(r.get("key") or "")
+                if key:
+                    locks[key] = r.to_dict()
+    except Exception:
+        pass
+    st.session_state["board_locks"] = locks
+    return locks
+
+
+def _save_board_locks(locks: Dict[str, Dict]) -> None:
+    st.session_state["board_locks"] = locks
+    try:
+        pd.DataFrame(list(locks.values())).to_csv(BOARD_LOCK_PATH, index=False)
+    except Exception:
+        pass
+
+
+def board_lock_key(week, away, home, gameday) -> str:
+    return f"{week}_{away}_{home}_{str(gameday)[:10]}"
+
+
+def freeze_or_update_board_row(row: Dict, started: bool) -> Dict:
+    """
+    Before kickoff: keep refreshing the live row and store as lock snapshot.
+    After kickoff: return the frozen snapshot so the Full board stops updating.
+    """
+    key = board_lock_key(row.get("Week"), row.get("_away"), row.get("_home"), row.get("Kickoff") or row.get("_gameday"))
+    locks = _load_board_locks()
+    if started:
+        if key in locks:
+            frozen = dict(locks[key])
+            # Ensure display fields present
+            frozen.setdefault("Game", row.get("Game"))
+            return frozen
+        # No prior snapshot — lock current values as-is
+        snap = dict(row)
+        snap["key"] = key
+        snap["_locked"] = True
+        locks[key] = snap
+        _save_board_locks(locks)
+        return snap
+    # Pre-game: update snapshot with latest live values
+    snap = dict(row)
+    snap["key"] = key
+    snap["_locked"] = False
+    locks[key] = snap
+    _save_board_locks(locks)
+    return row
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -3051,7 +3194,21 @@ with tab1:
                     "_total": avg_total,
                     "_home": home,
                     "_away": away,
+                    "_gameday": game_date,
                 })
+                # Lock Full-board values at kickoff — no live updates after game starts
+                started = game_has_started(
+                    kickoff=str(commence or ""),
+                    gameday=str(game_date or ""),
+                    gametime=str(g.get("gametime") or ""),
+                    commence_raw=str(commence_raw or ""),
+                )
+                row_final = freeze_or_update_board_row(opportunities[-1], started)
+                if started:
+                    opportunities[-1] = row_final
+                    opportunities[-1]["_locked"] = True
+                else:
+                    opportunities[-1]["_locked"] = False
             except Exception as e:
                 skipped.append(f"Error: {e}")
                 continue
@@ -3171,6 +3328,7 @@ with tab1:
             display_df = filtered.drop(columns=["_Week_num"] + helper_cols, errors="ignore")
             # Color-ish confidence sort already by score
             st.markdown("##### Full board")
+            st.caption("Values lock at kickoff — lines, scores, and signals stop updating once a game starts.")
             st.dataframe(display_df, use_container_width=True, hide_index=True)
 
             # ---- TOP 5 SIGNALED GAMES BY WEEK ----
@@ -3256,13 +3414,17 @@ with tab2:
 
     # Build display rows DIRECTLY from embedded schedule (never drop matchups)
     today = pd.Timestamp.now().normalize()
+    # Prefer showing from ~2 days ago forward; if that yields nothing (date skew), show full slate
     rows = []
+    embed_errors = 0
     for row in EMBEDDED_2026_SCHEDULE:
         try:
             gameday = row["gameday"]
             gd = pd.to_datetime(gameday, errors="coerce")
-            # Show all remaining 2026 REG games (full season weeks 1-18)
-            if pd.isna(gd) or gd < today - pd.Timedelta(days=2):
+            if pd.isna(gd):
+                continue
+            # Soft filter: hide games more than 2 days in the past
+            if gd < today - pd.Timedelta(days=2):
                 continue
             home = row["home"]
             away = row["away"]
@@ -3330,7 +3492,55 @@ with tab2:
                 "Roof": str(row.get("roof") or "outdoors").title(),
             })
         except Exception:
+            embed_errors += 1
             continue
+
+    # Fallback: if date filter emptied the board, show the full embedded slate
+    if not rows and EMBEDDED_2026_SCHEDULE:
+        for row in EMBEDDED_2026_SCHEDULE:
+            try:
+                gameday = row["gameday"]
+                home = row["home"]
+                away = row["away"]
+                week = int(row["week"])
+                gametime = row.get("gametime") or "13:00"
+                kickoff = format_schedule_kickoff(gameday, gametime)
+                avg_spread = avg_total = None
+                if odds_data:
+                    for ev in odds_data:
+                        h = to_abbr(ev.get("home_team", ""))
+                        a = to_abbr(ev.get("away_team", ""))
+                        if h == home and a == away:
+                            s, t = _extract_odds_lines(ev, home)
+                            avg_spread, avg_total = s, t
+                            break
+                line_key = f"{week}_{away}_{home}_{gameday}"
+                try:
+                    line_info = track_open_lines(line_key, avg_spread, avg_total)
+                except Exception:
+                    line_info = {}
+                open_s, open_t = line_info.get("open_spread"), line_info.get("open_total")
+                cur_s, cur_t = line_info.get("cur_spread"), line_info.get("cur_total")
+                s_move, t_move = line_info.get("spread_move"), line_info.get("total_move")
+                rows.append({
+                    "Week": week,
+                    "Away": full_name(away),
+                    "Home": full_name(home),
+                    "Kickoff": kickoff,
+                    "Open Spread": f"{open_s:+.1f}" if open_s is not None else "—",
+                    "Curr Spread": f"{cur_s:+.1f}" if cur_s is not None else "—",
+                    "Spread Move": f"{s_move:+.1f}" if s_move is not None else "—",
+                    "Open Total": f"{open_t:.1f}" if open_t is not None else "—",
+                    "Curr Total": f"{cur_t:.1f}" if cur_t is not None else "—",
+                    "Total Move": f"{t_move:+.1f}" if t_move is not None else "—",
+                    "Home Imp": "—",
+                    "Away Imp": "—",
+                    "Divisional": "Yes" if is_divisional(home, away) else "No",
+                    "Roof": str(row.get("roof") or "outdoors").title(),
+                })
+            except Exception:
+                embed_errors += 1
+                continue
 
     if rows:
         games_df = pd.DataFrame(rows)
@@ -3394,7 +3604,11 @@ with tab2:
                 f"PHI @ CHI: {'✅' if has_phichi else '❌'}"
             )
     else:
-        st.warning("No upcoming games in the embedded schedule window.")
+        st.warning(
+            "No games found in the embedded schedule window. "
+            f"Embedded rows: {len(EMBEDDED_2026_SCHEDULE)} · filter errors: {embed_errors}. "
+            "Try Clear all caches or confirm EMBEDDED_2026_SCHEDULE is present in app.py."
+        )
 
 
 with tab3:
