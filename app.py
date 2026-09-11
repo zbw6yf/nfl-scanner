@@ -3593,170 +3593,185 @@ with tab1:
 with tab2:
     st.subheader("Upcoming Games (full schedule)")
     st.caption(
-        "Complete official slate from the embedded 2026 schedule. "
-        "Open = market open from historical odds when available (else first tracked line). Curr = live. Move = Curr − Open."
+        "Official slate with open / current lines. "
+        "Open = historical market snapshot when available (else first tracked line). "
+        "Curr = live Odds API. Move = Curr − Open."
     )
 
-    # One-time reset: unlock SF @ LA 2026-09-10 so pre-kickoff snapshot can be restored on Game Signals
-    if not st.session_state.get("_reset_sf_la_lock"):
-        try:
-            n = clear_board_lock_for_game("SF", "LA", "2026-09-10")
-            st.session_state["_reset_sf_la_lock"] = True
-            if n:
-                st.caption(f"Reset board lock for 49ers @ Rams ({n} entries) so pre-kickoff values can apply.")
-        except Exception:
-            st.session_state["_reset_sf_la_lock"] = True
-
-    # Ensure odds are available even if Game Signals tab had no key/fetch
+    # ---- Odds (always try to load on this tab) ----
+    local_odds = None
+    local_odds_status = "No API key"
     try:
         if api_key:
-            # Always refresh current lines on this tab so Curr Spread/Total populate
-            _od, _os = fetch_nfl_odds(api_key)
-            if _od:
-                odds_data = _od
-                odds_status = _os
+            local_odds, local_odds_status = fetch_nfl_odds(api_key)
+            if local_odds:
                 stamp_now("odds")
-    except Exception:
-        pass
+    except Exception as e:
+        local_odds_status = f"Odds fetch error: {e}"
+    if not local_odds:
+        try:
+            local_odds = odds_data  # from Game Signals load if present
+        except Exception:
+            local_odds = None
 
-    # Build display rows DIRECTLY from embedded schedule (never drop matchups)
+    # Optional: one historical snapshot (~5 days ago) for opens
+    hist_snapshot = None
+    try:
+        if api_key:
+            snap_day = (pd.Timestamp.now().normalize() - pd.Timedelta(days=5)).strftime("%Y-%m-%dT17:00:00Z")
+            hist_snapshot = fetch_historical_nfl_odds(api_key, snap_day)
+    except Exception:
+        hist_snapshot = None
+
+    def _lines_for_game(home: str, away: str, gameday: str):
+        """Return open/curr spread & total for a matchup."""
+        cur_s = cur_t = open_s = open_t = None
+        # Current from live odds
+        try:
+            if local_odds:
+                ev = find_odds_event(local_odds, home, away)
+                if ev:
+                    cur_s, cur_t = _extract_odds_lines(ev, home)
+        except Exception:
+            pass
+        # Open from historical snapshot
+        try:
+            if hist_snapshot:
+                evh = find_odds_event(hist_snapshot, home, away)
+                if evh:
+                    open_s, open_t = _extract_odds_lines(evh, home)
+        except Exception:
+            pass
+        # Schedule lines fallback for current
+        try:
+            if (cur_s is None or cur_t is None) and schedules is not None and not getattr(schedules, "empty", True):
+                sm = schedules.copy()
+                if "home_team" in sm.columns:
+                    sm = sm[
+                        (sm["home_team"].astype(str).str.upper() == str(home).upper())
+                        & (sm["away_team"].astype(str).str.upper() == str(away).upper())
+                    ]
+                    if "gameday" in sm.columns and gameday:
+                        sm2 = sm[sm["gameday"].astype(str).str[:10] == str(gameday)[:10]]
+                        if not sm2.empty:
+                            sm = sm2
+                    if not sm.empty:
+                        r0 = sm.iloc[0]
+                        if cur_s is None and pd.notna(r0.get("spread_line")):
+                            cur_s = float(r0["spread_line"])
+                        if cur_t is None and pd.notna(r0.get("total_line")):
+                            cur_t = float(r0["total_line"])
+        except Exception:
+            pass
+        # Tracked open / merge
+        try:
+            info = resolve_open_lines(api_key or "", home, away, gameday, cur_s, cur_t)
+            if open_s is None:
+                open_s = info.get("open_spread")
+            if open_t is None:
+                open_t = info.get("open_total")
+            if cur_s is None:
+                cur_s = info.get("cur_spread")
+            if cur_t is None:
+                cur_t = info.get("cur_total")
+        except Exception:
+            try:
+                info = track_open_lines(f"{away}_{home}_{str(gameday)[:10]}", cur_s, cur_t)
+                if open_s is None:
+                    open_s = info.get("open_spread")
+                if open_t is None:
+                    open_t = info.get("open_total")
+                if cur_s is None:
+                    cur_s = info.get("cur_spread")
+                if cur_t is None:
+                    cur_t = info.get("cur_total")
+            except Exception:
+                pass
+        if cur_s is None and open_s is not None:
+            cur_s = open_s
+        if cur_t is None and open_t is not None:
+            cur_t = open_t
+        s_move = (float(cur_s) - float(open_s)) if (cur_s is not None and open_s is not None) else None
+        t_move = (float(cur_t) - float(open_t)) if (cur_t is not None and open_t is not None) else None
+        return open_s, open_t, cur_s, cur_t, s_move, t_move
+
     today = pd.Timestamp.now().normalize()
-    # Prefer showing from ~2 days ago forward; if that yields nothing (date skew), show full slate
     rows = []
-    embed_errors = 0
     for row in EMBEDDED_2026_SCHEDULE:
         try:
-            gameday = row["gameday"]
+            gameday = row.get("gameday")
             gd = pd.to_datetime(gameday, errors="coerce")
             if pd.isna(gd):
                 continue
-            # Soft filter: hide games more than 2 days in the past
-            if gd < today - pd.Timedelta(days=2):
+            # Keep recent + future games (hide older than 3 days)
+            if gd < today - pd.Timedelta(days=3):
                 continue
-            home = row["home"]
-            away = row["away"]
-            week = int(row["week"])
+            home = str(row.get("home") or "").upper()
+            away = str(row.get("away") or "").upper()
+            week = int(row.get("week") or 0)
             gametime = row.get("gametime") or "13:00"
             kickoff = format_schedule_kickoff(gameday, gametime)
-
-            # Overlay odds: upcoming list → Odds API match → schedule lines
-            avg_spread = avg_total = None
-            match = next(
-                (
-                    g for g in (upcoming or [])
-                    if _normalize_team_abbr(str(g.get("home") or "")) == _normalize_team_abbr(home)
-                    and _normalize_team_abbr(str(g.get("away") or "")) == _normalize_team_abbr(away)
-                    and (g.get("week") is None or int(g.get("week") or 0) == week)
-                ),
-                None,
-            )
-            if match:
-                avg_spread = match.get("avg_spread")
-                avg_total = match.get("avg_total")
-            if (avg_spread is None or avg_total is None) and odds_data:
-                ev = find_odds_event(odds_data, home, away)
-                if ev:
-                    s, t = _extract_odds_lines(ev, home)
-                    if avg_spread is None:
-                        avg_spread = s
-                    if avg_total is None:
-                        avg_total = t
-            # Historical/schedule closing-ish lines as last resort
-            if (avg_spread is None or avg_total is None) and schedules is not None and not getattr(schedules, "empty", True):
-                try:
-                    sm = schedules[
-                        (schedules["home_team"].astype(str).str.upper() == home)
-                        & (schedules["away_team"].astype(str).str.upper() == away)
-                    ]
-                    if "gameday" in sm.columns:
-                        sm = sm[sm["gameday"].astype(str).str[:10] == str(gameday)[:10]]
-                    if not sm.empty:
-                        r0 = sm.iloc[0]
-                        if avg_spread is None and pd.notna(r0.get("spread_line")):
-                            avg_spread = float(r0["spread_line"])
-                        if avg_total is None and pd.notna(r0.get("total_line")):
-                            avg_total = float(r0["total_line"])
-                except Exception:
-                    pass
-
-            # True open (historical API when available) + current live lines
-            line_info = resolve_open_lines(
-                api_key or "",
-                home,
-                away,
-                gameday,
-                avg_spread,
-                avg_total,
-            )
-            open_s = line_info.get("open_spread")
-            open_t = line_info.get("open_total")
-            cur_s = line_info.get("cur_spread")
-            cur_t = line_info.get("cur_total")
-            s_move = line_info.get("spread_move")
-            t_move = line_info.get("total_move")
-
-            spread = f"{cur_s:+.1f}" if cur_s is not None else "—"
-            total = f"{cur_t:.1f}" if cur_t is not None else "—"
-            open_spread = f"{open_s:+.1f}" if open_s is not None else "—"
-            open_total = f"{open_t:.1f}" if open_t is not None else "—"
-            spread_move = f"{s_move:+.1f}" if s_move is not None else "—"
-            total_move = f"{t_move:+.1f}" if t_move is not None else "—"
+            open_s, open_t, cur_s, cur_t, s_move, t_move = _lines_for_game(home, away, gameday)
 
             imp_h = imp_a = "—"
             if cur_s is not None and cur_t is not None:
                 try:
-                    ih, ia = implied_team_totals(cur_s, cur_t)
+                    ih, ia = implied_team_totals(float(cur_s), float(cur_t))
                     imp_h, imp_a = f"{ih:.1f}", f"{ia:.1f}"
                 except Exception:
                     pass
+
             rows.append({
                 "Week": week,
                 "Away": full_name(away),
                 "Home": full_name(home),
                 "Kickoff": kickoff,
-                "Open Spread": open_spread,
-                "Curr Spread": spread,
-                "Spread Move": spread_move,
-                "Open Total": open_total,
-                "Curr Total": total,
-                "Total Move": total_move,
+                "Open Spread": f"{open_s:+.1f}" if open_s is not None else "—",
+                "Curr Spread": f"{cur_s:+.1f}" if cur_s is not None else "—",
+                "Spread Move": f"{s_move:+.1f}" if s_move is not None else "—",
+                "Open Total": f"{open_t:.1f}" if open_t is not None else "—",
+                "Curr Total": f"{cur_t:.1f}" if cur_t is not None else "—",
+                "Total Move": f"{t_move:+.1f}" if t_move is not None else "—",
                 "Home Imp": imp_h,
                 "Away Imp": imp_a,
                 "Divisional": "Yes" if is_divisional(home, away) else "No",
                 "Roof": str(row.get("roof") or "outdoors").title(),
             })
         except Exception:
-            embed_errors += 1
-            continue
+            # Still try to show the game shell without lines
+            try:
+                rows.append({
+                    "Week": int(row.get("week") or 0),
+                    "Away": full_name(str(row.get("away") or "")),
+                    "Home": full_name(str(row.get("home") or "")),
+                    "Kickoff": format_schedule_kickoff(row.get("gameday"), row.get("gametime") or "13:00"),
+                    "Open Spread": "—",
+                    "Curr Spread": "—",
+                    "Spread Move": "—",
+                    "Open Total": "—",
+                    "Curr Total": "—",
+                    "Total Move": "—",
+                    "Home Imp": "—",
+                    "Away Imp": "—",
+                    "Divisional": "Yes" if is_divisional(str(row.get("home")), str(row.get("away"))) else "No",
+                    "Roof": str(row.get("roof") or "outdoors").title(),
+                })
+            except Exception:
+                continue
 
-    # Fallback: if date filter emptied the board, show the full embedded slate
-    if not rows and EMBEDDED_2026_SCHEDULE:
+    # Absolute fallback: full slate with no date filter
+    if not rows:
         for row in EMBEDDED_2026_SCHEDULE:
             try:
-                gameday = row["gameday"]
-                home = row["home"]
-                away = row["away"]
-                week = int(row["week"])
-                gametime = row.get("gametime") or "13:00"
-                kickoff = format_schedule_kickoff(gameday, gametime)
-                avg_spread = avg_total = None
-                if odds_data:
-                    ev = find_odds_event(odds_data, home, away)
-                    if ev:
-                        avg_spread, avg_total = _extract_odds_lines(ev, home)
-                line_key = f"{week}_{away}_{home}_{gameday}"
-                try:
-                    line_info = track_open_lines(line_key, avg_spread, avg_total)
-                except Exception:
-                    line_info = {}
-                open_s, open_t = line_info.get("open_spread"), line_info.get("open_total")
-                cur_s, cur_t = line_info.get("cur_spread"), line_info.get("cur_total")
-                s_move, t_move = line_info.get("spread_move"), line_info.get("total_move")
+                home = str(row.get("home") or "").upper()
+                away = str(row.get("away") or "").upper()
+                gameday = row.get("gameday")
+                open_s, open_t, cur_s, cur_t, s_move, t_move = _lines_for_game(home, away, gameday)
                 rows.append({
-                    "Week": week,
+                    "Week": int(row.get("week") or 0),
                     "Away": full_name(away),
                     "Home": full_name(home),
-                    "Kickoff": kickoff,
+                    "Kickoff": format_schedule_kickoff(gameday, row.get("gametime") or "13:00"),
                     "Open Spread": f"{open_s:+.1f}" if open_s is not None else "—",
                     "Curr Spread": f"{cur_s:+.1f}" if cur_s is not None else "—",
                     "Spread Move": f"{s_move:+.1f}" if s_move is not None else "—",
@@ -3769,17 +3784,16 @@ with tab2:
                     "Roof": str(row.get("roof") or "outdoors").title(),
                 })
             except Exception:
-                embed_errors += 1
                 continue
+
+    st.caption(f"Odds status: {local_odds_status} · Events: {0 if not local_odds else len(local_odds)}")
 
     if rows:
         games_df = pd.DataFrame(rows)
-        # Always offer every week that exists in the official embedded slate
-        all_embed_weeks = sorted({int(r["week"]) for r in EMBEDDED_2026_SCHEDULE})
-        weeks_in_view = sorted(games_df["Week"].dropna().unique().tolist())
+        all_weeks = sorted({int(r["week"]) for r in EMBEDDED_2026_SCHEDULE})
         week_filter = st.selectbox(
             "Filter by week",
-            options=["All weeks"] + [f"Week {int(w)}" for w in all_embed_weeks],
+            options=["All weeks"] + [f"Week {int(w)}" for w in all_weeks],
             key="tab2_week_filter",
         )
         display = games_df
@@ -3787,47 +3801,20 @@ with tab2:
             try:
                 wk = int(week_filter.replace("Week ", ""))
                 display = games_df[games_df["Week"] == wk].copy()
-                # If anything missing for this week, rebuild purely from embed
-                expected = [r for r in EMBEDDED_2026_SCHEDULE if int(r["week"]) == wk]
-                if len(display) < len(expected):
-                    rebuilt = []
-                    for r in expected:
-                        home, away = r["home"], r["away"]
-                        kickoff = format_schedule_kickoff(r["gameday"], r.get("gametime") or "13:00")
-                        existing = display[
-                            (display["Home"] == full_name(home)) & (display["Away"] == full_name(away))
-                        ] if not display.empty else display
-                        if not existing.empty:
-                            rebuilt.append(existing.iloc[0].to_dict())
-                        else:
-                            rebuilt.append({
-                                "Week": wk,
-                                "Away": full_name(away),
-                                "Home": full_name(home),
-                                "Kickoff": kickoff,
-                                "Open Spread": "—",
-                                "Curr Spread": "—",
-                                "Spread Move": "—",
-                                "Open Total": "—",
-                                "Curr Total": "—",
-                                "Total Move": "—",
-                                "Home Imp": "—",
-                                "Away Imp": "—",
-                                "Divisional": "Yes" if is_divisional(home, away) else "No",
-                                "Roof": str(r.get("roof") or "outdoors").title(),
-                            })
-                    display = pd.DataFrame(rebuilt)
             except Exception:
                 pass
         st.dataframe(display, use_container_width=True, hide_index=True)
-        counts = games_df.groupby("Week").size().sort_index()
-        count_str = " · ".join([f"W{int(w)}:{int(n)}" for w, n in counts.items()])
-        st.caption(f"{len(display)} games shown · Full slate counts: {count_str}")
+        lined = display[
+            (display["Curr Spread"].astype(str) != "—") | (display["Curr Total"].astype(str) != "—")
+        ] if not display.empty else display
+        st.caption(
+            f"{len(display)} games shown · {len(lined)} with at least one live/open line. "
+            "Enter a valid Odds API key in the sidebar if Curr Spread/Total are blank."
+        )
     else:
-        st.warning(
-            "No games found in the embedded schedule window. "
-            f"Embedded rows: {len(EMBEDDED_2026_SCHEDULE)} · filter errors: {embed_errors}. "
-            "Try Clear all caches or confirm EMBEDDED_2026_SCHEDULE is present in app.py."
+        st.error(
+            f"No games could be built from the embedded schedule "
+            f"(len={len(EMBEDDED_2026_SCHEDULE)}). Redeploy app.py with EMBEDDED_2026_SCHEDULE intact."
         )
 
 
