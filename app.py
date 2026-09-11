@@ -1198,6 +1198,195 @@ def _save_bet_log(df: pd.DataFrame) -> None:
         pass
 
 
+SIGNAL_HISTORY_PATH = Path("/home/workdir/artifacts/signal_history.csv")
+
+
+def _load_signal_history() -> pd.DataFrame:
+    cols = [
+        "id", "logged_at", "week", "game", "home", "away", "kickoff",
+        "recommendation", "confidence", "score", "spread", "total",
+        "result", "correct", "graded_at",
+    ]
+    if "signal_history_df" in st.session_state and isinstance(st.session_state.get("signal_history_df"), pd.DataFrame):
+        return st.session_state["signal_history_df"]
+    try:
+        if SIGNAL_HISTORY_PATH.exists():
+            df = pd.read_csv(SIGNAL_HISTORY_PATH)
+            st.session_state["signal_history_df"] = df
+            return df
+    except Exception:
+        pass
+    df = pd.DataFrame(columns=cols)
+    st.session_state["signal_history_df"] = df
+    return df
+
+
+def _save_signal_history(df: pd.DataFrame) -> None:
+    st.session_state["signal_history_df"] = df
+    try:
+        df.to_csv(SIGNAL_HISTORY_PATH, index=False)
+    except Exception:
+        pass
+
+
+def _upsert_signals_from_opportunities(opps: list) -> None:
+    """Add new Game Signals rows to history (skip duplicates by week+game+recommendation)."""
+    if not opps:
+        return
+    hist = _load_signal_history()
+    existing = set()
+    if not hist.empty:
+        for _, r in hist.iterrows():
+            existing.add((str(r.get("week")), str(r.get("game")), str(r.get("recommendation"))))
+    new_rows = []
+    import uuid
+    for o in opps:
+        game = str(o.get("Game", ""))
+        rec = str(o.get("Recommendation", ""))
+        week = str(o.get("Week", ""))
+        key = (week, game, rec)
+        if key in existing:
+            continue
+        if rec in ("", "—", "None"):
+            continue
+        new_rows.append({
+            "id": str(uuid.uuid4())[:8],
+            "logged_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "week": o.get("Week"),
+            "game": game,
+            "home": o.get("_home"),
+            "away": o.get("_away"),
+            "kickoff": o.get("Kickoff"),
+            "recommendation": rec,
+            "confidence": o.get("Confidence"),
+            "score": o.get("Score"),
+            "spread": o.get("_spread") if o.get("_spread") is not None else o.get("Spread"),
+            "total": o.get("_total") if o.get("_total") is not None else o.get("Total"),
+            "result": "Pending",
+            "correct": None,
+            "graded_at": None,
+        })
+        existing.add(key)
+    if new_rows:
+        hist = pd.concat([hist, pd.DataFrame(new_rows)], ignore_index=True)
+        _save_signal_history(hist)
+
+
+def _grade_signal_history(schedules: pd.DataFrame) -> pd.DataFrame:
+    """Grade pending signals against completed schedule results."""
+    hist = _load_signal_history()
+    if hist.empty or schedules is None or getattr(schedules, "empty", True):
+        return hist
+    s = schedules.copy()
+    if "gameday" not in s.columns:
+        return hist
+    s["_gd"] = pd.to_datetime(s["gameday"], errors="coerce")
+    changed = False
+    for idx, row in hist.iterrows():
+        if str(row.get("result") or "") not in ("Pending", "nan", "None", ""):
+            if row.get("result") not in (None, "Pending"):
+                continue
+        home = row.get("home")
+        away = row.get("away")
+        if not home or not away or home is None or away is None or str(home) == "nan":
+            # try parse from game string "Away @ Home"
+            game = str(row.get("game") or "")
+            if " @ " in game:
+                # full names - skip team match via schedule names
+                pass
+            continue
+        try:
+            home = str(home).upper()
+            away = str(away).upper()
+        except Exception:
+            continue
+        mask = (
+            (s.get("home_team", pd.Series(dtype=str)).astype(str).str.upper() == home)
+            & (s.get("away_team", pd.Series(dtype=str)).astype(str).str.upper() == away)
+        )
+        if "result" in s.columns:
+            mask = mask & s["result"].notna()
+        matches = s.loc[mask]
+        if matches.empty:
+            continue
+        m = matches.sort_values("_gd").iloc[-1]
+        try:
+            margin = float(m["result"])  # home - away score differential
+        except Exception:
+            continue
+        if pd.isna(margin):
+            continue
+        home_score = m.get("home_score")
+        away_score = m.get("away_score")
+        try:
+            total_pts = float(home_score) + float(away_score) if pd.notna(home_score) and pd.notna(away_score) else None
+        except Exception:
+            total_pts = None
+
+        rec = str(row.get("recommendation") or "")
+        spread = row.get("spread")
+        total_line = row.get("total")
+        try:
+            if spread is not None and str(spread) not in ("—", "nan", "None", ""):
+                spread = float(str(spread).replace("+", ""))
+            else:
+                spread = float(m["spread_line"]) if pd.notna(m.get("spread_line")) else None
+        except Exception:
+            spread = None
+        try:
+            if total_line is not None and str(total_line) not in ("—", "nan", "None", ""):
+                total_line = float(str(total_line).replace("+", ""))
+            else:
+                total_line = float(m["total_line"]) if pd.notna(m.get("total_line")) else None
+        except Exception:
+            total_line = None
+
+        outcome = None  # True=correct, False=incorrect, None=push/unknown
+        if rec == "Lean Home ATS" and spread is not None:
+            # home covers if margin > spread (spread is home line, e.g. -3)
+            if margin == spread:
+                outcome = None  # push
+                hist.at[idx, "result"] = "Push"
+            else:
+                outcome = margin > spread
+                hist.at[idx, "result"] = "Correct" if outcome else "Incorrect"
+        elif rec == "Lean Away ATS" and spread is not None:
+            if margin == spread:
+                outcome = None
+                hist.at[idx, "result"] = "Push"
+            else:
+                outcome = margin < spread
+                hist.at[idx, "result"] = "Correct" if outcome else "Incorrect"
+        elif rec == "Lean Over" and total_line is not None and total_pts is not None:
+            if total_pts == total_line:
+                hist.at[idx, "result"] = "Push"
+                outcome = None
+            else:
+                outcome = total_pts > total_line
+                hist.at[idx, "result"] = "Correct" if outcome else "Incorrect"
+        elif rec == "Lean Under" and total_line is not None and total_pts is not None:
+            if total_pts == total_line:
+                hist.at[idx, "result"] = "Push"
+                outcome = None
+            else:
+                outcome = total_pts < total_line
+                hist.at[idx, "result"] = "Correct" if outcome else "Incorrect"
+        elif rec == "No strong lean":
+            hist.at[idx, "result"] = "N/A"
+            outcome = None
+        else:
+            continue
+
+        hist.at[idx, "correct"] = outcome if outcome is not None else None
+        hist.at[idx, "graded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        changed = True
+
+    if changed:
+        _save_signal_history(hist)
+    return hist
+
+
+
 def _strip_html(s: str) -> str:
     s = re.sub(r"<[^>]+>", "", s or "")
     s = re.sub(r"\s+", " ", s).strip()
@@ -2149,9 +2338,10 @@ def monte_carlo_game(
 # -----------------------------
 # TABS
 # -----------------------------
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "🎯 Opportunities",
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    "🎯 Game Signals",
     "📅 Games & Odds",
+    "🎯 Player Props",
     "🌤️ Weather",
     "🏥 Injury Report",
     "📋 Depth Charts",
@@ -2160,7 +2350,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 ])
 # ========== TAB 1 ==========
 with tab1:
-    st.subheader("Ranked Opportunities")
+    st.subheader("Game Signals")
     with st.spinner("Loading EPA, Pace, Form, Schedule, Odds and unique weather..."):
         team_epa = get_team_epa()
         team_pace = get_team_pace()
@@ -2407,6 +2597,10 @@ with tab1:
                 skipped.append(f"Error: {e}")
                 continue
         if opportunities:
+            try:
+                _upsert_signals_from_opportunities(opportunities)
+            except Exception:
+                pass
             df = pd.DataFrame(opportunities).sort_values("Score", ascending=False)
 
             # ---- FILTER CONTROLS ----
@@ -2722,6 +2916,46 @@ with tab2:
 
 
 with tab3:
+    st.subheader("Player Props")
+
+
+
+    if not api_key:
+        st.warning("Enter API key first.")
+    elif not odds_data:
+        st.info("No games with live odds available.")
+    else:
+        options = {f"{g.get('away_team')} @ {g.get('home_team')}": g.get("id") for g in odds_data}
+        selected = st.selectbox("Select game", list(options.keys()))
+        if st.button("Load Player Props", type="primary"):
+            with st.spinner("Fetching..."):
+                props = fetch_player_props(api_key, options[selected])
+            if not props:
+                st.error("Failed to fetch")
+            elif "error" in props:
+                st.error(props.get("error"))
+                st.caption("Player props usually require a paid plan.")
+            else:
+                rows = []
+                for book in props.get("bookmakers", []):
+                    for market in book.get("markets", []):
+                        for o in market.get("outcomes", []):
+                            rows.append({
+                                "Book": book.get("title"),
+                                "Market": (market.get("key") or "").replace("player_", "").replace("_", " ").title(),
+                                "Player": o.get("description") or o.get("name"),
+                                "Side": o.get("name"),
+                                "Line": o.get("point"),
+                                "Odds": o.get("price")
+                            })
+                if rows:
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                else:
+                    st.warning("No props returned.")
+
+    # ========== TAB 4 ==========
+
+with tab4:
     st.subheader("Game Weather")
     st.caption(
         "Forecast at each outdoor stadium near kickoff (Open-Meteo). "
@@ -2786,10 +3020,10 @@ with tab3:
         st.dataframe(show, use_container_width=True, hide_index=True)
         st.caption(f"{len(show)} games shown")
     else:
-        st.info("No upcoming games / weather available yet. Load Opportunities first so weather is fetched.")
+        st.info("No upcoming games / weather available yet. Load Game Signals first so weather is fetched.")
 
 
-with tab4:
+with tab5:
     st.subheader("NFL Injury Report")
     st.caption(
         "Official report from [NFL.com/injuries](https://www.nfl.com/injuries/). "
@@ -2858,7 +3092,7 @@ with tab4:
             )
 
 
-with tab5:
+with tab6:
     st.subheader("Depth Charts")
     st.caption(
         "Current team depth charts from [Ourlads](https://www.ourlads.com/nfldepthcharts/). "
@@ -2907,7 +3141,7 @@ with tab5:
             st.caption(f"{len(show)} entries · source: Ourlads")
 
 
-with tab6:
+with tab7:
     st.subheader("Methodology")
     st.caption("How Score, Confidence, and Lean recommendations are produced. Research tool only — not betting advice.")
 
@@ -3002,56 +3236,109 @@ Over/under probabilities are taken from simulated totals vs the market line (wit
         """
     )
 
-with tab7:
+with tab8:
     st.subheader("Advanced")
     st.caption("Less frequently used tools — props, bankroll tracking, and historical backtests.")
     adv = st.radio(
         "Section",
-        options=["Player Props", "Bankroll & CLV", "Backtest"],
+        options=["Signal History", "Bankroll & CLV", "Backtest"],
         horizontal=True,
         key="advanced_section",
     )
     st.markdown("---")
-    if adv == "Player Props":
-        st.markdown("##### Player Props")
+    if adv == "Signal History":
+        st.markdown("##### Signal History")
+        st.caption(
+            "Tracks Game Signals recommendations and grades them when results are in. "
+            "Sorted by confidence. Record by grade (e.g. D: 0-1) counts Correct-Incorrect (pushes excluded)."
+        )
+        # Ensure we grade against schedule
+        try:
+            sched_for_grade = load_schedules()
+        except Exception:
+            sched_for_grade = pd.DataFrame()
+        hist = _grade_signal_history(sched_for_grade)
+        hist = _load_signal_history()
 
-
-
-        if not api_key:
-            st.warning("Enter API key first.")
-        elif not odds_data:
-            st.info("No games with live odds available.")
+        if hist is None or hist.empty:
+            st.info(
+                "No signals logged yet. Open **Game Signals** so recommendations are saved, "
+                "then return here after games complete to see graded results."
+            )
         else:
-            options = {f"{g.get('away_team')} @ {g.get('home_team')}": g.get("id") for g in odds_data}
-            selected = st.selectbox("Select game", list(options.keys()))
-            if st.button("Load Player Props", type="primary"):
-                with st.spinner("Fetching..."):
-                    props = fetch_player_props(api_key, options[selected])
-                if not props:
-                    st.error("Failed to fetch")
-                elif "error" in props:
-                    st.error(props.get("error"))
-                    st.caption("Player props usually require a paid plan.")
-                else:
-                    rows = []
-                    for book in props.get("bookmakers", []):
-                        for market in book.get("markets", []):
-                            for o in market.get("outcomes", []):
-                                rows.append({
-                                    "Book": book.get("title"),
-                                    "Market": (market.get("key") or "").replace("player_", "").replace("_", " ").title(),
-                                    "Player": o.get("description") or o.get("name"),
-                                    "Side": o.get("name"),
-                                    "Line": o.get("point"),
-                                    "Odds": o.get("price")
-                                })
-                    if rows:
-                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                    else:
-                        st.warning("No props returned.")
+            # Summary by confidence
+            graded = hist[hist["result"].isin(["Correct", "Incorrect"])].copy()
+            conf_order = ["A", "B", "C", "D", "F"]
+            summary_rows = []
+            if not graded.empty:
+                graded["confidence"] = graded["confidence"].astype(str).str.upper().str[:1]
+                for conf in conf_order:
+                    sub = graded[graded["confidence"] == conf]
+                    if sub.empty:
+                        continue
+                    wins = int((sub["result"] == "Correct").sum())
+                    losses = int((sub["result"] == "Incorrect").sum())
+                    total = wins + losses
+                    pct = f"{wins / total:.0%}" if total else "—"
+                    summary_rows.append({
+                        "Confidence": conf,
+                        "Record": f"{wins}-{losses}",
+                        "Win %": pct,
+                        "N": total,
+                    })
+                # overall
+                ow = int((graded["result"] == "Correct").sum())
+                ol = int((graded["result"] == "Incorrect").sum())
+                summary_rows.append({
+                    "Confidence": "ALL",
+                    "Record": f"{ow}-{ol}",
+                    "Win %": f"{ow / (ow + ol):.0%}" if (ow + ol) else "—",
+                    "N": ow + ol,
+                })
+            if summary_rows:
+                st.markdown("**Record by confidence**")
+                st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-    # ========== TAB 4 ==========
-
+            # Full table sorted by confidence then date
+            show = hist.copy()
+            conf_rank = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
+            show["_cr"] = show["confidence"].astype(str).str.upper().str[:1].map(lambda x: conf_rank.get(x, 9))
+            show = show.sort_values(["_cr", "week", "logged_at"], ascending=[True, True, False])
+            display_cols = [
+                c for c in [
+                    "confidence", "recommendation", "result", "week", "game", "kickoff",
+                    "score", "spread", "total", "logged_at", "graded_at",
+                ] if c in show.columns
+            ]
+            st.markdown("**All signals**")
+            st.dataframe(
+                show[display_cols].rename(columns={
+                    "confidence": "Confidence",
+                    "recommendation": "Recommendation",
+                    "result": "Result",
+                    "week": "Week",
+                    "game": "Game",
+                    "kickoff": "Kickoff",
+                    "score": "Score",
+                    "spread": "Spread",
+                    "total": "Total",
+                    "logged_at": "Logged",
+                    "graded_at": "Graded",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(f"{len(show)} signals · Pending rows grade automatically when final scores are available in the schedule.")
+            st.download_button(
+                "Download signal history CSV",
+                data=hist.to_csv(index=False),
+                file_name="signal_history.csv",
+                mime="text/csv",
+                key="signal_hist_dl",
+            )
+            if st.button("Clear signal history", key="signal_hist_clear"):
+                _save_signal_history(pd.DataFrame(columns=hist.columns))
+                st.rerun()
 
     elif adv == "Bankroll & CLV":
         st.markdown("##### Bankroll & Closing Line Value")
@@ -3107,7 +3394,7 @@ with tab7:
         st.markdown("---")
         st.markdown("##### Open & settled bets")
         if bet_df is None or bet_df.empty:
-            st.info("No bets logged yet. Add one above, or use Edge % from Opportunities to size spots.")
+            st.info("No bets logged yet. Add one above, or use Edge % from Game Signals to size spots.")
         else:
             st.dataframe(bet_df.drop(columns=["id"], errors="ignore"), use_container_width=True, hide_index=True)
 
