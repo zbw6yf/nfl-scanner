@@ -711,30 +711,66 @@ def _save_board_locks(locks: Dict[str, Dict]) -> None:
 
 
 def board_lock_key(week, away, home, gameday) -> str:
-    return f"{week}_{away}_{home}_{str(gameday)[:10]}"
+    gd = str(gameday or "")[:10]
+    return f"{week}_{str(away).upper()}_{str(home).upper()}_{gd}"
+
+
+def clear_board_lock_for_game(away: str, home: str, gameday: str = "") -> int:
+    """Remove lock entries for a matchup (optionally on a date). Returns count removed."""
+    locks = _load_board_locks()
+    away_u, home_u = str(away).upper(), str(home).upper()
+    gd = str(gameday or "")[:10]
+    remove = []
+    for k, v in locks.items():
+        ku = str(k).upper()
+        if f"_{away_u}_{home_u}_" in f"_{ku}_" or (
+            str(v.get("_away", "")).upper() == away_u and str(v.get("_home", "")).upper() == home_u
+        ):
+            if gd and gd not in str(k) and gd not in str(v.get("_gameday", "")) and gd not in str(v.get("Kickoff", "")):
+                continue
+            remove.append(k)
+    for k in remove:
+        locks.pop(k, None)
+    if remove:
+        _save_board_locks(locks)
+    return len(remove)
 
 
 def freeze_or_update_board_row(row: Dict, started: bool) -> Dict:
     """
     Before kickoff: keep refreshing the live row and store as lock snapshot.
-    After kickoff: return the frozen snapshot so the Full board stops updating.
+    After kickoff: return the frozen pre-kickoff snapshot (never overwrite once locked).
     """
-    key = board_lock_key(row.get("Week"), row.get("_away"), row.get("_home"), row.get("Kickoff") or row.get("_gameday"))
+    gd = row.get("_gameday") or str(row.get("Kickoff") or "")[:10]
+    key = board_lock_key(row.get("Week"), row.get("_away"), row.get("_home"), gd)
     locks = _load_board_locks()
+    existing = locks.get(key)
+
     if started:
-        if key in locks:
-            frozen = dict(locks[key])
-            # Ensure display fields present
+        # Prefer an existing pre-kickoff snapshot — never replace with live post-start data
+        if existing and existing.get("_locked"):
+            frozen = dict(existing)
             frozen.setdefault("Game", row.get("Game"))
             return frozen
-        # No prior snapshot — lock current values as-is
+        if existing and not existing.get("_locked"):
+            # Promote last pre-game snapshot to locked
+            snap = dict(existing)
+            snap["key"] = key
+            snap["_locked"] = True
+            locks[key] = snap
+            _save_board_locks(locks)
+            return snap
+        # No snapshot at all — lock current once (best effort)
         snap = dict(row)
         snap["key"] = key
         snap["_locked"] = True
         locks[key] = snap
         _save_board_locks(locks)
         return snap
-    # Pre-game: update snapshot with latest live values
+
+    # Pre-game only: refresh snapshot while unlocked
+    if existing and existing.get("_locked"):
+        return dict(existing)
     snap = dict(row)
     snap["key"] = key
     snap["_locked"] = False
@@ -2144,20 +2180,55 @@ def _extract_odds_lines(odds_ev, home_abbr: str):
     if not odds_ev:
         return None, None
     spreads, totals = [], []
-    home_full = odds_ev.get("home_team", full_name(home_abbr))
+    home_full = (odds_ev.get("home_team") or full_name(home_abbr) or "").strip()
+    home_abbr_n = _normalize_team_abbr(to_abbr(home_full) or home_abbr or "")
     for book in odds_ev.get("bookmakers", []) or []:
         for market in book.get("markets", []) or []:
             if market.get("key") == "spreads":
                 for o in market.get("outcomes", []) or []:
-                    if o.get("name") == home_full and o.get("point") is not None:
-                        spreads.append(o.get("point"))
+                    if o.get("point") is None:
+                        continue
+                    oname = (o.get("name") or "").strip()
+                    oabbr = _normalize_team_abbr(to_abbr(oname) or "")
+                    if oname == home_full or (oabbr and home_abbr_n and oabbr == home_abbr_n):
+                        spreads.append(float(o.get("point")))
             elif market.get("key") == "totals":
                 for o in market.get("outcomes", []) or []:
-                    if o.get("name") == "Over" and o.get("point") is not None:
-                        totals.append(o.get("point"))
+                    if (o.get("name") or "").lower() == "over" and o.get("point") is not None:
+                        totals.append(float(o.get("point")))
+    # Fallback: any spread outcome for home-ish name contains
+    if not spreads:
+        for book in odds_ev.get("bookmakers", []) or []:
+            for market in book.get("markets", []) or []:
+                if market.get("key") != "spreads":
+                    continue
+                outs = market.get("outcomes") or []
+                for o in outs:
+                    if o.get("point") is None:
+                        continue
+                    oname = (o.get("name") or "").lower()
+                    if home_full.lower() in oname or oname in home_full.lower():
+                        spreads.append(float(o.get("point")))
+                        break
+                if spreads:
+                    break
     avg_spread = float(np.mean(spreads)) if spreads else None
     avg_total = float(np.mean(totals)) if totals else None
     return avg_spread, avg_total
+
+
+def find_odds_event(odds_data, home: str, away: str):
+    """Match Odds API event to home/away abbrs (normalized)."""
+    if not odds_data:
+        return None
+    home_n = _normalize_team_abbr(home or "")
+    away_n = _normalize_team_abbr(away or "")
+    for ev in odds_data:
+        h = _normalize_team_abbr(to_abbr(ev.get("home_team", "")) or "")
+        a = _normalize_team_abbr(to_abbr(ev.get("away_team", "")) or "")
+        if h == home_n and a == away_n:
+            return ev
+    return None
 
 
 def build_upcoming_from_odds(odds_data, schedules: pd.DataFrame) -> List[Dict]:
@@ -3412,6 +3483,25 @@ with tab2:
         "Open lines are the first values seen by this app; Curr is live; Move = Curr − Open."
     )
 
+    # One-time reset: unlock SF @ LA 2026-09-10 so pre-kickoff snapshot can be restored on Game Signals
+    if not st.session_state.get("_reset_sf_la_lock"):
+        try:
+            n = clear_board_lock_for_game("SF", "LA", "2026-09-10")
+            st.session_state["_reset_sf_la_lock"] = True
+            if n:
+                st.caption(f"Reset board lock for 49ers @ Rams ({n} entries) so pre-kickoff values can apply.")
+        except Exception:
+            st.session_state["_reset_sf_la_lock"] = True
+
+    # Ensure odds are available even if Game Signals tab had no key/fetch
+    try:
+        if api_key and (not odds_data):
+            odds_data, odds_status = fetch_nfl_odds(api_key)
+            if odds_data:
+                stamp_now("odds")
+    except Exception:
+        pass
+
     # Build display rows DIRECTLY from embedded schedule (never drop matchups)
     today = pd.Timestamp.now().normalize()
     # Prefer showing from ~2 days ago forward; if that yields nothing (date skew), show full slate
@@ -3432,28 +3522,56 @@ with tab2:
             gametime = row.get("gametime") or "13:00"
             kickoff = format_schedule_kickoff(gameday, gametime)
 
-            # Overlay odds from upcoming list if present
+            # Overlay odds: upcoming list → Odds API match → schedule lines
             avg_spread = avg_total = None
             match = next(
-                (g for g in (upcoming or []) if g.get("home") == home and g.get("away") == away and g.get("week") == week),
+                (
+                    g for g in (upcoming or [])
+                    if _normalize_team_abbr(str(g.get("home") or "")) == _normalize_team_abbr(home)
+                    and _normalize_team_abbr(str(g.get("away") or "")) == _normalize_team_abbr(away)
+                    and (g.get("week") is None or int(g.get("week") or 0) == week)
+                ),
                 None,
             )
             if match:
                 avg_spread = match.get("avg_spread")
                 avg_total = match.get("avg_total")
-            elif odds_data:
-                # try odds API by team names
-                for ev in odds_data:
-                    h = to_abbr(ev.get("home_team", ""))
-                    a = to_abbr(ev.get("away_team", ""))
-                    if h == home and a == away:
-                        s, t = _extract_odds_lines(ev, home)
-                        avg_spread, avg_total = s, t
-                        break
+            if (avg_spread is None or avg_total is None) and odds_data:
+                ev = find_odds_event(odds_data, home, away)
+                if ev:
+                    s, t = _extract_odds_lines(ev, home)
+                    if avg_spread is None:
+                        avg_spread = s
+                    if avg_total is None:
+                        avg_total = t
+            # Historical/schedule closing-ish lines as last resort
+            if (avg_spread is None or avg_total is None) and schedules is not None and not getattr(schedules, "empty", True):
+                try:
+                    sm = schedules[
+                        (schedules["home_team"].astype(str).str.upper() == home)
+                        & (schedules["away_team"].astype(str).str.upper() == away)
+                    ]
+                    if "gameday" in sm.columns:
+                        sm = sm[sm["gameday"].astype(str).str[:10] == str(gameday)[:10]]
+                    if not sm.empty:
+                        r0 = sm.iloc[0]
+                        if avg_spread is None and pd.notna(r0.get("spread_line")):
+                            avg_spread = float(r0["spread_line"])
+                        if avg_total is None and pd.notna(r0.get("total_line")):
+                            avg_total = float(r0["total_line"])
+                except Exception:
+                    pass
 
-            # Track open vs current lines
+            # Track open vs current lines (also surfaces last-known if live odds drop after kickoff)
             line_key = f"{week}_{away}_{home}_{gameday}"
             line_info = track_open_lines(line_key, avg_spread, avg_total)
+            # If live odds missing but we have stored open, show open as current fallback
+            if line_info.get("cur_spread") is None and line_info.get("open_spread") is not None:
+                line_info["cur_spread"] = line_info.get("open_spread")
+                line_info["spread_move"] = 0.0
+            if line_info.get("cur_total") is None and line_info.get("open_total") is not None:
+                line_info["cur_total"] = line_info.get("open_total")
+                line_info["total_move"] = 0.0
             open_s = line_info.get("open_spread")
             open_t = line_info.get("open_total")
             cur_s = line_info.get("cur_spread")
@@ -3507,13 +3625,9 @@ with tab2:
                 kickoff = format_schedule_kickoff(gameday, gametime)
                 avg_spread = avg_total = None
                 if odds_data:
-                    for ev in odds_data:
-                        h = to_abbr(ev.get("home_team", ""))
-                        a = to_abbr(ev.get("away_team", ""))
-                        if h == home and a == away:
-                            s, t = _extract_odds_lines(ev, home)
-                            avg_spread, avg_total = s, t
-                            break
+                    ev = find_odds_event(odds_data, home, away)
+                    if ev:
+                        avg_spread, avg_total = _extract_odds_lines(ev, home)
                 line_key = f"{week}_{away}_{home}_{gameday}"
                 try:
                     line_info = track_open_lines(line_key, avg_spread, avg_total)
