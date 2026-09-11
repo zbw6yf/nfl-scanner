@@ -397,6 +397,209 @@ def get_team_pace(seasons: Optional[List[int]] = None) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def get_team_success_metrics(seasons: Optional[List[int]] = None) -> pd.DataFrame:
+    """
+    Success rate and explosive-play rate by team (offense & defense).
+    Success ≈ EPA > 0 on a play; explosive ≈ EPA >= 1.0 (chunk plays).
+    """
+    try:
+        if seasons is None:
+            try:
+                current = int(nfl.get_current_season())
+            except Exception:
+                current = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
+            seasons = [current - 1, current]
+        pbp = nfl.load_pbp(seasons=seasons)
+        if hasattr(pbp, "to_pandas"):
+            pbp = pbp.to_pandas()
+        if pbp is None or pbp.empty:
+            return pd.DataFrame()
+        pbp = pbp[
+            (pbp["play_type"].isin(["pass", "run"]))
+            & pbp["epa"].notna()
+            & pbp["posteam"].notna()
+            & pbp["defteam"].notna()
+        ].copy()
+        if pbp.empty:
+            return pd.DataFrame()
+        pbp["success"] = (pbp["epa"] > 0).astype(float)
+        pbp["explosive"] = (pbp["epa"] >= 1.0).astype(float)
+        off = pbp.groupby("posteam").agg(
+            off_success=("success", "mean"),
+            off_explosive=("explosive", "mean"),
+            off_n=("epa", "count"),
+        ).reset_index().rename(columns={"posteam": "team"})
+        deff = pbp.groupby("defteam").agg(
+            def_success=("success", "mean"),  # rate allowed
+            def_explosive=("explosive", "mean"),
+            def_n=("epa", "count"),
+        ).reset_index().rename(columns={"defteam": "team"})
+        return off.merge(deff, on="team", how="outer").set_index("team")
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def get_team_ou_tendency(seasons: Optional[List[int]] = None) -> Dict[str, float]:
+    """
+    Team over rate in completed games with a total line (share of overs).
+    Returns dict[team] = over_rate in [0,1]. League average ~0.5.
+    """
+    try:
+        if seasons is None:
+            try:
+                current = int(nfl.get_current_season())
+            except Exception:
+                current = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
+            seasons = list(range(current - 2, current + 1))
+        sched = load_schedules(seasons=seasons)
+        if sched is None or sched.empty:
+            return {}
+        s = sched.copy()
+        if "home_score" not in s.columns or "total_line" not in s.columns:
+            return {}
+        s = s[s["home_score"].notna() & s["away_score"].notna() & s["total_line"].notna()]
+        if s.empty:
+            return {}
+        s["total_pts"] = s["home_score"].astype(float) + s["away_score"].astype(float)
+        s["is_over"] = s["total_pts"] > s["total_line"].astype(float)
+        rates = {}
+        for team_col in ("home_team", "away_team"):
+            for team, grp in s.groupby(team_col):
+                t = str(team).upper()
+                rates.setdefault(t, {"overs": 0, "n": 0})
+                rates[t]["overs"] += int(grp["is_over"].sum())
+                rates[t]["n"] += len(grp)
+        return {t: v["overs"] / v["n"] if v["n"] else 0.5 for t, v in rates.items()}
+    except Exception:
+        return {}
+
+
+def shrink_to_mean(value: float, n: float, league_mean: float, prior_n: float = 8.0) -> float:
+    """Empirical-Bayes style shrink toward league mean (early season / small samples)."""
+    try:
+        n = float(n)
+        if n <= 0:
+            return float(league_mean)
+        w = n / (n + prior_n)
+        return w * float(value) + (1.0 - w) * float(league_mean)
+    except Exception:
+        return float(league_mean)
+
+
+LINE_OPEN_PATH = Path("/home/workdir/artifacts/line_opens.csv")
+
+
+def _load_line_opens() -> Dict[str, Dict]:
+    if "line_opens" in st.session_state and isinstance(st.session_state.get("line_opens"), dict):
+        return st.session_state["line_opens"]
+    opens = {}
+    try:
+        if LINE_OPEN_PATH.exists():
+            df = pd.read_csv(LINE_OPEN_PATH)
+            for _, r in df.iterrows():
+                key = str(r.get("key") or "")
+                if not key:
+                    continue
+                opens[key] = {
+                    "open_spread": r.get("open_spread"),
+                    "open_total": r.get("open_total"),
+                    "first_seen": r.get("first_seen"),
+                }
+    except Exception:
+        pass
+    st.session_state["line_opens"] = opens
+    return opens
+
+
+def _save_line_opens(opens: Dict[str, Dict]) -> None:
+    st.session_state["line_opens"] = opens
+    try:
+        rows = []
+        for k, v in opens.items():
+            rows.append({
+                "key": k,
+                "open_spread": v.get("open_spread"),
+                "open_total": v.get("open_total"),
+                "first_seen": v.get("first_seen"),
+            })
+        pd.DataFrame(rows).to_csv(LINE_OPEN_PATH, index=False)
+    except Exception:
+        pass
+
+
+def track_open_lines(games_key: str, spread, total) -> Dict[str, Optional[float]]:
+    """
+    First observed spread/total becomes the 'open' line for this app.
+    Returns open_spread, open_total, cur_spread, cur_total, spread_move, total_move.
+    """
+    opens = _load_line_opens()
+    cur_s = float(spread) if spread is not None and str(spread) not in ("", "None", "nan") else None
+    cur_t = float(total) if total is not None and str(total) not in ("", "None", "nan") else None
+    if game_key not in opens:
+        opens[game_key] = {
+            "open_spread": cur_s,
+            "open_total": cur_t,
+            "first_seen": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        _save_line_opens(opens)
+    else:
+        # Fill missing opens if we only just got a line
+        entry = opens[game_key]
+        updated = False
+        if entry.get("open_spread") is None and cur_s is not None:
+            entry["open_spread"] = cur_s
+            updated = True
+        if entry.get("open_total") is None and cur_t is not None:
+            entry["open_total"] = cur_t
+            updated = True
+        if updated:
+            opens[game_key] = entry
+            _save_line_opens(opens)
+    entry = opens.get(game_key) or {}
+    try:
+        open_s = float(entry["open_spread"]) if entry.get("open_spread") is not None and str(entry.get("open_spread")) not in ("", "nan", "None") else None
+    except Exception:
+        open_s = None
+    try:
+        open_t = float(entry["open_total"]) if entry.get("open_total") is not None and str(entry.get("open_total")) not in ("", "nan", "None") else None
+    except Exception:
+        open_t = None
+    spread_move = (cur_s - open_s) if (cur_s is not None and open_s is not None) else None
+    total_move = (cur_t - open_t) if (cur_t is not None and open_t is not None) else None
+    return {
+        "open_spread": open_s,
+        "open_total": open_t,
+        "cur_spread": cur_s,
+        "cur_total": cur_t,
+        "spread_move": spread_move,
+        "total_move": total_move,
+    }
+
+
+def is_primetime_kickoff(kickoff: str, gametime: Optional[str] = None) -> bool:
+    """Rough primetime: local ET hour >= 19 or Thursday/Monday night patterns."""
+    try:
+        text_k = str(kickoff or "")
+        # Prefer explicit gametime HH:MM
+        gt = str(gametime or "")
+        hour = None
+        if ":" in gt:
+            hour = int(gt.split(":")[0])
+        else:
+            m = re.search(r"\b(\d{1,2}):(\d{2})\b", text_k)
+            if m:
+                hour = int(m.group(1))
+        if hour is None:
+            return False
+        return hour >= 19
+    except Exception:
+        return False
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def get_recent_form(seasons: Optional[List[int]] = None, n_games: int = 6) -> Dict[str, Dict]:
     """
@@ -2524,6 +2727,8 @@ with tab1:
     with st.spinner("Loading EPA, Pace, Form, Schedule, Odds and unique weather..."):
         team_epa = get_team_epa()
         team_pace = get_team_pace()
+        team_success = get_team_success_metrics()
+        team_ou_rate = get_team_ou_tendency()
         recent_form = get_recent_form(n_games=form_window)
         schedules = load_schedules()
         odds_data, odds_status = fetch_nfl_odds(api_key) if api_key else (None, "No API key entered")
@@ -2586,14 +2791,38 @@ with tab1:
                 avg_total = g.get("avg_total") if g.get("avg_total") is not None else 45.0
 
                 # Use team EPA when available; otherwise neutral league averages (never drop the game)
+                # League means for shrinkage (early season)
+                if not team_epa.empty and "off_epa" in team_epa.columns:
+                    league_off = float(team_epa["off_epa"].mean())
+                    league_def = float(team_epa["def_epa"].mean())
+                else:
+                    league_off = league_def = 0.0
+                # Approximate sample size from form n when available (else modest prior)
                 if not team_epa.empty and home in team_epa.index and away in team_epa.index:
-                    home_off = float(team_epa.loc[home, "off_epa"])
-                    home_def = float(team_epa.loc[home, "def_epa"])
-                    away_off = float(team_epa.loc[away, "off_epa"])
-                    away_def = float(team_epa.loc[away, "def_epa"])
+                    home_off_raw = float(team_epa.loc[home, "off_epa"])
+                    home_def_raw = float(team_epa.loc[home, "def_epa"])
+                    away_off_raw = float(team_epa.loc[away, "off_epa"])
+                    away_def_raw = float(team_epa.loc[away, "def_epa"])
                 else:
                     skipped.append(f"Neutral EPA used for {away} @ {home}")
-                    home_off = home_def = away_off = away_def = 0.0
+                    home_off_raw = home_def_raw = away_off_raw = away_def_raw = 0.0
+                home_form = recent_form.get(home, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
+                away_form = recent_form.get(away, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
+                # Early-season / small-sample shrink toward league mean (option 8)
+                n_home = float(home_form.get("n") or 0)
+                n_away = float(away_form.get("n") or 0)
+                # Use games played as sample proxy; if none yet, full shrink to mean
+                prior = 8.0
+                home_off = shrink_to_mean(home_off_raw, max(n_home, 1.0) * 15.0, league_off, prior_n=prior * 15.0)
+                home_def = shrink_to_mean(home_def_raw, max(n_home, 1.0) * 15.0, league_def, prior_n=prior * 15.0)
+                away_off = shrink_to_mean(away_off_raw, max(n_away, 1.0) * 15.0, league_off, prior_n=prior * 15.0)
+                away_def = shrink_to_mean(away_def_raw, max(n_away, 1.0) * 15.0, league_def, prior_n=prior * 15.0)
+                if n_home < 4 or n_away < 4:
+                    # Extra shrink early season
+                    home_off = shrink_to_mean(home_off, n_home, league_off, prior_n=6.0)
+                    home_def = shrink_to_mean(home_def, n_home, league_def, prior_n=6.0)
+                    away_off = shrink_to_mean(away_off, n_away, league_off, prior_n=6.0)
+                    away_def = shrink_to_mean(away_def, n_away, league_def, prior_n=6.0)
                 epa_edge = (home_off - away_def) - (away_off - home_def)
                 rest_diff = rest_differential(schedules, home, away, game_date, week=g.get("week"))
                 # ---- SIGNALS ----
@@ -2601,10 +2830,11 @@ with tab1:
                     home_imp, away_imp = implied_team_totals(avg_spread, avg_total)
                 else:
                     home_imp, away_imp = avg_total / 2, avg_total / 2
-                home_form = recent_form.get(home, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
-                away_form = recent_form.get(away, {"form_margin": 0.0, "form_epa": 0.0, "n": 0})
                 form_margin_diff = home_form["form_margin"] - away_form["form_margin"]
                 form_epa_diff = home_form["form_epa"] - away_form["form_epa"]
+                # Shrink form diffs when sample is thin
+                form_margin_diff = shrink_to_mean(form_margin_diff, min(n_home, n_away), 0.0, prior_n=6.0)
+                form_epa_diff = shrink_to_mean(form_epa_diff, min(n_home, n_away), 0.0, prior_n=6.0)
                 home_pace = float(team_pace.loc[home, "plays_per_game"]) if (not team_pace.empty and home in team_pace.index) else league_avg_pace
                 away_pace = float(team_pace.loc[away, "plays_per_game"]) if (not team_pace.empty and away in team_pace.index) else league_avg_pace
                 combined_pace = (home_pace + away_pace) / 2.0
@@ -2662,6 +2892,65 @@ with tab1:
                     signals.append(f"Away TZ -{tz_diff}h"); rule_score += 0.5
                 if div_flag:
                     signals.append("Divisional"); rule_score += 0.7
+
+                # ---- Option 4: Success rate & explosive-play edge ----
+                try:
+                    ts = team_success if isinstance(team_success, pd.DataFrame) else pd.DataFrame()
+                except NameError:
+                    ts = pd.DataFrame()
+                if not ts.empty and home in ts.index and away in ts.index:
+                    # Offense success vs opponent def success-allowed
+                    h_sr = float(ts.loc[home, "off_success"]) - float(ts.loc[away, "def_success"])
+                    a_sr = float(ts.loc[away, "off_success"]) - float(ts.loc[home, "def_success"])
+                    sr_edge = h_sr - a_sr
+                    h_exp = float(ts.loc[home, "off_explosive"]) - float(ts.loc[away, "def_explosive"])
+                    a_exp = float(ts.loc[away, "off_explosive"]) - float(ts.loc[home, "def_explosive"])
+                    exp_edge = h_exp - a_exp
+                    if sr_edge > 0.04:
+                        signals.append(f"Home success +{sr_edge:.3f}"); rule_score += 1.4
+                    elif sr_edge < -0.04:
+                        signals.append(f"Away success {sr_edge:.3f}"); rule_score += 1.3
+                    if exp_edge > 0.03:
+                        signals.append(f"Home explosive +{exp_edge:.3f}"); rule_score += 1.1
+                    elif exp_edge < -0.03:
+                        signals.append(f"Away explosive {exp_edge:.3f}"); rule_score += 1.0
+
+                # ---- Option 5: Implied total vs team O/U tendency ----
+                try:
+                    ou_rates = team_ou_rate if isinstance(team_ou_rate, dict) else {}
+                except NameError:
+                    ou_rates = {}
+                if ou_rates and avg_total is not None:
+                    h_over = float(ou_rates.get(home, 0.5))
+                    a_over = float(ou_rates.get(away, 0.5))
+                    combo_over = (h_over + a_over) / 2.0
+                    # High total + over-prone teams → over lean signal; low total + under-prone → under
+                    if avg_total >= 47.5 and combo_over >= 0.55:
+                        signals.append(f"Over-prone teams ({combo_over:.0%})"); rule_score += 1.2
+                    elif avg_total <= 42.5 and combo_over <= 0.45:
+                        signals.append(f"Under-prone teams ({combo_over:.0%})"); rule_score += 1.2
+                    elif avg_total >= 49 and combo_over <= 0.45:
+                        signals.append("High total vs under teams"); rule_score += 0.9
+                    elif avg_total <= 41 and combo_over >= 0.55:
+                        signals.append("Low total vs over teams"); rule_score += 0.9
+
+                # ---- Option 6: Rest × travel × primetime interaction ----
+                away_rest = None
+                try:
+                    away_rest = get_rest_days(schedules, away, game_date)
+                except Exception:
+                    away_rest = None
+                pt = is_primetime_kickoff(str(g.get("kickoff") or ""), g.get("gametime"))
+                short_rest_away = (away_rest is not None and away_rest <= 5)
+                if short_rest_away and travel_dir == "Westbound" and tz_diff >= 2:
+                    signals.append("Away short rest × West travel"); rule_score += 1.5
+                elif short_rest_away and pt:
+                    signals.append("Away short rest × primetime"); rule_score += 1.2
+                elif travel_dir == "Westbound" and tz_diff >= 3 and pt:
+                    signals.append("West travel × primetime"); rule_score += 1.1
+                elif short_rest_away and tz_diff >= 2:
+                    signals.append("Away short rest × TZ"); rule_score += 0.8
+
                 form_margin_adj = form_margin_diff * 0.15
                 ml_home = 0.5
                 if model is not None and avg_spread is not None and feature_cols is not None:
@@ -2855,7 +3144,7 @@ with tab1:
             )
 
             # ---- Top opportunity cards ----
-            st.markdown("##### Top opportunities")
+            st.markdown("##### Strongest Signals")
             card_n = min(5, len(filtered))
             if card_n:
                 for i in range(card_n):
@@ -2962,7 +3251,7 @@ with tab2:
     st.subheader("Upcoming Games (full schedule)")
     st.caption(
         "Complete official slate from the embedded 2026 schedule. "
-        "Every week lists every game with correct date/time. Odds fill in when available."
+        "Open lines are the first values seen by this app; Curr is live; Move = Curr − Open."
     )
 
     # Build display rows DIRECTLY from embedded schedule (never drop matchups)
@@ -3000,12 +3289,27 @@ with tab2:
                         avg_spread, avg_total = s, t
                         break
 
-            spread = f"{avg_spread:+.1f}" if avg_spread is not None else "—"
-            total = f"{avg_total:.1f}" if avg_total is not None else "—"
+            # Track open vs current lines
+            line_key = f"{week}_{away}_{home}_{gameday}"
+            line_info = track_open_lines(line_key, avg_spread, avg_total)
+            open_s = line_info.get("open_spread")
+            open_t = line_info.get("open_total")
+            cur_s = line_info.get("cur_spread")
+            cur_t = line_info.get("cur_total")
+            s_move = line_info.get("spread_move")
+            t_move = line_info.get("total_move")
+
+            spread = f"{cur_s:+.1f}" if cur_s is not None else "—"
+            total = f"{cur_t:.1f}" if cur_t is not None else "—"
+            open_spread = f"{open_s:+.1f}" if open_s is not None else "—"
+            open_total = f"{open_t:.1f}" if open_t is not None else "—"
+            spread_move = f"{s_move:+.1f}" if s_move is not None else "—"
+            total_move = f"{t_move:+.1f}" if t_move is not None else "—"
+
             imp_h = imp_a = "—"
-            if avg_spread is not None and avg_total is not None:
+            if cur_s is not None and cur_t is not None:
                 try:
-                    ih, ia = implied_team_totals(avg_spread, avg_total)
+                    ih, ia = implied_team_totals(cur_s, cur_t)
                     imp_h, imp_a = f"{ih:.1f}", f"{ia:.1f}"
                 except Exception:
                     pass
@@ -3014,8 +3318,12 @@ with tab2:
                 "Away": full_name(away),
                 "Home": full_name(home),
                 "Kickoff": kickoff,
-                "Spread": spread,
-                "Total": total,
+                "Open Spread": open_spread,
+                "Curr Spread": spread,
+                "Spread Move": spread_move,
+                "Open Total": open_total,
+                "Curr Total": total,
+                "Total Move": total_move,
                 "Home Imp": imp_h,
                 "Away Imp": imp_a,
                 "Divisional": "Yes" if is_divisional(home, away) else "No",
@@ -3057,8 +3365,12 @@ with tab2:
                                 "Away": full_name(away),
                                 "Home": full_name(home),
                                 "Kickoff": kickoff,
-                                "Spread": "—",
-                                "Total": "—",
+                                "Open Spread": "—",
+                                "Curr Spread": "—",
+                                "Spread Move": "—",
+                                "Open Total": "—",
+                                "Curr Total": "—",
+                                "Total Move": "—",
                                 "Home Imp": "—",
                                 "Away Imp": "—",
                                 "Divisional": "Yes" if is_divisional(home, away) else "No",
@@ -3431,7 +3743,7 @@ ATS leans require **both** positive simulated EV at −110 **and** model confide
 \textbf{Score} = \text{rule\_score} + \text{ml\_edge} + \text{mc\_edge} + \text{agree}
 \]
 
-- **rule_score** — sum of heuristic signal points (EPA edge, rest, form, weather, implied totals, pace, travel, divisional, etc.). Form and rest use **current season only** (Week 1 rest advantage is forced to 0).
+- **rule_score** — sum of heuristic signal points (EPA edge, rest, form, weather, implied totals, pace, travel, divisional, **success/explosive rates**, **team O/U tendency vs market total**, **rest×travel×primetime**). Form and rest use **current season only** (Week 1 rest advantage is forced to 0). EPA/form are **shrunk toward league mean** early season (small samples).
 - **ml_edge** — \(|P_{\text{model}}(\text{home covers}) - 0.5| \times 4\)
 - **mc_edge** — \(\max(\text{home EV},\ \text{away EV}) \times 8\) from Monte Carlo at −110 prices
 - **agree** — +1.5 when the logistic model and Monte Carlo lean the same side
