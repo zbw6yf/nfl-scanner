@@ -922,6 +922,19 @@ def render_byoa_tab(
 
     if "byoa_cfg" not in st.session_state:
         st.session_state["byoa_cfg"] = byoa_default_config()
+
+    # Migrate older saved configs so newly added factors always appear
+    cfg = st.session_state["byoa_cfg"]
+    if not isinstance(cfg.get("factors"), dict):
+        cfg["factors"] = {}
+    for _k, _meta in BYOA_FACTORS.items():
+        if _k not in cfg["factors"]:
+            cfg["factors"][_k] = {
+                "enabled": bool(_meta["default_enabled"]),
+                "weight": float(_meta["default_weight"]),
+                "invert": False,
+            }
+    st.session_state["byoa_cfg"] = cfg
     cfg = st.session_state["byoa_cfg"]
 
     # ---- Quick presets strip ----
@@ -1021,14 +1034,32 @@ def render_byoa_tab(
         st.markdown("### 2 · Factors")
         st.caption("Enable a factor, set its weight. Use **Invert** to flip direction.")
 
-        # Group factors for cleaner UI
+        if st.button("Reset factors to defaults", key="byoa_reset_factors", help="Clears old config and reloads all factors including new ones"):
+            st.session_state["byoa_cfg"] = byoa_default_config()
+            # Clear widget keys so checkboxes refresh
+            for _k in list(st.session_state.keys()):
+                if isinstance(_k, str) and _k.startswith(("byoa_en_", "byoa_w_", "byoa_inv_")):
+                    del st.session_state[_k]
+            st.rerun()
+
+        # Group factors for cleaner UI — every key listed here is shown individually
         FACTOR_GROUPS = {
             "Core matchup": [
-                "epa_edge", "form_margin_diff", "form_epa_diff", "rest_diff",
-                "success_rate_edge", "explosive_rate_edge", "redzone_td_edge",
+                "epa_edge",
+                "form_margin_diff",
+                "form_epa_diff",
+                "rest_diff",
+                "success_rate_edge",
+                "explosive_rate_edge",
+                "redzone_td_edge",
             ],
-            "Market lines": ["spread", "abs_spread", "total_line", "home_imp", "away_imp", "edge_pct", "model_home_prob"],
-            "Context": ["pace_vs_avg", "weather_under_bias", "tz_diff", "divisional"],
+            "Market lines": [
+                "spread", "abs_spread", "total_line",
+                "home_imp", "away_imp", "edge_pct", "model_home_prob",
+            ],
+            "Context": [
+                "pace_vs_avg", "weather_under_bias", "tz_diff", "divisional",
+            ],
         }
 
         enabled_labels = []
