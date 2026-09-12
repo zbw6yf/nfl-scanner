@@ -17,6 +17,7 @@ except ImportError:
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+from byoa import render_byoa_tab, features_dict_for_board_row
 # -----------------------------
 # PAGE CONFIG
 # -----------------------------
@@ -3825,7 +3826,7 @@ def _pick_top_play(opportunities: list) -> Optional[Dict]:
 
 
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "🏠 Homepage",
     "🏈 The Big Board",
     "📅 Games & Odds",
@@ -3835,6 +3836,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "📊 Team History",
     "📘 Methodology",
     "⚙️ Advanced",
+    "🧪 BYOA",
 ])
 
 # ========== TAB 1: Homepage ==========
@@ -4331,6 +4333,23 @@ with tab2:
                 week_num = g.get("week")
                 if week_num is None:
                     week_num = get_week(schedules, home, away, game_date)
+                # Structured features for BYOA (and any downstream consumers)
+                _byoa_feats = features_dict_for_board_row(
+                    epa_edge=float(epa_edge),
+                    form_margin_diff=float(form_margin_diff),
+                    form_epa_diff=float(form_epa_diff),
+                    rest_diff=float(rest_diff),
+                    avg_spread=float(avg_spread) if avg_spread is not None else None,
+                    avg_total=float(avg_total) if avg_total is not None else 45.0,
+                    pace_vs_avg=float(pace_vs_avg),
+                    weather_under_bias=float(wx_adj.get("under_bias") or wx_adj.get("rule_pts") or 0.0),
+                    home_imp=float(home_imp),
+                    away_imp=float(away_imp),
+                    tz_diff=float(tz_diff),
+                    divisional=bool(div_flag),
+                    model_home_prob=float(model_home) if model_home is not None else 0.5,
+                    edge_pct=float(edge_pct) if edge_pct is not None else 0.0,
+                )
                 # Always include every scheduled game so weekly filters show the full slate
                 opportunities.append({
                     "Week": week_num if week_num is not None else "—",
@@ -4368,6 +4387,7 @@ with tab2:
                     "_home": home,
                     "_away": away,
                     "_gameday": game_date,
+                    "_features": _byoa_feats,
                 })
                 # Lock Full-board values at kickoff — no live updates after game starts
                 started = game_has_started(
@@ -5687,6 +5707,48 @@ with tab9:
 
     
 
+# ========== TAB 10: BYOA ==========
+with tab10:
+    def _byoa_load_odds(key: str):
+        try:
+            if not key:
+                return None
+            cached = st.session_state.get("odds_data")
+            if cached:
+                return cached
+            data, _msg = fetch_nfl_odds(key)
+            if data:
+                st.session_state["odds_data"] = data
+            return data
+        except Exception:
+            return None
+
+    def _byoa_recent_form(n_games: int = 6):
+        try:
+            return get_recent_form(n_games=n_games)
+        except TypeError:
+            return get_recent_form()
+
+    render_byoa_tab(
+        api_key=api_key,
+        n_simulations=n_simulations,
+        form_window=form_window,
+        load_schedules=load_schedules,
+        load_odds=_byoa_load_odds,
+        build_upcoming=build_upcoming_games,
+        get_team_epa=get_team_epa,
+        get_team_pace=get_team_pace,
+        get_recent_form=_byoa_recent_form,
+        rest_differential=rest_differential,
+        is_divisional=is_divisional,
+        timezone_diff=timezone_diff,
+        weather_cache_builder=build_weather_cache_from_games,
+        weather_adjustments=weather_adjustments,
+        implied_team_totals=implied_team_totals,
+        estimate_week=estimate_week_from_date,
+    )
+
+
 # ---- Footer ----
 st.markdown(
     """
@@ -5696,4 +5758,5 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
