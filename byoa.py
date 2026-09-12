@@ -63,6 +63,24 @@ BYOA_FACTORS: Dict[str, Dict[str, Any]] = {
         "default_weight": 1.2,
         "default_enabled": True,
     },
+    "success_rate_edge": {
+        "label": "Success rate edge (home − away matchup)",
+        "help": "Home off success − Away def success, minus the reverse. Typical range ≈ -0.08 to +0.08. Positive favors home.",
+        "default_weight": 1.6,
+        "default_enabled": True,
+    },
+    "explosive_rate_edge": {
+        "label": "Explosive play rate edge (home − away)",
+        "help": "Differential in chunk-play rate (EPA ≥ 1.0). Typical range ≈ -0.05 to +0.05. Positive favors home.",
+        "default_weight": 1.3,
+        "default_enabled": True,
+    },
+    "redzone_td_edge": {
+        "label": "Red-zone TD rate edge (home − away)",
+        "help": "Red-zone touchdown rate differential (off vs opp def). Typical range ≈ -0.15 to +0.15. Positive favors home.",
+        "default_weight": 1.4,
+        "default_enabled": True,
+    },
     "rest_diff": {
         "label": "Rest advantage (home − away days)",
         "help": "Positive means home has more rest.",
@@ -279,10 +297,33 @@ def features_from_board_row(o: Dict[str, Any]) -> Dict[str, float]:
     if pace is not None:
         pace_vs_avg = pace - 65.0
 
+    # Parse optional efficiency edges from Signals text when not on the row
+    success_edge = _parse_signed_number(o.get("Success Edge"))
+    explosive_edge = _parse_signed_number(o.get("Explosive Edge"))
+    redzone_edge = _parse_signed_number(o.get("RZ TD Edge"))
+    if success_edge is None:
+        m = re.search(r"(Home|Away)\s+success\s*([+-]?\d+\.?\d*)", signals, re.I)
+        if m:
+            val = float(m.group(2))
+            success_edge = val if m.group(1).lower() == "home" else -abs(val)
+    if explosive_edge is None:
+        m = re.search(r"(Home|Away)\s+explosive\s*([+-]?\d+\.?\d*)", signals, re.I)
+        if m:
+            val = float(m.group(2))
+            explosive_edge = val if m.group(1).lower() == "home" else -abs(val)
+    if redzone_edge is None:
+        m = re.search(r"(Home|Away)\s+RZ(?:\s*TD)?\s*([+-]?\d+\.?\d*)", signals, re.I)
+        if m:
+            val = float(m.group(2))
+            redzone_edge = val if m.group(1).lower() == "home" else -abs(val)
+
     raw = {
         "epa_edge": epa_edge if epa_edge is not None else 0.0,
         "form_margin_diff": form_margin if form_margin is not None else 0.0,
         "form_epa_diff": form_epa if form_epa is not None else 0.0,
+        "success_rate_edge": success_edge if success_edge is not None else 0.0,
+        "explosive_rate_edge": explosive_edge if explosive_edge is not None else 0.0,
+        "redzone_td_edge": redzone_edge if redzone_edge is not None else 0.0,
         "rest_diff": rest_diff if rest_diff is not None else 0.0,
         "spread": spread if spread is not None else 0.0,
         "abs_spread": abs(spread) if spread is not None else 0.0,
@@ -304,6 +345,9 @@ def features_dict_for_board_row(
     epa_edge: float = 0.0,
     form_margin_diff: float = 0.0,
     form_epa_diff: float = 0.0,
+    success_rate_edge: float = 0.0,
+    explosive_rate_edge: float = 0.0,
+    redzone_td_edge: float = 0.0,
     rest_diff: float = 0.0,
     avg_spread: Optional[float] = None,
     avg_total: Optional[float] = None,
@@ -322,6 +366,9 @@ def features_dict_for_board_row(
         opportunity["_features"] = features_dict_for_board_row(
             epa_edge=epa_edge,
             form_margin_diff=form_margin_diff,
+            success_rate_edge=success_rate_edge,
+            explosive_rate_edge=explosive_rate_edge,
+            redzone_td_edge=redzone_td_edge,
             ...
         )
     """
@@ -331,6 +378,9 @@ def features_dict_for_board_row(
         "epa_edge": epa_edge,
         "form_margin_diff": form_margin_diff,
         "form_epa_diff": form_epa_diff,
+        "success_rate_edge": success_rate_edge,
+        "explosive_rate_edge": explosive_rate_edge,
+        "redzone_td_edge": redzone_td_edge,
         "rest_diff": rest_diff,
         "spread": spread,
         "abs_spread": abs(spread),
@@ -365,6 +415,13 @@ def _scale_feature(key: str, raw: float) -> float:
     """Bring heterogeneous features onto roughly comparable scales."""
     if key in ("epa_edge", "form_epa_diff"):
         return raw * 10.0
+    # Success / explosive / RZ rates are already small fractions
+    if key == "success_rate_edge":
+        return raw * 25.0          # ±0.08 → ±2.0
+    if key == "explosive_rate_edge":
+        return raw * 30.0          # ±0.05 → ±1.5
+    if key == "redzone_td_edge":
+        return raw * 12.0          # ±0.15 → ±1.8
     if key in ("form_margin_diff", "rest_diff", "pace_vs_avg", "spread", "tz_diff"):
         return raw / 3.0
     if key == "abs_spread":
@@ -532,6 +589,7 @@ def rebuild_feature_rows(
     build_upcoming: Optional[Callable[..., List[Dict]]] = None,
     get_team_epa: Optional[Callable[..., pd.DataFrame]] = None,
     get_team_pace: Optional[Callable[..., pd.DataFrame]] = None,
+    get_team_success_metrics: Optional[Callable[..., pd.DataFrame]] = None,
     get_recent_form: Optional[Callable[..., Dict]] = None,
     rest_differential: Optional[Callable[..., int]] = None,
     is_divisional: Optional[Callable[..., bool]] = None,
@@ -699,10 +757,46 @@ def rebuild_feature_rows(
             else:
                 home_imp = away_imp = float(avg_total or 45.0) / 2.0
 
+            # Efficiency edges (success / explosive / RZ) — optional if caller provides metrics
+            success_rate_edge = 0.0
+            explosive_rate_edge = 0.0
+            redzone_td_edge = 0.0
+            team_success = None
+            if get_team_success_metrics:
+                try:
+                    team_success = get_team_success_metrics()
+                except Exception:
+                    team_success = None
+            if isinstance(team_success, pd.DataFrame) and not team_success.empty:
+                if home in team_success.index and away in team_success.index:
+                    try:
+                        h_sr = float(team_success.loc[home, "off_success"]) - float(team_success.loc[away, "def_success"])
+                        a_sr = float(team_success.loc[away, "off_success"]) - float(team_success.loc[home, "def_success"])
+                        success_rate_edge = h_sr - a_sr
+                    except Exception:
+                        pass
+                    try:
+                        h_exp = float(team_success.loc[home, "off_explosive"]) - float(team_success.loc[away, "def_explosive"])
+                        a_exp = float(team_success.loc[away, "off_explosive"]) - float(team_success.loc[home, "def_explosive"])
+                        explosive_rate_edge = h_exp - a_exp
+                    except Exception:
+                        pass
+                    # Red-zone columns optional
+                    if "off_rz_td" in team_success.columns and "def_rz_td" in team_success.columns:
+                        try:
+                            h_rz = float(team_success.loc[home, "off_rz_td"]) - float(team_success.loc[away, "def_rz_td"])
+                            a_rz = float(team_success.loc[away, "off_rz_td"]) - float(team_success.loc[home, "def_rz_td"])
+                            redzone_td_edge = h_rz - a_rz
+                        except Exception:
+                            pass
+
             feats = features_dict_for_board_row(
                 epa_edge=epa_edge,
                 form_margin_diff=form_margin_diff,
                 form_epa_diff=form_epa_diff,
+                success_rate_edge=success_rate_edge,
+                explosive_rate_edge=explosive_rate_edge,
+                redzone_td_edge=redzone_td_edge,
                 rest_diff=float(rest_diff),
                 avg_spread=float(avg_spread) if avg_spread is not None else None,
                 avg_total=float(avg_total) if avg_total is not None else 45.0,
@@ -780,6 +874,7 @@ def render_byoa_tab(
     build_upcoming: Optional[Callable] = None,
     get_team_epa: Optional[Callable] = None,
     get_team_pace: Optional[Callable] = None,
+    get_team_success_metrics: Optional[Callable] = None,
     get_recent_form: Optional[Callable] = None,
     rest_differential: Optional[Callable] = None,
     is_divisional: Optional[Callable] = None,
@@ -837,15 +932,23 @@ def render_byoa_tab(
             st.session_state["byoa_cfg"] = byoa_default_config()
             st.rerun()
     with q2:
-        if st.button("EPA + Form", use_container_width=True, help="Focus on EPA edge and recent form"):
+        if st.button("EPA + Form", use_container_width=True, help="Focus on EPA, efficiency, and recent form"):
             c = byoa_default_config()
             c["name"] = "EPA + Form"
+            core = (
+                "epa_edge", "form_margin_diff", "form_epa_diff", "rest_diff",
+                "success_rate_edge", "explosive_rate_edge", "redzone_td_edge",
+            )
             for k, f in c["factors"].items():
-                f["enabled"] = k in ("epa_edge", "form_margin_diff", "form_epa_diff", "rest_diff")
+                f["enabled"] = k in core
                 if k == "epa_edge":
                     f["weight"] = 2.5
                 if k in ("form_margin_diff", "form_epa_diff"):
                     f["weight"] = 1.8
+                if k == "success_rate_edge":
+                    f["weight"] = 1.8
+                if k in ("explosive_rate_edge", "redzone_td_edge"):
+                    f["weight"] = 1.4
             st.session_state["byoa_cfg"] = c
             st.rerun()
     with q3:
@@ -920,7 +1023,10 @@ def render_byoa_tab(
 
         # Group factors for cleaner UI
         FACTOR_GROUPS = {
-            "Core matchup": ["epa_edge", "form_margin_diff", "form_epa_diff", "rest_diff"],
+            "Core matchup": [
+                "epa_edge", "form_margin_diff", "form_epa_diff", "rest_diff",
+                "success_rate_edge", "explosive_rate_edge", "redzone_td_edge",
+            ],
             "Market lines": ["spread", "abs_spread", "total_line", "home_imp", "away_imp", "edge_pct", "model_home_prob"],
             "Context": ["pace_vs_avg", "weather_under_bias", "tz_diff", "divisional"],
         }
@@ -1049,6 +1155,7 @@ def render_byoa_tab(
                         build_upcoming=build_upcoming,
                         get_team_epa=get_team_epa,
                         get_team_pace=get_team_pace,
+                        get_team_success_metrics=get_team_success_metrics,
                         get_recent_form=get_recent_form,
                         rest_differential=rest_differential,
                         is_divisional=is_divisional,
@@ -1129,4 +1236,5 @@ def render_byoa_tab(
         f"BYOA · {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
         "Linear weighted factors for transparency. Not betting advice."
     )
+
 
