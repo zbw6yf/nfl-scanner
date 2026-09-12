@@ -3829,6 +3829,7 @@ def _pick_top_play(opportunities: list) -> Optional[Dict]:
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "🏠 Homepage",
     "🏈 The Big Board",
+    "🧪 BYOA",
     "📅 Games & Odds",
     "🌤️ Weather",
     "🏥 Injury Report",
@@ -3836,7 +3837,6 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "📊 Team History",
     "📘 Methodology",
     "⚙️ Advanced",
-    "🧪 BYOA",
 ])
 
 # ========== TAB 1: Homepage ==========
@@ -3973,6 +3973,7 @@ with tab1:
 <div class="tm-section-title">What you can do</div>
 <div class="tm-grid">
   <div class="tm-card"><div class="icon">🎯</div><h4>The Big Board</h4><p>Ranked ATS & total leans with confidence grades, edge %, and the NFL Big Board.</p></div>
+  <div class="tm-card"><div class="icon">🧪</div><h4>BYOA</h4><p>Build your own weighted algorithm and generate custom weekly recommendations.</p></div>
   <div class="tm-card"><div class="icon">📈</div><h4>Games & Odds</h4><p>Full slate tickets with open → current spreads/totals and line movement.</p></div>
   <div class="tm-card"><div class="icon">🌤️</div><h4>Weather</h4><p>Stadium forecasts near kickoff that feed total and under-bias adjustments.</p></div>
   <div class="tm-card"><div class="icon">🏥</div><h4>Injuries & Depth</h4><p>Filterable injury report and depth charts so context sits next to the lean.</p></div>
@@ -3994,9 +3995,10 @@ with tab1:
 <div class="tm-steps">
   <div class="tm-step"><div class="n">1</div><div>Save your Odds API key in the sidebar</div></div>
   <div class="tm-step"><div class="n">2</div><div>Open The Big Board for full leans</div></div>
-  <div class="tm-step"><div class="n">3</div><div>Check Games & Odds for line moves</div></div>
-  <div class="tm-step"><div class="n">4</div><div>Sanity-check weather / injuries / depth</div></div>
-  <div class="tm-step"><div class="n">5</div><div>Review Advanced → Signal History</div></div>
+  <div class="tm-step"><div class="n">3</div><div>Try BYOA with your own weights</div></div>
+  <div class="tm-step"><div class="n">4</div><div>Check Games & Odds for line moves</div></div>
+  <div class="tm-step"><div class="n">5</div><div>Sanity-check weather / injuries / depth</div></div>
+  <div class="tm-step"><div class="n">6</div><div>Review Advanced → Signal History</div></div>
 </div>
 
 <div class="tm-footnote">Research only — not betting advice. Model output is for education and decision support. Wager responsibly and only where legal.</div>
@@ -4599,8 +4601,50 @@ with tab2:
         else:
             st.warning("No opportunities to display.")
 
-# ========== TAB 2 ==========
+# ========== TAB 3: BYOA ==========
 with tab3:
+    def _byoa_load_odds(key: str):
+        try:
+            if not key:
+                return None
+            cached = st.session_state.get("odds_data")
+            if cached:
+                return cached
+            data, _msg = fetch_nfl_odds(key)
+            if data:
+                st.session_state["odds_data"] = data
+            return data
+        except Exception:
+            return None
+
+    def _byoa_recent_form(n_games: int = 6):
+        try:
+            return get_recent_form(n_games=n_games)
+        except TypeError:
+            return get_recent_form()
+
+    render_byoa_tab(
+        api_key=api_key,
+        n_simulations=n_simulations,
+        form_window=form_window,
+        load_schedules=load_schedules,
+        load_odds=_byoa_load_odds,
+        build_upcoming=build_upcoming_games,
+        get_team_epa=get_team_epa,
+        get_team_pace=get_team_pace,
+        get_recent_form=_byoa_recent_form,
+        rest_differential=rest_differential,
+        is_divisional=is_divisional,
+        timezone_diff=timezone_diff,
+        weather_cache_builder=build_weather_cache_from_games,
+        weather_adjustments=weather_adjustments,
+        implied_team_totals=implied_team_totals,
+        estimate_week=estimate_week_from_date,
+    )
+
+
+# ========== TAB 4: Games & Odds ==========
+with tab4:
     st.subheader("Upcoming Games (full schedule)")
     st.caption(
         "Official slate with open / current lines. "
@@ -4944,7 +4988,7 @@ with tab3:
         )
 
 
-with tab4:
+with tab5:
     st.subheader("Game Weather")
     st.caption(
         "Forecast at each outdoor stadium near kickoff (Open-Meteo). "
@@ -5018,7 +5062,7 @@ with tab4:
         st.caption(last_update_caption("weather", "schedule", label="Last update (Weather)"))
 
 
-with tab5:
+with tab6:
     st.subheader("NFL Injury Report")
     st.caption(
         "Official report from [NFL.com/injuries](https://www.nfl.com/injuries/). "
@@ -5087,7 +5131,7 @@ with tab5:
             )
 
 
-with tab6:
+with tab7:
     st.subheader("Depth Charts")
     st.caption(
         "Current team depth charts from [Ourlads](https://www.ourlads.com/nfldepthcharts/). "
@@ -5137,7 +5181,7 @@ with tab6:
 
 
 
-with tab7:
+with tab8:
     st.subheader("Team History")
     st.caption(
         "ATS (against the spread) and Over/Under records by team — last 5 seasons of completed games. "
@@ -5230,7 +5274,7 @@ with tab7:
         st.caption(f"{len(show)} team-games · spreads/totals from historical schedule lines when available")
 
 
-with tab8:
+with tab9:
     st.subheader("Methodology")
     st.caption("How Score, Confidence, and Lean recommendations are produced. Research tool only — not betting advice.")
 
@@ -5325,7 +5369,7 @@ Over/under probabilities are taken from simulated totals vs the market line (wit
         """
     )
 
-with tab9:
+with tab10:
     st.subheader("Advanced")
     st.caption("Less frequently used tools — props, bankroll tracking, and historical backtests.")
     adv = st.radio(
@@ -5706,47 +5750,6 @@ with tab9:
 
 
     
-
-# ========== TAB 10: BYOA ==========
-with tab10:
-    def _byoa_load_odds(key: str):
-        try:
-            if not key:
-                return None
-            cached = st.session_state.get("odds_data")
-            if cached:
-                return cached
-            data, _msg = fetch_nfl_odds(key)
-            if data:
-                st.session_state["odds_data"] = data
-            return data
-        except Exception:
-            return None
-
-    def _byoa_recent_form(n_games: int = 6):
-        try:
-            return get_recent_form(n_games=n_games)
-        except TypeError:
-            return get_recent_form()
-
-    render_byoa_tab(
-        api_key=api_key,
-        n_simulations=n_simulations,
-        form_window=form_window,
-        load_schedules=load_schedules,
-        load_odds=_byoa_load_odds,
-        build_upcoming=build_upcoming_games,
-        get_team_epa=get_team_epa,
-        get_team_pace=get_team_pace,
-        get_recent_form=_byoa_recent_form,
-        rest_differential=rest_differential,
-        is_divisional=is_divisional,
-        timezone_diff=timezone_diff,
-        weather_cache_builder=build_weather_cache_from_games,
-        weather_adjustments=weather_adjustments,
-        implied_team_totals=implied_team_totals,
-        estimate_week=estimate_week_from_date,
-    )
 
 
 # ---- Footer ----
