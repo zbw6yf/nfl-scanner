@@ -7,6 +7,14 @@ extract further following README.md.
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Ensure project root is on sys.path (required for Streamlit Cloud / local runs)
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 import streamlit as st
 import pandas as pd
 import requests
@@ -14,7 +22,6 @@ import re
 import base64
 import numpy as np
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 import warnings
 warnings.filterwarnings("ignore")
@@ -333,7 +340,28 @@ def get_team_success_metrics(seasons: Optional[List[int]] = None) -> pd.DataFram
             def_explosive=("explosive", "mean"),
             def_n=("epa", "count"),
         ).reset_index().rename(columns={"defteam": "team"})
-        return off.merge(deff, on="team", how="outer").set_index("team")
+        out = off.merge(deff, on="team", how="outer")
+
+        # Red-zone TD rate (yardline_100 <= 20)
+        try:
+            if "yardline_100" in pbp.columns:
+                rz = pbp[pbp["yardline_100"].notna() & (pbp["yardline_100"] <= 20)].copy()
+                if not rz.empty:
+                    td_col = "touchdown" if "touchdown" in rz.columns else None
+                    if td_col:
+                        rz["rz_td"] = (rz[td_col].fillna(0).astype(float) > 0).astype(float)
+                    else:
+                        rz["rz_td"] = 0.0
+                    off_rz = rz.groupby("posteam")["rz_td"].mean().rename("off_rz_td")
+                    def_rz = rz.groupby("defteam")["rz_td"].mean().rename("def_rz_td")
+                    out = out.merge(off_rz, left_on="team", right_index=True, how="left")
+                    out = out.merge(def_rz, left_on="team", right_index=True, how="left")
+                    out["off_rz_td"] = out["off_rz_td"].fillna(0.0)
+                    out["def_rz_td"] = out["def_rz_td"].fillna(0.0)
+        except Exception:
+            pass
+
+        return out.set_index("team")
     except Exception:
         return pd.DataFrame()
 
@@ -3650,6 +3678,9 @@ with tab2:
                     signals.append("Divisional"); rule_score += 0.7
 
                 # ---- Option 4: Success rate & explosive-play edge ----
+                sr_edge = 0.0
+                exp_edge = 0.0
+                rz_edge = 0.0
                 try:
                     ts = team_success if isinstance(team_success, pd.DataFrame) else pd.DataFrame()
                 except NameError:
@@ -3662,6 +3693,13 @@ with tab2:
                     h_exp = float(ts.loc[home, "off_explosive"]) - float(ts.loc[away, "def_explosive"])
                     a_exp = float(ts.loc[away, "off_explosive"]) - float(ts.loc[home, "def_explosive"])
                     exp_edge = h_exp - a_exp
+                    if "off_rz_td" in ts.columns and "def_rz_td" in ts.columns:
+                        try:
+                            h_rz = float(ts.loc[home, "off_rz_td"]) - float(ts.loc[away, "def_rz_td"])
+                            a_rz = float(ts.loc[away, "off_rz_td"]) - float(ts.loc[home, "def_rz_td"])
+                            rz_edge = h_rz - a_rz
+                        except Exception:
+                            rz_edge = 0.0
                     if sr_edge > 0.04:
                         signals.append(f"Home success +{sr_edge:.3f}"); rule_score += 1.4
                     elif sr_edge < -0.04:
@@ -3670,6 +3708,10 @@ with tab2:
                         signals.append(f"Home explosive +{exp_edge:.3f}"); rule_score += 1.1
                     elif exp_edge < -0.03:
                         signals.append(f"Away explosive {exp_edge:.3f}"); rule_score += 1.0
+                    if rz_edge > 0.08:
+                        signals.append(f"Home RZ TD +{rz_edge:.3f}"); rule_score += 1.2
+                    elif rz_edge < -0.08:
+                        signals.append(f"Away RZ TD {rz_edge:.3f}"); rule_score += 1.1
 
                 # ---- Option 5: Implied total vs team O/U tendency ----
                 try:
@@ -3776,6 +3818,9 @@ with tab2:
                     epa_edge=float(epa_edge),
                     form_margin_diff=float(form_margin_diff),
                     form_epa_diff=float(form_epa_diff),
+                    success_rate_edge=float(sr_edge),
+                    explosive_rate_edge=float(exp_edge),
+                    redzone_td_edge=float(rz_edge),
                     rest_diff=float(rest_diff),
                     avg_spread=float(avg_spread) if avg_spread is not None else None,
                     avg_total=float(avg_total) if avg_total is not None else 45.0,
@@ -4068,6 +4113,7 @@ with tab3:
         build_upcoming=build_upcoming_games,
         get_team_epa=get_team_epa,
         get_team_pace=get_team_pace,
+        get_team_success_metrics=get_team_success_metrics,
         get_recent_form=_byoa_recent_form,
         rest_differential=rest_differential,
         is_divisional=is_divisional,
@@ -5197,5 +5243,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
 
