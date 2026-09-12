@@ -775,7 +775,6 @@ def render_byoa_tab(
     api_key: str = "",
     n_simulations: int = 8000,
     form_window: int = 6,
-    # Optional injectors for self-contained rebuild
     load_schedules: Optional[Callable] = None,
     load_odds: Optional[Callable] = None,
     build_upcoming: Optional[Callable] = None,
@@ -790,198 +789,323 @@ def render_byoa_tab(
     implied_team_totals: Optional[Callable] = None,
     estimate_week: Optional[Callable] = None,
 ) -> None:
-    """Render the full BYOA tab. Call inside `with tab10:`."""
-    st.subheader("🧪 BYOA — Build Your Own Algorithm")
-    st.caption(
-        "Select factors, assign weights, and generate custom recommendations for this week's games. "
-        "Research tool only — not betting advice."
+    """Render the full BYOA tab (user-friendly layout)."""
+
+    # ---- Hero / intro ----
+    st.markdown(
+        """
+<div style="
+  background: linear-gradient(135deg, #0b1220 0%, #1e3a5f 55%, #1d4ed8 100%);
+  border-radius: 14px; padding: 1.1rem 1.25rem; margin-bottom: 1rem;
+  border: 1px solid rgba(255,255,255,0.08); color: #f8fafc;">
+  <div style="font-size:1.35rem;font-weight:700;margin-bottom:0.25rem;">🧪 Build Your Own Algorithm</div>
+  <div style="color:#cbd5e1;font-size:0.95rem;line-height:1.45;">
+    Pick the factors you care about, set weights, and generate custom leans for this week.
+    Research only — not betting advice.
+  </div>
+</div>
+        """,
+        unsafe_allow_html=True,
     )
+
+    with st.expander("How BYOA works (30 seconds)", expanded=False):
+        st.markdown(
+            """
+**Steps**
+1. Choose **ATS** (spread) or **Total** (over/under)
+2. Turn factors **on/off** and set a **weight** (−5 to +5). Higher weight = more influence.
+3. Load games (**Big Board cache** or **Rebuild features**)
+4. Click **Run algorithm** to rank this week’s games
+
+**Tips**
+- Start with defaults, then tweak 2–3 factors you believe in
+- Use **Minimum score** to hide weak leans
+- **Invert** flips a factor’s direction without changing the weight magnitude
+- Save a **preset** when you like a setup
+            """
+        )
 
     if "byoa_cfg" not in st.session_state:
         st.session_state["byoa_cfg"] = byoa_default_config()
     cfg = st.session_state["byoa_cfg"]
 
-    left, right = st.columns([1.05, 1.45], gap="large")
+    # ---- Quick presets strip ----
+    st.markdown("##### Quick start")
+    q1, q2, q3, q4 = st.columns(4)
+    with q1:
+        if st.button("Defaults", use_container_width=True, help="Reset to balanced defaults"):
+            st.session_state["byoa_cfg"] = byoa_default_config()
+            st.rerun()
+    with q2:
+        if st.button("EPA + Form", use_container_width=True, help="Focus on EPA edge and recent form"):
+            c = byoa_default_config()
+            c["name"] = "EPA + Form"
+            for k, f in c["factors"].items():
+                f["enabled"] = k in ("epa_edge", "form_margin_diff", "form_epa_diff", "rest_diff")
+                if k == "epa_edge":
+                    f["weight"] = 2.5
+                if k in ("form_margin_diff", "form_epa_diff"):
+                    f["weight"] = 1.8
+            st.session_state["byoa_cfg"] = c
+            st.rerun()
+    with q3:
+        if st.button("Under dog bias", use_container_width=True, help="Lean into home dogs + rest"):
+            c = byoa_default_config()
+            c["name"] = "Underdog bias"
+            for k, f in c["factors"].items():
+                f["enabled"] = k in ("spread", "rest_diff", "epa_edge", "tz_diff")
+                if k == "spread":
+                    f["weight"] = 1.6
+                if k == "rest_diff":
+                    f["weight"] = 1.2
+            st.session_state["byoa_cfg"] = c
+            st.rerun()
+    with q4:
+        if st.button("Totals / weather", use_container_width=True, help="Pace + total + weather for O/U"):
+            c = byoa_default_config()
+            c["name"] = "Totals / weather"
+            c["market"] = "Total"
+            for k, f in c["factors"].items():
+                f["enabled"] = k in ("total_line", "pace_vs_avg", "weather_under_bias", "home_imp", "away_imp")
+                if k == "weather_under_bias":
+                    f["weight"] = 1.5
+                if k == "pace_vs_avg":
+                    f["weight"] = 1.2
+            st.session_state["byoa_cfg"] = c
+            st.rerun()
 
-    # ---------- LEFT: builder ----------
+    cfg = st.session_state["byoa_cfg"]
+
+    # ---- Main layout ----
+    left, right = st.columns([1.0, 1.35], gap="large")
+
+    # ================= LEFT: setup =================
     with left:
-        st.markdown("##### Algorithm setup")
+        st.markdown("### 1 · Setup")
         cfg["name"] = st.text_input("Algorithm name", value=cfg.get("name", "My Algorithm"))
-        cfg["market"] = st.radio(
-            "Market",
-            ["ATS", "Total"],
-            horizontal=True,
-            index=0 if cfg.get("market", "ATS") == "ATS" else 1,
-        )
-        if cfg["market"] == "ATS":
-            opts = ["Auto", "Home", "Away"]
-            cfg["prefer_side"] = st.selectbox(
-                "Side preference",
-                opts,
-                index=opts.index(cfg.get("prefer_side", "Auto")) if cfg.get("prefer_side") in opts else 0,
+
+        mcol1, mcol2 = st.columns(2)
+        with mcol1:
+            cfg["market"] = st.radio(
+                "Market",
+                ["ATS", "Total"],
+                horizontal=True,
+                index=0 if cfg.get("market", "ATS") == "ATS" else 1,
+                help="ATS = against the spread. Total = over/under.",
             )
-        else:
-            opts = ["Auto", "Over", "Under"]
-            cfg["total_side_mode"] = st.selectbox(
-                "Total preference",
-                opts,
-                index=opts.index(cfg.get("total_side_mode", "Auto")) if cfg.get("total_side_mode") in opts else 0,
-            )
+        with mcol2:
+            if cfg["market"] == "ATS":
+                opts = ["Auto", "Home", "Away"]
+                cfg["prefer_side"] = st.selectbox(
+                    "Side preference",
+                    opts,
+                    index=opts.index(cfg.get("prefer_side", "Auto")) if cfg.get("prefer_side") in opts else 0,
+                )
+            else:
+                opts = ["Auto", "Over", "Under"]
+                cfg["total_side_mode"] = st.selectbox(
+                    "Total preference",
+                    opts,
+                    index=opts.index(cfg.get("total_side_mode", "Auto")) if cfg.get("total_side_mode") in opts else 0,
+                )
+
         cfg["min_abs_score"] = st.slider(
             "Minimum |score| to recommend",
             0.0, 5.0, float(cfg.get("min_abs_score", 1.25)), 0.05,
+            help="Leans weaker than this show as “No strong lean”.",
         )
 
-        st.markdown("##### Factors & weights")
-        st.caption("Enable a factor, set weight (−5 to +5). Invert flips the contribution sign.")
-        for key, meta in BYOA_FACTORS.items():
-            fcfg = cfg["factors"].setdefault(
-                key,
-                {"enabled": meta["default_enabled"], "weight": meta["default_weight"], "invert": False},
-            )
-            box = st.container(border=True)
-            with box:
-                c1, c2 = st.columns([0.12, 0.88])
-                with c1:
-                    fcfg["enabled"] = st.checkbox(
-                        "on",
-                        value=bool(fcfg.get("enabled")),
-                        key=f"byoa_en_{key}",
-                        label_visibility="collapsed",
+        st.markdown("### 2 · Factors")
+        st.caption("Enable a factor, set its weight. Use **Invert** to flip direction.")
+
+        # Group factors for cleaner UI
+        FACTOR_GROUPS = {
+            "Core matchup": ["epa_edge", "form_margin_diff", "form_epa_diff", "rest_diff"],
+            "Market lines": ["spread", "abs_spread", "total_line", "home_imp", "away_imp", "edge_pct", "model_home_prob"],
+            "Context": ["pace_vs_avg", "weather_under_bias", "tz_diff", "divisional"],
+        }
+
+        enabled_labels = []
+        for group_name, keys in FACTOR_GROUPS.items():
+            with st.expander(group_name, expanded=(group_name == "Core matchup")):
+                for key in keys:
+                    meta = BYOA_FACTORS[key]
+                    fcfg = cfg["factors"].setdefault(
+                        key,
+                        {"enabled": meta["default_enabled"], "weight": meta["default_weight"], "invert": False},
                     )
-                with c2:
-                    st.markdown(f"**{meta['label']}**")
-                    st.caption(meta["help"])
-                    wcol, icol = st.columns([0.65, 0.35])
-                    with wcol:
+                    r1, r2, r3 = st.columns([0.12, 0.53, 0.35])
+                    with r1:
+                        fcfg["enabled"] = st.checkbox(
+                            "on",
+                            value=bool(fcfg.get("enabled")),
+                            key=f"byoa_en_{key}",
+                            label_visibility="collapsed",
+                        )
+                    with r2:
+                        st.markdown(f"**{meta['label']}**")
+                        st.caption(meta["help"])
+                    with r3:
                         fcfg["weight"] = st.number_input(
-                            "Weight",
+                            "W",
                             min_value=-5.0,
                             max_value=5.0,
                             value=float(fcfg.get("weight", meta["default_weight"])),
                             step=0.1,
                             key=f"byoa_w_{key}",
                             disabled=not fcfg["enabled"],
+                            label_visibility="collapsed",
                         )
-                    with icol:
                         fcfg["invert"] = st.checkbox(
                             "Invert",
                             value=bool(fcfg.get("invert")),
                             key=f"byoa_inv_{key}",
                             disabled=not fcfg["enabled"],
                         )
+                    cfg["factors"][key] = fcfg
+                    if fcfg["enabled"]:
+                        inv = " (inv)" if fcfg.get("invert") else ""
+                        enabled_labels.append(f"{key}×{fcfg['weight']:.1f}{inv}")
+
+        # Any factors not in groups (safety)
+        grouped = {k for keys in FACTOR_GROUPS.values() for k in keys}
+        for key, meta in BYOA_FACTORS.items():
+            if key in grouped:
+                continue
+            fcfg = cfg["factors"].setdefault(
+                key,
+                {"enabled": meta["default_enabled"], "weight": meta["default_weight"], "invert": False},
+            )
             cfg["factors"][key] = fcfg
 
         st.session_state["byoa_cfg"] = cfg
 
-        b1, b2, b3 = st.columns(3)
-        with b1:
-            if st.button("Reset defaults", use_container_width=True):
-                st.session_state["byoa_cfg"] = byoa_default_config()
-                st.rerun()
-        with b2:
+        if enabled_labels:
+            st.info("**Active factors:** " + ", ".join(enabled_labels))
+        else:
+            st.warning("No factors enabled — turn at least one on.")
+
+        st.markdown("### Presets")
+        p1, p2, p3 = st.columns(3)
+        with p1:
             if st.button("Save preset", use_container_width=True):
                 save_preset(cfg["name"], deepcopy(cfg))
-                st.success(f"Saved: {cfg['name']}")
-        with b3:
+                st.success(f"Saved “{cfg['name']}”")
+        with p2:
             presets = load_presets()
             names = sorted(presets.keys())
             if names:
-                pick = st.selectbox("Presets", names, label_visibility="collapsed")
-                if st.button("Load", use_container_width=True):
-                    st.session_state["byoa_cfg"] = deepcopy(presets[pick])
-                    st.rerun()
+                pick = st.selectbox("Load", names, label_visibility="collapsed", key="byoa_preset_pick")
             else:
-                st.caption("No presets yet")
+                pick = None
+                st.caption("No saved presets")
+        with p3:
+            if pick and st.button("Load preset", use_container_width=True):
+                st.session_state["byoa_cfg"] = deepcopy(presets[pick])
+                st.rerun()
 
-    # ---------- RIGHT: results ----------
+    # ================= RIGHT: run + results =================
     with right:
-        st.markdown("##### Recommendations")
+        st.markdown("### 3 · Load games & run")
 
         source = st.radio(
-            "Data source",
+            "Game data source",
             [
-                "Big Board cache (fast, uses rows already loaded)",
-                "Rebuild features now (standalone, no Big Board visit)",
+                "Big Board cache (fast)",
+                "Rebuild features now (standalone)",
             ],
             index=0,
+            help="Big Board cache uses rows already computed in The Big Board tab. "
+                 "Standalone rebuild fetches schedule/EPA/form without opening Big Board.",
         )
 
         board_opps = st.session_state.get("bb_opportunities") or []
         standalone_opps = st.session_state.get("byoa_standalone_rows") or []
 
+        status_cols = st.columns(2)
+        with status_cols[0]:
+            st.metric("Big Board rows", len(board_opps))
+        with status_cols[1]:
+            st.metric("Standalone rows", len(standalone_opps))
+
         if source.startswith("Big Board"):
             base_rows = board_opps
             if not base_rows:
                 st.info(
-                    "No Big Board opportunities in session yet. "
+                    "No Big Board data in this session yet. "
                     "Open **The Big Board** once, or switch to **Rebuild features now**."
                 )
         else:
-            can_rebuild = all(
-                fn is not None
-                for fn in (load_schedules, build_upcoming, get_team_epa)
-            )
+            can_rebuild = all(fn is not None for fn in (load_schedules, build_upcoming, get_team_epa))
             if not can_rebuild:
-                st.warning(
-                    "Standalone rebuild is not fully wired. "
-                    "Pass data-loader callables into `render_byoa_tab(...)`, "
-                    "or use Big Board cache."
-                )
-            col_a, col_b = st.columns([1, 1])
-            with col_a:
-                if st.button("Rebuild feature rows", type="secondary", disabled=not can_rebuild):
-                    with st.spinner("Building feature rows…"):
-                        standalone_opps = rebuild_feature_rows(
-                            api_key=api_key,
-                            form_window=form_window,
-                            load_schedules=load_schedules,
-                            load_odds=load_odds,
-                            build_upcoming=build_upcoming,
-                            get_team_epa=get_team_epa,
-                            get_team_pace=get_team_pace,
-                            get_recent_form=get_recent_form,
-                            rest_differential=rest_differential,
-                            is_divisional=is_divisional,
-                            timezone_diff=timezone_diff,
-                            weather_cache_builder=weather_cache_builder,
-                            weather_adjustments=weather_adjustments,
-                            implied_team_totals=implied_team_totals,
-                            estimate_week=estimate_week,
-                        )
-                        st.session_state["byoa_standalone_rows"] = standalone_opps
-                        st.success(f"Built {len(standalone_opps)} game feature rows")
+                st.warning("Standalone rebuild isn’t fully wired — use Big Board cache, or pass data loaders.")
+            if st.button("Rebuild feature rows", type="secondary", disabled=not can_rebuild, use_container_width=True):
+                with st.spinner("Building feature rows…"):
+                    standalone_opps = rebuild_feature_rows(
+                        api_key=api_key,
+                        form_window=form_window,
+                        load_schedules=load_schedules,
+                        load_odds=load_odds,
+                        build_upcoming=build_upcoming,
+                        get_team_epa=get_team_epa,
+                        get_team_pace=get_team_pace,
+                        get_recent_form=get_recent_form,
+                        rest_differential=rest_differential,
+                        is_divisional=is_divisional,
+                        timezone_diff=timezone_diff,
+                        weather_cache_builder=weather_cache_builder,
+                        weather_adjustments=weather_adjustments,
+                        implied_team_totals=implied_team_totals,
+                        estimate_week=estimate_week,
+                    )
+                    st.session_state["byoa_standalone_rows"] = standalone_opps
+                    st.success(f"Built {len(standalone_opps)} game feature rows")
             base_rows = st.session_state.get("byoa_standalone_rows") or []
-            if not base_rows:
-                st.caption("Click **Rebuild feature rows** to score without visiting The Big Board.")
 
         if base_rows:
             weeks = sorted({str(r.get("Week") or "—") for r in base_rows})
-            week_pick = st.multiselect("Filter weeks", weeks, default=weeks, key="byoa_weeks")
+            week_pick = st.multiselect("Weeks to include", weeks, default=weeks, key="byoa_weeks")
             filtered = [r for r in base_rows if str(r.get("Week") or "—") in set(week_pick)]
+            st.caption(f"{len(filtered)} games selected")
 
-            if st.button("Run BYOA", type="primary"):
-                result = run_byoa_on_rows(filtered, cfg)
-                st.session_state["byoa_result"] = result
+            run = st.button("▶  Run algorithm", type="primary", use_container_width=True)
+            if run:
+                with st.spinner("Scoring games…"):
+                    result = run_byoa_on_rows(filtered, cfg)
+                    st.session_state["byoa_result"] = result
 
             result = st.session_state.get("byoa_result")
             if isinstance(result, pd.DataFrame) and not result.empty:
-                show = result.drop(columns=[c for c in ("_contribs", "_features", "_home", "_away") if c in result.columns])
-                st.dataframe(show, use_container_width=True, hide_index=True)
+                st.markdown("### Results")
+                # Summary metrics
+                leans = result[result["Recommendation"].astype(str) != "No strong lean"]
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Games scored", len(result))
+                c2.metric("Strong leans", len(leans))
+                top_conf = leans["Confidence"].iloc[0] if len(leans) else "—"
+                c3.metric("Top confidence", str(top_conf))
+                c4.metric("Market", cfg.get("market", "ATS"))
 
-                st.markdown("##### Inspect one game")
+                show = result.drop(
+                    columns=[c for c in ("_contribs", "_features", "_home", "_away") if c in result.columns]
+                )
+                # Highlight strong leans first already sorted
+                st.dataframe(show, use_container_width=True, hide_index=True, height=360)
+
+                st.markdown("#### Inspect a game")
                 labels = show["Game"].astype(str).tolist()
                 choice = st.selectbox("Game", labels, key="byoa_inspect")
                 row = result[result["Game"].astype(str) == choice].iloc[0]
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Recommendation", str(row["Recommendation"]))
                 m2.metric("Confidence", str(row["Confidence"]))
-                m3.metric("BYOA Score", f"{row['BYOA Score']:+.3f}")
+                m3.metric("BYOA Score", f"{float(row['BYOA Score']):+.3f}")
 
                 contribs = row.get("_contribs") or []
                 if contribs:
-                    st.markdown("**Contribution breakdown**")
-                    st.dataframe(pd.DataFrame(contribs), use_container_width=True, hide_index=True)
+                    with st.expander("Contribution breakdown", expanded=True):
+                        cdf = pd.DataFrame(contribs)
+                        st.dataframe(cdf, use_container_width=True, hide_index=True)
 
                 feats = row.get("_features") or {}
                 if feats:
@@ -989,17 +1113,20 @@ def render_byoa_tab(
                         st.json(feats)
 
                 st.download_button(
-                    "Download BYOA CSV",
+                    "Download results CSV",
                     data=show.to_csv(index=False).encode("utf-8"),
                     file_name=f"byoa_{str(cfg.get('name', 'algo')).replace(' ', '_').lower()}.csv",
                     mime="text/csv",
+                    use_container_width=True,
                 )
             elif result is not None:
-                st.warning("No rows scored. Adjust filters or weights.")
+                st.warning("No rows scored. Enable factors or loosen the minimum score.")
+        else:
+            st.caption("Load games above, then run the algorithm.")
 
     st.markdown("---")
     st.caption(
-        f"BYOA engine · {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
-        "Weights are linear and intentionally simple for transparency."
+        f"BYOA · {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
+        "Linear weighted factors for transparency. Not betting advice."
     )
 
