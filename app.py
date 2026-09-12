@@ -1712,6 +1712,14 @@ def _grade_signal_history(schedules: pd.DataFrame) -> pd.DataFrame:
     if hist.empty:
         return hist
 
+    # CSV load often infers float for mostly-empty string columns; allow str/None writes
+    for _col in (
+        "result", "graded_at", "recommendation", "game", "kickoff",
+        "home", "away", "confidence", "id", "logged_at", "correct",
+    ):
+        if _col in hist.columns:
+            hist[_col] = hist[_col].astype(object)
+
     today = pd.Timestamp.now().normalize()
 
     def _parse_day(val) -> Optional[pd.Timestamp]:
