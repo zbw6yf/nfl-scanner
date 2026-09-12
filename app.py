@@ -1,3 +1,12 @@
+"""
+TAIL ME Sports — Streamlit entry point.
+
+Modular pieces live under config/, utils/, ui/, persistence/.
+Heavy domain logic and tab UI are still in this file for compatibility;
+extract further following README.md.
+"""
+from __future__ import annotations
+
 import streamlit as st
 import pandas as pd
 import requests
@@ -9,15 +18,52 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 import warnings
 warnings.filterwarnings("ignore")
+
 try:
     import nflreadpy as nfl
 except ImportError:
     st.error("nflreadpy is not installed. Run: pip install nflreadpy")
     st.stop()
+
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+
 from byoa import render_byoa_tab, features_dict_for_board_row
+
+# ---- Modular imports ----
+from config.constants import (
+    TEAM_NAME_TO_ABBR, ABBR_TO_FULL, STADIUM_COORDS, TEAM_TZ, DIVISIONS, TEAM_TO_DIV,
+    TEAM_COLORS, CONF_COLORS, DEFAULT_FEATURE_FLAGS, TEAM_ALIASES, SLUG_TO_ABBR,
+)
+from utils.teams import (
+    to_abbr, full_name, expand_team, is_divisional, timezone_diff, travel_direction,
+    normalize_team_abbr,
+)
+from utils.dates import (
+    format_kickoff, format_schedule_kickoff, estimate_week_from_date, current_nfl_week,
+)
+from utils.odds_utils import (
+    implied_team_totals, american_to_implied_prob, remove_vig_two_way,
+    compute_edge, american_profit, clv_spread, clv_total,
+)
+from utils.features import (
+    feature_enabled, user_tier, require_pro, stripe_payment_link, render_upgrade_cta,
+)
+from ui.theme import (
+    inject_theme_css, get_logo_data_uri, conf_pill,
+    stamp_now, stamp_text, last_update_caption,
+)
+from persistence.storage import (
+    _load_saved_api_key, _save_api_key,
+    _load_signal_history, _save_signal_history,
+    _load_bet_log, _save_bet_log,
+)
+
+# Alias used by older code
+_expand_team = expand_team
+_normalize_team_abbr = normalize_team_abbr
+
 # -----------------------------
 # PAGE CONFIG
 # -----------------------------
@@ -30,6 +76,7 @@ for _p in [
     if _p.exists():
         _page_icon = str(_p)
         break
+
 st.set_page_config(
     page_title="TAIL ME Sports",
     page_icon=_page_icon,
@@ -37,291 +84,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---- Theme + polish CSS ----
 if "ui_theme" not in st.session_state:
     st.session_state["ui_theme"] = "Dark"
-
-TEAM_COLORS = {
-    "ARI": "#97233F", "ATL": "#A71930", "BAL": "#241773", "BUF": "#00338D",
-    "CAR": "#0085CA", "CHI": "#0B162A", "CIN": "#FB4F14", "CLE": "#311D00",
-    "DAL": "#003594", "DEN": "#FB4F14", "DET": "#0076B6", "GB": "#203731",
-    "HOU": "#03202F", "IND": "#002C5F", "JAX": "#006778", "KC": "#E31837",
-    "LAC": "#0080C6", "LA": "#003594", "LV": "#000000", "MIA": "#008E97",
-    "MIN": "#4F2683", "NE": "#002244", "NO": "#D3BC8D", "NYG": "#0B2265",
-    "NYJ": "#125740", "PHI": "#004C54", "PIT": "#FFB612", "SF": "#AA0000",
-    "SEA": "#002244", "TB": "#D50A0A", "TEN": "#0C2340", "WAS": "#5A1414",
-}
-
-CONF_COLORS = {"A": "#22c55e", "B": "#84cc16", "C": "#eab308", "D": "#f97316", "F": "#6b7280"}
-
-
-def inject_theme_css(theme: str) -> None:
-    dark = theme == "Dark"
-    bg = "#0e1117" if dark else "#f7f8fa"
-    card = "#1a1f2e" if dark else "#ffffff"
-    text = "#e8eaed" if dark else "#1a1d26"
-    muted = "#9aa0a6" if dark else "#5f6368"
-    accent = "#3b82f6"
-    border = "#2d3348" if dark else "#e5e7eb"
-    st.markdown(
-        f"""
-<style>
-    .stApp {{ background-color: {bg}; color: {text}; }}
-    .block-container {{ padding-top: 1.2rem; padding-bottom: 2rem; }}
-    h1, h2, h3, h4 {{ letter-spacing: -0.02em; }}
-    div[data-testid="stMetric"] {{
-        background: {card};
-        border: 1px solid {border};
-        border-radius: 12px;
-        padding: 12px 14px;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.06);
-    }}
-    div[data-testid="stMetric"] label {{ color: {muted} !important; }}
-    .nsc-hero {{
-        background: linear-gradient(135deg, #0b1220 0%, #1e3a5f 55%, #1d4ed8 100%);
-        border-radius: 16px;
-        padding: 1.25rem 1.5rem;
-        margin-bottom: 1rem;
-        color: #f8fafc;
-        border: 1px solid rgba(255,255,255,0.08);
-    }}
-    .nsc-hero h1 {{
-        margin: 0;
-        font-size: 1.75rem;
-        font-weight: 700;
-        color: #f8fafc !important;
-    }}
-    .nsc-hero p {{
-        margin: 0.35rem 0 0 0;
-        color: #cbd5e1;
-        font-size: 0.95rem;
-    }}
-    .nsc-badge {{
-        display: inline-block;
-        padding: 2px 10px;
-        border-radius: 999px;
-        font-size: 0.75rem;
-        font-weight: 600;
-        margin-right: 6px;
-        background: rgba(255,255,255,0.12);
-        color: #e2e8f0;
-    }}
-    .nsc-card {{
-        background: {card};
-        border: 1px solid {border};
-        border-radius: 12px;
-        padding: 0.9rem 1rem;
-        margin-bottom: 0.65rem;
-    }}
-    .nsc-card-title {{ font-weight: 650; font-size: 1.02rem; margin-bottom: 0.25rem; color: {text}; }}
-    .nsc-muted {{ color: {muted}; font-size: 0.85rem; }}
-    .nsc-pill {{
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 6px;
-        font-size: 0.78rem;
-        font-weight: 600;
-        margin-right: 4px;
-    }}
-    .nsc-stamp {{
-        color: {muted};
-        font-size: 0.8rem;
-        margin: 0.15rem 0 0.75rem 0;
-    }}
-    .nsc-footer {{
-        margin-top: 2rem;
-        padding-top: 0.75rem;
-        border-top: 1px solid {border};
-        color: {muted};
-        font-size: 0.8rem;
-    }}
-    [data-testid="stSidebar"] {{
-        background: {"#111827" if dark else "#ffffff"};
-        border-right: 1px solid {border};
-    }}
-</style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-
-
-LOGO_CANDIDATES = [
-    Path(__file__).resolve().parent / "tailme_logo.png",
-    Path("/home/workdir/artifacts/tailme_logo.png"),
-    Path("tailme_logo.png"),
-    Path("assets/tailme_logo.png"),
-]
-
-
-def get_logo_data_uri() -> Optional[str]:
-    """Load company logo as a data URI for the header."""
-    try:
-        for p in LOGO_CANDIDATES:
-            if p.exists() and p.is_file():
-                raw = p.read_bytes()
-                b64 = base64.b64encode(raw).decode("ascii")
-                return f"data:image/png;base64,{b64}"
-    except Exception:
-        pass
-    return None
-
-
-API_KEY_PATH = Path("/home/workdir/artifacts/odds_api_key.txt")
-
-
-def _load_saved_api_key() -> str:
-    try:
-        if "odds_api_key" in st.session_state and st.session_state.get("odds_api_key"):
-            return str(st.session_state.get("odds_api_key") or "")
-        if API_KEY_PATH.exists():
-            key = API_KEY_PATH.read_text(encoding="utf-8").strip()
-            if key:
-                st.session_state["odds_api_key"] = key
-                return key
-    except Exception:
-        pass
-    return ""
-
-
-def _save_api_key(key: str) -> None:
-    key = (key or "").strip()
-    st.session_state["odds_api_key"] = key
-    try:
-        if key:
-            API_KEY_PATH.write_text(key, encoding="utf-8")
-        elif API_KEY_PATH.exists():
-            API_KEY_PATH.unlink()
-    except Exception:
-        pass
-
-
-
-# ---------------------------------------------------------------------------
-# Feature flags (Stripe-ready)
-# Free vs Pro gating. Flip flags or set secrets without rewriting UI code.
-# Streamlit secrets example:
-#   [features]
-#   stripe_enabled = true
-#   require_pro_for_props = true
-#   [stripe]
-#   price_id_pro = "price_xxx"
-#   payment_link = "https://buy.stripe.com/xxx"
-# ---------------------------------------------------------------------------
-DEFAULT_FEATURE_FLAGS = {
-    "stripe_enabled": False,          # master switch for paywall CTAs
-    "require_pro_for_props": False,    # gate Player Props
-    "require_pro_for_bankroll": False, # gate Bankroll & CLV
-    "require_pro_for_history": False,  # gate Signal History detail
-    "require_pro_for_backtest": False,
-    "today_card": True,               # Homepage Today's Card
-    "show_upgrade_cta": True,
-}
-
-
-def _secrets_features() -> dict:
-    try:
-        feat = st.secrets.get("features", {})
-        return dict(feat) if feat else {}
-    except Exception:
-        return {}
-
-
-def feature_enabled(name: str) -> bool:
-    flags = dict(DEFAULT_FEATURE_FLAGS)
-    flags.update(_secrets_features())
-    # session overrides for testing
-    overrides = st.session_state.get("feature_flag_overrides") or {}
-    flags.update(overrides)
-    return bool(flags.get(name, False))
-
-
-def user_tier() -> str:
-    """free | pro — set via session after Stripe webhook / login (future)."""
-    tier = st.session_state.get("user_tier")
-    if tier in ("free", "pro"):
-        return tier
-    try:
-        if st.secrets.get("user_tier") in ("free", "pro"):
-            return str(st.secrets.get("user_tier"))
-    except Exception:
-        pass
-    return "free"
-
-
-def require_pro(flag_name: str) -> bool:
-    """Return True if the user is blocked (needs Pro)."""
-    if not feature_enabled(flag_name):
-        return False
-    if not feature_enabled("stripe_enabled"):
-        return False  # soft launch: flags on but stripe off = allow all
-    return user_tier() != "pro"
-
-
-def stripe_payment_link() -> str:
-    try:
-        return str(st.secrets.get("stripe", {}).get("payment_link") or "")
-    except Exception:
-        return ""
-
-
-def render_upgrade_cta(context: str = "") -> None:
-    if not feature_enabled("show_upgrade_cta"):
-        return
-    if not feature_enabled("stripe_enabled"):
-        return
-    if user_tier() == "pro":
-        return
-    link = stripe_payment_link()
-    msg = "Pro unlocks full Signal History, props, bankroll tools, and priority board refresh."
-    if context:
-        msg = f"{context} {msg}"
-    st.warning(msg)
-    if link:
-        st.link_button("Upgrade to Pro", link, type="primary")
-    else:
-        st.caption("Set secrets.stripe.payment_link to enable checkout.")
-
-
-def stamp_now(key: str) -> None:
-    st.session_state[f"updated_{key}"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def stamp_text(key: str, label: str) -> str:
-    val = st.session_state.get(f"updated_{key}")
-    if not val:
-        return f"{label}: —"
-    return f"{label}: {val}"
-
-
-def last_update_caption(*keys: str, label: str = "Last update") -> str:
-    """Best (most recent) timestamp among keys, for section footers."""
-    times = []
-    for key in keys:
-        val = st.session_state.get(f"updated_{key}")
-        if val:
-            times.append(str(val))
-    if not times:
-        # fall back to "now" if section is actively rendering with data
-        return f"{label}: not yet refreshed this session"
-    times.sort()
-    return f"{label}: {times[-1]}"
-
-
-def current_nfl_week() -> Optional[int]:
-    """Best-effort current NFL week from today's date."""
-    try:
-        return estimate_week_from_date(datetime.now().strftime("%Y-%m-%d"))
-    except Exception:
-        return None
-
-
-def conf_pill(grade: str) -> str:
-    g = (grade or "F").upper()[:1]
-    color = CONF_COLORS.get(g, "#6b7280")
-    return f'<span class="nsc-pill" style="background:{color}22;color:{color};border:1px solid {color}55">{g}</span>'
-
 
 inject_theme_css(st.session_state.get("ui_theme", "Dark"))
 
@@ -400,144 +164,17 @@ st.markdown(
     <p class="tailme-sub">Schedule, weather, injuries, depth charts, and model signals — not betting advice.</p>
   </div>
 </div>
-    """,
+""",
     unsafe_allow_html=True,
 )
-# -----------------------------
-# CONSTANTS
-# -----------------------------
-TEAM_NAME_TO_ABBR = {
-    "Arizona Cardinals": "ARI", "Atlanta Falcons": "ATL", "Baltimore Ravens": "BAL",
-    "Buffalo Bills": "BUF", "Carolina Panthers": "CAR", "Chicago Bears": "CHI",
-    "Cincinnati Bengals": "CIN", "Cleveland Browns": "CLE", "Dallas Cowboys": "DAL",
-    "Denver Broncos": "DEN", "Detroit Lions": "DET", "Green Bay Packers": "GB",
-    "Houston Texans": "HOU", "Indianapolis Colts": "IND", "Jacksonville Jaguars": "JAX",
-    "Kansas City Chiefs": "KC", "Las Vegas Raiders": "LV", "Los Angeles Chargers": "LAC",
-    "Los Angeles Rams": "LA", "Miami Dolphins": "MIA", "Minnesota Vikings": "MIN",
-    "New England Patriots": "NE", "New Orleans Saints": "NO", "New York Giants": "NYG",
-    "New York Jets": "NYJ", "Philadelphia Eagles": "PHI", "Pittsburgh Steelers": "PIT",
-    "San Francisco 49ers": "SF", "Seattle Seahawks": "SEA", "Tampa Bay Buccaneers": "TB",
-    "Tennessee Titans": "TEN", "Washington Commanders": "WAS",
-    "Washington Football Team": "WAS", "Oakland Raiders": "LV",
-    "San Diego Chargers": "LAC", "St. Louis Rams": "LA",
-}
-# Reverse map for display names
-ABBR_TO_FULL = {v: k for k, v in TEAM_NAME_TO_ABBR.items() if k not in (
-    "Washington Football Team", "Oakland Raiders", "San Diego Chargers", "St. Louis Rams"
-)}
-# Prefer modern names
-ABBR_TO_FULL.update({
-    "WAS": "Washington Commanders",
-    "LV": "Las Vegas Raiders",
-    "LAC": "Los Angeles Chargers",
-    "LA": "Los Angeles Rams",
-})
 
-STADIUM_COORDS = {
-    "ARI": (33.5275, -112.2625), "ATL": (33.7554, -84.4010), "BAL": (39.2780, -76.6227),
-    "BUF": (42.7738, -78.7870), "CAR": (35.2258, -80.8528), "CHI": (41.8623, -87.6167),
-    "CIN": (39.0950, -84.5160), "CLE": (41.5061, -81.6995), "DAL": (32.7473, -97.0945),
-    "DEN": (39.7439, -105.0201), "DET": (42.3400, -83.0456), "GB": (44.5013, -88.0622),
-    "HOU": (29.6847, -95.4107), "IND": (39.7601, -86.1639), "JAX": (30.3239, -81.6373),
-    "KC": (39.0489, -94.4839), "LAC": (33.9535, -118.3392), "LA": (33.9535, -118.3392),
-    "LV": (36.0908, -115.1830), "MIA": (25.9580, -80.2389), "MIN": (44.9738, -93.2581),
-    "NE": (42.0909, -71.2643), "NO": (29.9511, -90.0812), "NYG": (40.8128, -74.0742),
-    "NYJ": (40.8128, -74.0742), "PHI": (39.9008, -75.1675), "PIT": (40.4468, -80.0158),
-    "SF": (37.4033, -121.9694), "SEA": (47.5952, -122.3316), "TB": (27.9759, -82.5033),
-    "TEN": (36.1665, -86.7713), "WAS": (38.9077, -76.8645),
-}
-# Time zone offsets from UTC (standard; DST handled roughly via season)
-TEAM_TZ = {
-    "ARI": -7, "ATL": -5, "BAL": -5, "BUF": -5, "CAR": -5, "CHI": -6,
-    "CIN": -5, "CLE": -5, "DAL": -6, "DEN": -7, "DET": -5, "GB": -6,
-    "HOU": -6, "IND": -5, "JAX": -5, "KC": -6, "LAC": -8, "LA": -8,
-    "LV": -8, "MIA": -5, "MIN": -6, "NE": -5, "NO": -6, "NYG": -5,
-    "NYJ": -5, "PHI": -5, "PIT": -5, "SF": -8, "SEA": -8, "TB": -5,
-    "TEN": -6, "WAS": -5,
-}
-# NFL Divisions (stable alignment)
-DIVISIONS = {
-    "AFC East": {"BUF", "MIA", "NE", "NYJ"},
-    "AFC North": {"BAL", "CIN", "CLE", "PIT"},
-    "AFC South": {"HOU", "IND", "JAX", "TEN"},
-    "AFC West": {"DEN", "KC", "LAC", "LV"},
-    "NFC East": {"DAL", "NYG", "PHI", "WAS"},
-    "NFC North": {"CHI", "DET", "GB", "MIN"},
-    "NFC South": {"ATL", "CAR", "NO", "TB"},
-    "NFC West": {"ARI", "LA", "SF", "SEA"},
-}
-TEAM_TO_DIV = {}
-for div, teams in DIVISIONS.items():
-    for t in teams:
-        TEAM_TO_DIV[t] = div
-
-def to_abbr(name: str) -> Optional[str]:
-    if not name or not isinstance(name, str):
-        return None
-    name = name.strip()
-    if name in TEAM_NAME_TO_ABBR:
-        return TEAM_NAME_TO_ABBR[name]
-    if len(name) <= 3 and name.isupper():
-        return name
-    return None
-
-def full_name(abbr: str) -> str:
-    return ABBR_TO_FULL.get(abbr, abbr)
+# ===========================================================================
+# REMAINING ORIGINAL LOGIC
+# (Data loaders, modeling, board builders, and all tab UI stay here for now.
+#  Import the modular helpers above instead of redefining them.)
+# ===========================================================================
 
 
-def format_kickoff(commence_raw: str) -> str:
-    """
-    Convert Odds API commence_time (UTC ISO) to US/Eastern for display.
-    Avoids evening games rolling to the next calendar day in UTC.
-    """
-    if not commence_raw:
-        return ""
-    try:
-        ts = pd.to_datetime(commence_raw, utc=True)
-        try:
-            from zoneinfo import ZoneInfo
-            ts_et = ts.tz_convert(ZoneInfo("America/New_York"))
-        except Exception:
-            ts_et = ts.tz_convert(None) - pd.Timedelta(hours=4)
-            return ts_et.strftime("%Y-%m-%d %H:%M ET")
-        return ts_et.strftime("%Y-%m-%d %H:%M ET")
-    except Exception:
-        return (commence_raw[:16].replace("T", " ") if len(commence_raw) >= 16 else commence_raw)
-
-
-def format_schedule_kickoff(gameday: str, gametime: Optional[str]) -> str:
-    """Build display kickoff from schedule gameday + gametime (local ET style)."""
-    if not gameday:
-        return ""
-    gd = str(gameday)[:10]
-    gt = (str(gametime).strip() if gametime and str(gametime) not in ("None", "nan") else "")
-    if gt:
-        # gametime is usually "13:00" or "20:15" in Eastern
-        try:
-            hh, mm = gt.split(":")[:2]
-            return f"{gd} {int(hh):02d}:{mm} ET"
-        except Exception:
-            return f"{gd} {gt} ET"
-    return f"{gd} ET"
-
-
-def is_divisional(home: str, away: str) -> bool:
-    return TEAM_TO_DIV.get(home) == TEAM_TO_DIV.get(away) and home in TEAM_TO_DIV
-
-def timezone_diff(home: str, away: str) -> int:
-    """Absolute hours of timezone change for the away team traveling to home."""
-    h = TEAM_TZ.get(home, -5)
-    a = TEAM_TZ.get(away, -5)
-    return abs(h - a)
-
-def travel_direction(home: str, away: str) -> str:
-    """Rough direction of travel for away team: Eastbound, Westbound, or None."""
-    h = TEAM_TZ.get(home, -5)
-    a = TEAM_TZ.get(away, -5)
-    diff = h - a  # positive = away is traveling west (to earlier TZ)
-    if abs(diff) < 1:
-        return "None"
-    return "Westbound" if diff > 0 else "Eastbound"
 # -----------------------------
 # SIDEBAR
 # -----------------------------
@@ -1793,39 +1430,6 @@ _TEAM_ALIASES = {
 def _expand_team(t: str) -> set:
     return _TEAM_ALIASES.get(t, {t}) | {t}
 
-def estimate_week_from_date(game_date: str) -> Optional[int]:
-    """
-    Estimate NFL week from calendar date when schedule lookup fails.
-
-    NFL weeks run roughly Thursday → following Wednesday (MNF included).
-    Week 1 anchor = first Thursday on/after Sept 4 of the season year.
-    Games 1–3 days before that Thursday (Wed openers) still count as Week 1.
-    """
-    try:
-        target = pd.to_datetime(str(game_date)[:10], errors="coerce")
-        if pd.isna(target):
-            return None
-        target = pd.Timestamp(year=target.year, month=target.month, day=target.day)
-        year = target.year if target.month >= 3 else target.year - 1
-
-        week1_thu = pd.Timestamp(year=year, month=9, day=4)
-        while week1_thu.weekday() != 3:  # Thursday = 3
-            week1_thu += pd.Timedelta(days=1)
-
-        if target < week1_thu - pd.Timedelta(days=3):
-            if target < week1_thu - pd.Timedelta(days=10):
-                return None
-            return 1
-
-        days_since_thu = (target - week1_thu).days
-        week = days_since_thu // 7 + 1
-        if week < 1:
-            return 1
-        if week > 22:
-            return None
-        return int(week)
-    except Exception:
-        return None
 
 def get_week(schedules: pd.DataFrame, home: str, away: str, game_date: str) -> Optional[int]:
     """
@@ -1891,35 +1495,7 @@ def get_week(schedules: pd.DataFrame, home: str, away: str, game_date: str) -> O
         return est
 
 
-def implied_team_totals(spread: float, total: float) -> Tuple[float, float]:
-    """
-    spread = home team line (negative if home favorite).
-    Returns (home_implied, away_implied).
-    """
-    home_imp = (total - spread) / 2.0
-    away_imp = (total + spread) / 2.0
-    return home_imp, away_imp
 
-
-def american_to_implied_prob(american_odds) -> Optional[float]:
-    """Convert American odds to implied probability (no-vig raw)."""
-    try:
-        o = float(american_odds)
-    except Exception:
-        return None
-    if o < 0:
-        return (-o) / ((-o) + 100.0)
-    if o > 0:
-        return 100.0 / (o + 100.0)
-    return None
-
-
-def remove_vig_two_way(p_home: float, p_away: float) -> Tuple[float, float]:
-    """Normalize two-way implied probs so they sum to 1."""
-    s = p_home + p_away
-    if s <= 0:
-        return 0.5, 0.5
-    return p_home / s, p_away / s
 
 
 def extract_moneylines(odds_ev: Optional[Dict], home_full: str, away_full: str) -> Tuple[Optional[float], Optional[float]]:
@@ -1971,13 +1547,6 @@ def market_home_win_prob(odds_ev: Optional[Dict], home_full: str, away_full: str
         except Exception:
             return None
     return None
-
-
-def compute_edge(model_prob: float, market_prob: Optional[float]) -> Optional[float]:
-    """Model probability edge vs market (percentage points)."""
-    if market_prob is None:
-        return None
-    return (model_prob - market_prob) * 100.0
 
 
 
@@ -2052,142 +1621,9 @@ def confidence_grade(
 
 
 
-def clv_spread(line_taken: float, closing_line: float, side: str) -> float:
-    """
-    Closing line value in points for an ATS bet.
-    side: 'home' or 'away' — line_taken is the home spread when side=home,
-    or the away spread (usually -home_spread) when side=away.
-    Positive CLV = you got a better number than close.
-    """
-    try:
-        lt = float(line_taken)
-        cl = float(closing_line)
-    except Exception:
-        return 0.0
-    side = (side or "home").lower()
-    if side == "home":
-        # Took home +3, closed home +1 → CLV = +2 (better)
-        return lt - cl
-    # Away side: away line is typically -home_line
-    # Took away -3 (home was +3), close away -1 (home +1) → better by 2
-    return cl - lt
-
-
-def clv_total(line_taken: float, closing_total: float, side: str) -> float:
-    """CLV for totals in points. Over: higher line taken is better. Under: lower is better."""
-    try:
-        lt = float(line_taken)
-        cl = float(closing_total)
-    except Exception:
-        return 0.0
-    side = (side or "over").lower()
-    if side == "over":
-        return lt - cl  # took 47, closed 45.5 → +1.5
-    return cl - lt  # under: took 44, closed 45.5 → +1.5
 
 
 
-
-
-SLUG_TO_ABBR = {
-    "arizona-cardinals": "ARI", "atlanta-falcons": "ATL", "baltimore-ravens": "BAL",
-    "buffalo-bills": "BUF", "carolina-panthers": "CAR", "chicago-bears": "CHI",
-    "cincinnati-bengals": "CIN", "cleveland-browns": "CLE", "dallas-cowboys": "DAL",
-    "denver-broncos": "DEN", "detroit-lions": "DET", "green-bay-packers": "GB",
-    "houston-texans": "HOU", "indianapolis-colts": "IND", "jacksonville-jaguars": "JAX",
-    "kansas-city-chiefs": "KC", "las-vegas-raiders": "LV", "los-angeles-chargers": "LAC",
-    "los-angeles-rams": "LA", "miami-dolphins": "MIA", "minnesota-vikings": "MIN",
-    "new-england-patriots": "NE", "new-orleans-saints": "NO", "new-york-giants": "NYG",
-    "new-york-jets": "NYJ", "philadelphia-eagles": "PHI", "pittsburgh-steelers": "PIT",
-    "san-francisco-49ers": "SF", "seattle-seahawks": "SEA", "tampa-bay-buccaneers": "TB",
-    "tennessee-titans": "TEN", "washington-commanders": "WAS",
-}
-
-ESPN_TEAM_IDS = {
-    "ARI": 22, "ATL": 1, "BAL": 33, "BUF": 2, "CAR": 29, "CHI": 3, "CIN": 4, "CLE": 5,
-    "DAL": 6, "DEN": 7, "DET": 8, "GB": 9, "HOU": 34, "IND": 11, "JAX": 30, "KC": 12,
-    "LAC": 24, "LA": 14, "LV": 13, "MIA": 15, "MIN": 16, "NE": 17, "NO": 18, "NYG": 19,
-    "NYJ": 20, "PHI": 21, "PIT": 23, "SF": 25, "SEA": 26, "TB": 27, "TEN": 10, "WAS": 28,
-}
-
-# Ourlads uses LAR for Rams
-OURLADS_ABBR = {**{a: a for a in ESPN_TEAM_IDS}, "LA": "LAR", "WAS": "WAS"}
-
-
-
-
-def american_profit(units: float, american_odds: float, won: bool) -> float:
-    if not won:
-        return -abs(units)
-    try:
-        o = float(american_odds)
-    except Exception:
-        o = -110.0
-    if o < 0:
-        return abs(units) * (100.0 / (-o))
-    return abs(units) * (o / 100.0)
-
-
-BET_LOG_PATH = Path("/home/workdir/artifacts/bet_log.csv")
-
-
-def _load_bet_log() -> pd.DataFrame:
-    cols = [
-        "id", "logged_at", "week", "game", "bet_type", "side", "line_taken",
-        "odds", "units", "model_prob", "market_prob", "edge_pct",
-        "closing_line", "result", "profit_units", "clv", "notes",
-    ]
-    if "bet_log_df" in st.session_state and isinstance(st.session_state.get("bet_log_df"), pd.DataFrame):
-        return st.session_state["bet_log_df"]
-    try:
-        if BET_LOG_PATH.exists():
-            df = pd.read_csv(BET_LOG_PATH)
-            st.session_state["bet_log_df"] = df
-            return df
-    except Exception:
-        pass
-    df = pd.DataFrame(columns=cols)
-    st.session_state["bet_log_df"] = df
-    return df
-
-
-def _save_bet_log(df: pd.DataFrame) -> None:
-    st.session_state["bet_log_df"] = df
-    try:
-        df.to_csv(BET_LOG_PATH, index=False)
-    except Exception:
-        pass
-
-
-SIGNAL_HISTORY_PATH = Path("/home/workdir/artifacts/signal_history.csv")
-
-
-def _load_signal_history() -> pd.DataFrame:
-    cols = [
-        "id", "logged_at", "week", "game", "home", "away", "kickoff",
-        "recommendation", "confidence", "score", "spread", "total",
-        "result", "correct", "graded_at",
-    ]
-    if "signal_history_df" in st.session_state and isinstance(st.session_state.get("signal_history_df"), pd.DataFrame):
-        return st.session_state["signal_history_df"]
-    try:
-        if SIGNAL_HISTORY_PATH.exists():
-            df = pd.read_csv(SIGNAL_HISTORY_PATH)
-            st.session_state["signal_history_df"] = df
-            return df
-    except Exception:
-        pass
-    df = pd.DataFrame(columns=cols)
-    st.session_state["signal_history_df"] = df
-    return df
-
-
-def _save_signal_history(df: pd.DataFrame) -> None:
-    st.session_state["signal_history_df"] = df
-    try:
-        df.to_csv(SIGNAL_HISTORY_PATH, index=False)
-    except Exception:
-        pass
 
 
 def _upsert_signals_from_opportunities(opps: list) -> None:
@@ -5761,5 +5197,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
 
