@@ -2186,6 +2186,16 @@ def _parse_ourlads_player(cell: str) -> str:
     return cell.strip()
 
 
+# ESPN numeric team IDs (injury scrapers) + Ourlads depth-chart abbreviations
+ESPN_TEAM_IDS = {
+    "ARI": 22, "ATL": 1, "BAL": 33, "BUF": 2, "CAR": 29, "CHI": 3, "CIN": 4, "CLE": 5,
+    "DAL": 6, "DEN": 7, "DET": 8, "GB": 9, "HOU": 34, "IND": 11, "JAX": 30, "KC": 12,
+    "LAC": 24, "LA": 14, "LV": 13, "MIA": 15, "MIN": 16, "NE": 17, "NO": 18, "NYG": 19,
+    "NYJ": 20, "PHI": 21, "PIT": 23, "SF": 25, "SEA": 26, "TB": 27, "TEN": 10, "WAS": 28,
+}
+OURLADS_ABBR = {**{a: a for a in ESPN_TEAM_IDS}, "LA": "LAR", "WAS": "WAS"}
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_depth_charts() -> pd.DataFrame:
     """
