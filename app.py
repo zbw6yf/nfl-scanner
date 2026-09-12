@@ -246,56 +246,23 @@ st.sidebar.caption("Weather is unique per stadium + kickoff.")
 # -----------------------------
 # DATA FUNCTIONS
 # -----------------------------
-def _default_pbp_seasons() -> List[int]:
-    try:
-        current = int(nfl.get_current_season())
-    except Exception:
-        current = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
-    return [current - 1, current]
-
-
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def _load_pbp_cached(seasons: Tuple[int, ...]) -> pd.DataFrame:
-    """
-    Single shared play-by-play load for EPA / pace / success / RZ.
-    seasons must be a tuple so the cache key is hashable.
-    """
-    try:
-        pbp = nfl.load_pbp(seasons=list(seasons))
-        if hasattr(pbp, "to_pandas"):
-            pbp = pbp.to_pandas()
-        if pbp is None or getattr(pbp, "empty", True):
-            return pd.DataFrame()
-        return pbp
-    except Exception:
-        return pd.DataFrame()
-
-
-def _pbp_pass_run(seasons: Optional[List[int]] = None) -> pd.DataFrame:
-    """Filtered pass/run plays with EPA (shared by metric builders)."""
-    if seasons is None:
-        seasons = _default_pbp_seasons()
-    pbp = _load_pbp_cached(tuple(sorted(int(s) for s in seasons)))
-    if pbp is None or pbp.empty:
-        return pd.DataFrame()
-    need = {"play_type", "epa", "posteam", "defteam"}
-    if not need.issubset(set(pbp.columns)):
-        return pd.DataFrame()
-    out = pbp[
-        (pbp["play_type"].isin(["pass", "run"]))
-        & pbp["epa"].notna()
-        & pbp["posteam"].notna()
-        & pbp["defteam"].notna()
-    ].copy()
-    return out
-
-
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def get_team_epa(seasons: Optional[List[int]] = None) -> pd.DataFrame:
     try:
         if seasons is None:
-            seasons = _default_pbp_seasons()
-        pbp = _pbp_pass_run(seasons)
+            current = int(nfl.get_current_season())
+            seasons = [current - 1, current]
+        pbp = nfl.load_pbp(seasons=seasons)
+        if hasattr(pbp, "to_pandas"):
+            pbp = pbp.to_pandas()
+        if pbp is None or pbp.empty:
+            return pd.DataFrame()
+        pbp = pbp[
+            (pbp["play_type"].isin(["pass", "run"])) &
+            (pbp["epa"].notna()) &
+            (pbp["posteam"].notna()) &
+            (pbp["defteam"].notna())
+        ].copy()
         if pbp.empty:
             return pd.DataFrame()
         off = pbp.groupby("posteam")["epa"].mean().reset_index().rename(
@@ -308,24 +275,23 @@ def get_team_epa(seasons: Optional[List[int]] = None) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def get_team_pace(seasons: Optional[List[int]] = None) -> pd.DataFrame:
-    """Plays per game (offense snaps via play counts)."""
+    """Plays per game (offense + defense snaps approx via play counts)."""
     try:
         if seasons is None:
-            seasons = _default_pbp_seasons()
-        # Pace uses pass/run with posteam; can include rows without defteam/epa
-        pbp = _load_pbp_cached(tuple(sorted(int(s) for s in seasons)))
+            current = int(nfl.get_current_season())
+            seasons = [current - 1, current]
+        pbp = nfl.load_pbp(seasons=seasons)
+        if hasattr(pbp, "to_pandas"):
+            pbp = pbp.to_pandas()
         if pbp is None or pbp.empty:
             return pd.DataFrame()
         plays = pbp[
-            (pbp["play_type"].isin(["pass", "run"]))
-            & pbp["posteam"].notna()
+            (pbp["play_type"].isin(["pass", "run"])) &
+            (pbp["posteam"].notna())
         ].copy()
         if plays.empty:
-            return pd.DataFrame()
-        if "game_id" not in plays.columns:
             return pd.DataFrame()
         g = plays.groupby(["game_id", "posteam"]).size().reset_index(name="off_plays")
         pace = g.groupby("posteam")["off_plays"].mean().reset_index()
@@ -335,19 +301,33 @@ def get_team_pace(seasons: Optional[List[int]] = None) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def get_team_success_metrics(seasons: Optional[List[int]] = None) -> pd.DataFrame:
     """
-    Success rate, explosive-play rate, and red-zone TD rate by team.
-    Derived from the same cached PBP as EPA/pace (no extra load_pbp call).
+    Success rate and explosive-play rate by team (offense & defense).
+    Success ≈ EPA > 0 on a play; explosive ≈ EPA >= 1.0 (chunk plays).
     """
     try:
         if seasons is None:
-            seasons = _default_pbp_seasons()
-        pbp = _pbp_pass_run(seasons)
+            try:
+                current = int(nfl.get_current_season())
+            except Exception:
+                current = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
+            seasons = [current - 1, current]
+        pbp = nfl.load_pbp(seasons=seasons)
+        if hasattr(pbp, "to_pandas"):
+            pbp = pbp.to_pandas()
+        if pbp is None or pbp.empty:
+            return pd.DataFrame()
+        pbp = pbp[
+            (pbp["play_type"].isin(["pass", "run"]))
+            & pbp["epa"].notna()
+            & pbp["posteam"].notna()
+            & pbp["defteam"].notna()
+        ].copy()
         if pbp.empty:
             return pd.DataFrame()
-        pbp = pbp.copy()
         pbp["success"] = (pbp["epa"] > 0).astype(float)
         pbp["explosive"] = (pbp["epa"] >= 1.0).astype(float)
         off = pbp.groupby("posteam").agg(
@@ -356,18 +336,20 @@ def get_team_success_metrics(seasons: Optional[List[int]] = None) -> pd.DataFram
             off_n=("epa", "count"),
         ).reset_index().rename(columns={"posteam": "team"})
         deff = pbp.groupby("defteam").agg(
-            def_success=("success", "mean"),
+            def_success=("success", "mean"),  # rate allowed
             def_explosive=("explosive", "mean"),
             def_n=("epa", "count"),
         ).reset_index().rename(columns={"defteam": "team"})
         out = off.merge(deff, on="team", how="outer")
 
+        # Red-zone TD rate (yardline_100 <= 20)
         try:
             if "yardline_100" in pbp.columns:
                 rz = pbp[pbp["yardline_100"].notna() & (pbp["yardline_100"] <= 20)].copy()
                 if not rz.empty:
-                    if "touchdown" in rz.columns:
-                        rz["rz_td"] = (rz["touchdown"].fillna(0).astype(float) > 0).astype(float)
+                    td_col = "touchdown" if "touchdown" in rz.columns else None
+                    if td_col:
+                        rz["rz_td"] = (rz[td_col].fillna(0).astype(float) > 0).astype(float)
                     else:
                         rz["rz_td"] = 0.0
                     off_rz = rz.groupby("posteam")["rz_td"].mean().rename("off_rz_td")
