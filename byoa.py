@@ -1201,8 +1201,55 @@ def render_byoa_tab(
             base_rows = st.session_state.get("byoa_standalone_rows") or []
 
         if base_rows:
-            weeks = sorted({str(r.get("Week") or "—") for r in base_rows})
-            week_pick = st.multiselect("Weeks to include", weeks, default=weeks, key="byoa_weeks")
+            def _week_sort_key(w: str):
+                s = str(w).strip()
+                if s.isdigit():
+                    return (0, int(s))
+                # try leading int e.g. "10" already covered; "Week 3" etc.
+                import re as _re
+                m = _re.match(r"(\d+)", s)
+                if m:
+                    return (0, int(m.group(1)))
+                return (1, s)
+
+            week_set = {str(r.get("Week") or "—") for r in base_rows}
+            weeks = sorted(week_set, key=_week_sort_key)
+
+            # Default to current NFL week when present; otherwise all weeks
+            _cur = None
+            try:
+                if estimate_week:
+                    _cur = estimate_week(datetime.now().strftime("%Y-%m-%d"))
+            except Exception:
+                _cur = None
+            if _cur is None:
+                try:
+                    from utils.dates import current_nfl_week as _cnw
+                    _cur = _cnw()
+                except Exception:
+                    _cur = None
+
+            default_weeks = weeks
+            if _cur is not None:
+                cur_str = str(int(_cur))
+                # match exact or string forms present in the list
+                matches = [w for w in weeks if str(w).strip() == cur_str or str(w).strip().lstrip("0") == cur_str]
+                if matches:
+                    default_weeks = matches
+                else:
+                    # if current week not in data yet, prefer the highest numeric week <= current
+                    numeric = [(w, int(str(w).strip())) for w in weeks if str(w).strip().isdigit()]
+                    le = [w for w, n in numeric if n <= int(_cur)]
+                    if le:
+                        default_weeks = [max(le, key=lambda x: int(str(x).strip()))]
+
+            # New key so old "all weeks" session state does not stick after this update
+            week_pick = st.multiselect(
+                "Weeks to include",
+                weeks,
+                default=default_weeks,
+                key="byoa_weeks_v2",
+            )
             filtered = [r for r in base_rows if str(r.get("Week") or "—") in set(week_pick)]
             st.caption(f"{len(filtered)} games selected")
 
