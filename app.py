@@ -41,6 +41,7 @@ import base64
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
+import time as _time
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -455,7 +456,7 @@ def shrink_to_mean(value: float, n: float, league_mean: float, prior_n: float = 
         return float(league_mean)
 
 
-LINE_OPEN_PATH = Path("/home/workdir/artifacts/line_opens.csv")
+LINE_OPEN_PATH = Path(__file__).resolve().parent / "line_opens.csv"
 
 
 def _load_line_opens() -> Dict[str, Dict]:
@@ -3673,7 +3674,6 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
 ])
 
 # ---- Performance helpers: session-cached board + lazy heavy tabs ----
-import time as _time
 BB_CACHE_TTL_SEC = 15 * 60  # rebuild Big Board at most every 15 minutes unless Refresh
 
 def _bb_cache_age_sec() -> float:
