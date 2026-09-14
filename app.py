@@ -240,7 +240,7 @@ elif api_key:
 if st.sidebar.checkbox("Clear saved API key", value=False, key="clear_api_key_cb"):
     _save_api_key("")
     st.sidebar.success("Saved API key cleared. Refresh to apply.")
-n_simulations = st.sidebar.slider("Monte Carlo simulations", 2000, 15000, 8000, 1000)
+n_simulations = st.sidebar.slider("Monte Carlo simulations", 1000, 8000, 2000, 500)
 form_window = st.sidebar.slider("Recent form window (games)", 4, 8, 6, 1)
 if st.sidebar.button("Clear all caches"):
     st.cache_data.clear()
@@ -290,6 +290,14 @@ def _load_pbp_cached(seasons: Tuple[int, ...]) -> pd.DataFrame:
             pbp = pbp.to_pandas()
         if pbp is None or getattr(pbp, "empty", True):
             return pd.DataFrame()
+        # Keep only columns needed for EPA / pace / success / RZ to cut memory
+        keep = [c for c in [
+            "play_type", "epa", "posteam", "defteam", "game_id", "season",
+            "down", "ydstogo", "yardline_100", "touchdown", "pass", "rush",
+            "success", "yards_gained", "air_yards", "incomplete_pass",
+        ] if c in getattr(pbp, "columns", [])]
+        if keep:
+            pbp = pbp[keep].copy()
         return pbp
     except Exception:
         return pd.DataFrame()
@@ -3563,7 +3571,7 @@ def build_play_of_the_day(
                 mc = monte_carlo_game(
                     home_off, home_def, away_off, away_def,
                     avg_spread if avg_spread is not None else 0.0,
-                    avg_total, n_sims=n_simulations,
+                    avg_total, n_sims=int(min(int(n_simulations), 2500)),
                     total_adj=wx_adj.get("total_adj", 0.0),
                     noise_extra=wx_adj.get("noise_extra", 0.0),
                     under_bias=wx_adj.get("under_bias", 0.0),
@@ -4112,31 +4120,51 @@ with tab2:
 
     if rebuild_bb:
         st.session_state["bb_autoload_once"] = False
-        with st.spinner("Loading EPA, Pace, Form, Schedule, Odds and unique weather..."):
-            team_epa = get_team_epa()
-            team_pace = get_team_pace()
-            team_success = get_team_success_metrics()
-            team_ou_rate = get_team_ou_tendency()
-            recent_form = get_recent_form(n_games=form_window)
-            schedules = load_schedules()
-            odds_data, odds_status = fetch_nfl_odds(api_key) if api_key else (None, "No API key entered")
-            st.session_state["bb_odds_status"] = odds_status
-            if odds_data:
-                st.session_state["odds_data"] = odds_data
-            try:
-                current_season = int(nfl.get_current_season())
-            except Exception:
-                current_season = datetime.now().year if datetime.now().month >= 8 else datetime.now().year - 1
-            model_bundle = train_ats_model(list(range(current_season - 4, current_season)))
-            # Source of truth: schedule-driven game list (includes every week 1–18 game)
-            upcoming = build_upcoming_games(schedules, odds_data, days_ahead=90)
-            stamp_now("schedule")
-            if odds_data:
-                stamp_now("odds")
-            weather_cache = build_weather_cache_from_games(upcoming)
-            stamp_now("weather")
-            st.session_state["bb_upcoming"] = list(upcoming or [])
-            st.session_state["bb_weather_cache"] = weather_cache or {}
+        try:
+            with st.spinner("Loading board (Cloud-safe path: no heavy ML train, fewer sims)..."):
+                import gc
+                team_epa = get_team_epa()
+                team_pace = get_team_pace()
+                team_success = get_team_success_metrics()
+                team_ou_rate = get_team_ou_tendency()
+                recent_form = get_recent_form(n_games=form_window)
+                schedules = load_schedules()
+                odds_data, odds_status = fetch_nfl_odds(api_key) if api_key else (None, "No API key entered")
+                st.session_state["bb_odds_status"] = odds_status
+                if odds_data:
+                    st.session_state["odds_data"] = odds_data
+                try:
+                    current_season = int(nfl.get_current_season())
+                except Exception:
+                    current_season = datetime.now().year if datetime.now().month >= 8 else datetime.now().year - 1
+                # Do NOT train 4-season ATS model on Cloud refresh — OOM risk. MC + rules still score.
+                model_bundle = st.session_state.get("bb_model_bundle")
+                upcoming = build_upcoming_games(schedules, odds_data, days_ahead=21)
+                stamp_now("schedule")
+                if odds_data:
+                    stamp_now("odds")
+                weather_cache = build_weather_cache_from_games(upcoming)
+                stamp_now("weather")
+                st.session_state["bb_upcoming"] = list(upcoming or [])
+                st.session_state["bb_weather_cache"] = weather_cache or {}
+                gc.collect()
+        except Exception as _bb_load_err:
+            st.error(
+                "Big Board data load failed (often memory limits on Streamlit Cloud). "
+                "Lower Monte Carlo simulations in the sidebar and try Refresh again.\n\n"
+                f"`{_bb_load_err}`"
+            )
+            rebuild_bb = False
+            team_epa = pd.DataFrame()
+            team_pace = pd.DataFrame()
+            team_success = pd.DataFrame()
+            team_ou_rate = {}
+            recent_form = {}
+            schedules = pd.DataFrame()
+            upcoming = st.session_state.get("bb_upcoming") or []
+            weather_cache = st.session_state.get("bb_weather_cache") or {}
+            odds_data = st.session_state.get("odds_data")
+            model_bundle = None
     else:
         # Fast path: reuse session cache (homepage + other widgets won't wait on full rebuild)
         opportunities = list(st.session_state.get("bb_opportunities") or [])
@@ -4423,7 +4451,7 @@ with tab2:
                 mc = monte_carlo_game(
                     home_off, home_def, away_off, away_def,
                     avg_spread if avg_spread is not None else 0.0,
-                    avg_total, n_sims=n_simulations,
+                    avg_total, n_sims=int(min(int(n_simulations), 2500)),
                     total_adj=wx_adj["total_adj"],
                     noise_extra=wx_adj["noise_extra"],
                     under_bias=wx_adj["under_bias"],
