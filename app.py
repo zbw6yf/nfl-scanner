@@ -3861,41 +3861,217 @@ with tab1:
                 st.caption(last_update_caption("odds", "schedule", label="Last update (Play Of The Day)"))
         st.markdown("---")
 
-    # ---- Rest of homepage (no hero) ----
+    # ---- Rest of homepage ----
     st.markdown(
         """
-<div class="tm-section-title">What you can do</div>
-<div class="tm-grid">
-  <div class="tm-card"><div class="icon">🎯</div><h4>The Big Board</h4><p>Ranked ATS & total leans with confidence grades, edge %, and the NFL Big Board.</p></div>
-  <div class="tm-card"><div class="icon">🧪</div><h4>BYOA</h4><p>Build your own weighted algorithm and generate custom weekly recommendations.</p></div>
-  <div class="tm-card"><div class="icon">📈</div><h4>Games & Odds</h4><p>Full slate tickets with open → current spreads/totals and line movement.</p></div>
-  <div class="tm-card"><div class="icon">🌤️</div><h4>Weather</h4><p>Stadium forecasts near kickoff that feed total and under-bias adjustments.</p></div>
-  <div class="tm-card"><div class="icon">🏥</div><h4>Injuries & Depth</h4><p>Filterable injury report and depth charts so context sits next to the lean.</p></div>
-  <div class="tm-card"><div class="icon">📊</div><h4>Team History</h4><p>Multi-year ATS and O/U records with game logs and pre-game lines.</p></div>
-  <div class="tm-card"><div class="icon">🧾</div><h4>Signal History</h4><p>Grade past recommendations by confidence so the model is accountable.</p></div>
+<style>
+.tm-hero-copy {
+  background: linear-gradient(135deg, #0b1220 0%, #0f172a 50%, #1e293b 100%);
+  border: 1px solid rgba(148,163,184,0.18);
+  border-radius: 16px;
+  padding: 1.25rem 1.4rem;
+  margin: 0.25rem 0 1.15rem 0;
+}
+.tm-hero-copy h2 {
+  margin: 0 0 0.45rem 0;
+  color: #f8fafc;
+  font-size: 1.45rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+.tm-hero-copy p {
+  margin: 0;
+  color: #cbd5e1;
+  font-size: 1rem;
+  line-height: 1.55;
+  max-width: 48rem;
+}
+.tm-feature-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin: 0.75rem 0 1.25rem 0;
+}
+@media (max-width: 900px) {
+  .tm-feature-row { grid-template-columns: 1fr; }
+}
+.tm-feature-card {
+  background: linear-gradient(165deg, #111827 0%, #0b1220 100%);
+  border: 1px solid #1f2937;
+  border-radius: 16px;
+  padding: 1.2rem 1.25rem 1.3rem;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.25);
+}
+.tm-feature-card.primary {
+  border-color: rgba(56,189,248,0.45);
+  box-shadow: 0 0 0 1px rgba(56,189,248,0.12), 0 8px 28px rgba(0,0,0,0.28);
+}
+.tm-feature-card.secondary {
+  border-color: rgba(167,139,250,0.4);
+  box-shadow: 0 0 0 1px rgba(167,139,250,0.1), 0 8px 28px rgba(0,0,0,0.28);
+}
+.tm-feature-card .badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  margin-bottom: 0.55rem;
+}
+.tm-feature-card.primary .badge {
+  background: rgba(56,189,248,0.15);
+  color: #7dd3fc;
+}
+.tm-feature-card.secondary .badge {
+  background: rgba(167,139,250,0.15);
+  color: #c4b5fd;
+}
+.tm-feature-card h3 {
+  margin: 0 0 0.4rem 0;
+  color: #f8fafc;
+  font-size: 1.2rem;
+  font-weight: 800;
+}
+.tm-feature-card p.lead {
+  margin: 0 0 0.75rem 0;
+  color: #94a3b8;
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+.tm-feature-card ul {
+  margin: 0;
+  padding-left: 1.1rem;
+  color: #cbd5e1;
+  font-size: 0.88rem;
+  line-height: 1.55;
+}
+.tm-feature-card li { margin-bottom: 0.35rem; }
+.tm-feature-card li strong { color: #e2e8f0; }
+.tm-more-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.75rem;
+  margin: 0.5rem 0 1rem 0;
+}
+.tm-more-card {
+  background: #0f172a;
+  border: 1px solid #1e293b;
+  border-radius: 12px;
+  padding: 0.9rem 1rem;
+}
+.tm-more-card h4 {
+  margin: 0 0 0.25rem 0;
+  color: #f1f5f9;
+  font-size: 0.95rem;
+}
+.tm-more-card p {
+  margin: 0;
+  color: #94a3b8;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+.tm-flow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.6rem 0 1rem 0;
+  align-items: center;
+}
+.tm-flow-pill {
+  background: #111827;
+  border: 1px solid #334155;
+  color: #e2e8f0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 0.45rem 0.85rem;
+  border-radius: 999px;
+}
+.tm-flow-arrow { color: #64748b; font-size: 0.9rem; }
+</style>
+
+<div class="tm-hero-copy">
+  <h2>NFL research, ranked and transparent</h2>
+  <p>
+    <b>TAIL ME</b> is a weekly research workspace for the full NFL slate — not a tip sheet.
+    It combines team efficiency, recent form, rest &amp; travel, weather, and market lines into a clear
+    <b>Score</b> and <b>Confidence</b> grade so you can compare games side by side before kickoff.
+  </p>
 </div>
 
-<div class="tm-section-title">What makes TAIL ME different</div>
-<div class="tm-diff">
-  <div class="tm-diff-item"><strong>Signals, not noise</strong><span>EPA, success rates, form, rest × travel, weather, Monte Carlo & ML fused into Score + Confidence.</span></div>
-  <div class="tm-diff-item"><strong>Full-slate honesty</strong><span>See the whole week — not only “hot” picks — so context stays visible.</span></div>
-  <div class="tm-diff-item"><strong>Market awareness</strong><span>Open vs current lines and steam sit next to the model lean.</span></div>
-  <div class="tm-diff-item"><strong>Lock at kickoff</strong><span>Big Board freezes so mid-game noise doesn’t rewrite the recommendation.</span></div>
-  <div class="tm-diff-item"><strong>Track record</strong><span>Signal History grades A–F leans so you know what’s working.</span></div>
-  <div class="tm-diff-item"><strong>One workflow</strong><span>Schedule, weather, injuries, depth, and props in the same tool as the scan.</span></div>
+<div class="tm-section-title">Core tools</div>
+<div class="tm-feature-row">
+  <div class="tm-feature-card primary">
+    <div class="badge">Primary · start here</div>
+    <h3>🏈 The Big Board</h3>
+    <p class="lead">Your main scan of the week — every game scored with the same rules.</p>
+    <ul>
+      <li><strong>Full-slate ranking</strong> — ATS and total leans for the entire week, not just a few “picks.”</li>
+      <li><strong>Score + Confidence (A–F)</strong> — how strong the lean is and how much the signals agree.</li>
+      <li><strong>Edge vs the market</strong> — model probability compared to the current line.</li>
+      <li><strong>Context baked in</strong> — EPA, success rates, form, rest, travel, weather, Monte Carlo &amp; ML.</li>
+      <li><strong>Locks at kickoff</strong> — recommendation, score, and confidence freeze once a game starts.</li>
+      <li><strong>Filters</strong> — by week, min score, and recommendation type so you can focus fast.</li>
+    </ul>
+  </div>
+  <div class="tm-feature-card secondary">
+    <div class="badge">Custom · your rules</div>
+    <h3>🧪 BYOA — Build Your Own Algorithm</h3>
+    <p class="lead">Turn the same data into <em>your</em> model with transparent weights.</p>
+    <ul>
+      <li><strong>Choose the market</strong> — score games for ATS or totals.</li>
+      <li><strong>Toggle factors</strong> — EPA, form, success/explosive rates, red zone, rest, weather, and more.</li>
+      <li><strong>Set weights</strong> — decide how much each factor matters; invert any signal if you want.</li>
+      <li><strong>Presets</strong> — start from Balanced, EPA + efficiency, Underdog, or Totals/weather.</li>
+      <li><strong>Run &amp; inspect</strong> — see top leans, a full table, and which factors drove each score.</li>
+      <li><strong>Save setups</strong> — keep algorithms you like and reuse them week to week.</li>
+    </ul>
+  </div>
 </div>
 
-<div class="tm-section-title">Quick start</div>
-<div class="tm-steps">
-  <div class="tm-step"><div class="n">1</div><div>Save your Odds API key in the sidebar</div></div>
-  <div class="tm-step"><div class="n">2</div><div>Open The Big Board for full leans</div></div>
-  <div class="tm-step"><div class="n">3</div><div>Try BYOA with your own weights</div></div>
-  <div class="tm-step"><div class="n">4</div><div>Check Games & Odds for line moves</div></div>
-  <div class="tm-step"><div class="n">5</div><div>Sanity-check weather / injuries / depth</div></div>
-  <div class="tm-step"><div class="n">6</div><div>Review Advanced → Signal History</div></div>
+<div class="tm-section-title">Suggested flow</div>
+<div class="tm-flow">
+  <span class="tm-flow-pill">1 · Odds API key (sidebar)</span>
+  <span class="tm-flow-arrow">→</span>
+  <span class="tm-flow-pill">2 · Big Board</span>
+  <span class="tm-flow-arrow">→</span>
+  <span class="tm-flow-pill">3 · BYOA (optional)</span>
+  <span class="tm-flow-arrow">→</span>
+  <span class="tm-flow-pill">4 · Steam / weather / injuries</span>
+  <span class="tm-flow-arrow">→</span>
+  <span class="tm-flow-pill">5 · Signal History</span>
 </div>
 
-<div class="tm-footnote">Research only — not betting advice. Model output is for education and decision support. Wager responsibly and only where legal.</div>
+<div class="tm-section-title">Also on the site</div>
+<div class="tm-more-grid">
+  <div class="tm-more-card">
+    <h4>📈 Games &amp; Odds</h4>
+    <p>Open → current lines, top steam plays, and the full slate table.</p>
+  </div>
+  <div class="tm-more-card">
+    <h4>🌤️ Weather</h4>
+    <p>Stadium forecasts near kickoff for outdoor totals context.</p>
+  </div>
+  <div class="tm-more-card">
+    <h4>🏥 Injuries &amp; depth</h4>
+    <p>Official injury report and Ourlads depth charts when you need them.</p>
+  </div>
+  <div class="tm-more-card">
+    <h4>📊 Team history</h4>
+    <p>Multi-year ATS and over/under records with game logs.</p>
+  </div>
+  <div class="tm-more-card">
+    <h4>🧾 Signal History</h4>
+    <p>Grade past Big Board leans so the system stays accountable.</p>
+  </div>
+  <div class="tm-more-card">
+    <h4>📘 Methodology</h4>
+    <p>How scores, confidence, and data sources fit together.</p>
+  </div>
+</div>
+
+<div class="tm-footnote">Research only — not betting advice. Output is for education and decision support. Wager responsibly and only where legal.</div>
         """,
         unsafe_allow_html=True,
     )
