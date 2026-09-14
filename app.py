@@ -5639,16 +5639,87 @@ with tab10:
             show = hist.copy()
             conf_rank = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
             show["_cr"] = show["confidence"].astype(str).str.upper().str[:1].map(lambda x: conf_rank.get(x, 9))
+            show["_conf_letter"] = show["confidence"].astype(str).str.upper().str[:1]
+            show["_rec_str"] = show["recommendation"].astype(str)
+            show["_week_num"] = pd.to_numeric(show["week"], errors="coerce")
             show = show.sort_values(["_cr", "week", "logged_at"], ascending=[True, True, False])
+
+            st.markdown("**All signals**")
+            st.caption("Filter by week, recommendation, and/or confidence (e.g. Week 1 + Under + A).")
+            fw1, fw2, fw3, fw4 = st.columns([1.1, 1.4, 1.0, 1.0])
+            with fw1:
+                week_vals = sorted(
+                    {int(w) for w in show["_week_num"].dropna().unique().tolist()}
+                )
+                week_opts = ["All weeks"] + [f"Week {w}" for w in week_vals]
+                week_pick = st.multiselect(
+                    "Week",
+                    options=week_opts,
+                    default=[],
+                    key="sig_hist_week_filter",
+                    help="Leave empty for all weeks. Select one or more weeks.",
+                )
+            with fw2:
+                rec_vals = sorted({r for r in show["_rec_str"].dropna().unique().tolist() if r and r != "nan"})
+                # Prefer standard order first
+                preferred = ["Home ATS", "Away ATS", "Over", "Under", "No strong lean"]
+                rec_opts = [r for r in preferred if r in rec_vals] + [r for r in rec_vals if r not in preferred]
+                rec_pick = st.multiselect(
+                    "Recommendation",
+                    options=rec_opts,
+                    default=[],
+                    key="sig_hist_rec_filter",
+                    help="e.g. Under only",
+                )
+            with fw3:
+                conf_opts = [c for c in conf_order if c in set(show["_conf_letter"].dropna().tolist())]
+                # Include any odd values
+                extra_c = sorted({c for c in show["_conf_letter"].dropna().unique().tolist() if c not in conf_opts and c})
+                conf_pick = st.multiselect(
+                    "Confidence",
+                    options=conf_opts + extra_c,
+                    default=[],
+                    key="sig_hist_conf_filter",
+                    help="e.g. A only",
+                )
+            with fw4:
+                result_vals = sorted({str(r) for r in show["result"].dropna().unique().tolist() if str(r) and str(r) != "nan"})
+                result_pick = st.multiselect(
+                    "Result",
+                    options=result_vals,
+                    default=[],
+                    key="sig_hist_result_filter",
+                    help="Optional: Correct, Incorrect, Pending…",
+                )
+
+            filtered = show
+            if week_pick:
+                want_weeks = set()
+                for w in week_pick:
+                    if w == "All weeks":
+                        want_weeks = set(week_vals)
+                        break
+                    try:
+                        want_weeks.add(int(str(w).replace("Week ", "").strip()))
+                    except Exception:
+                        pass
+                if want_weeks:
+                    filtered = filtered[filtered["_week_num"].isin(want_weeks)]
+            if rec_pick:
+                filtered = filtered[filtered["_rec_str"].isin(rec_pick)]
+            if conf_pick:
+                filtered = filtered[filtered["_conf_letter"].isin([str(c).upper()[:1] for c in conf_pick])]
+            if result_pick:
+                filtered = filtered[filtered["result"].astype(str).isin(result_pick)]
+
             display_cols = [
                 c for c in [
                     "confidence", "recommendation", "result", "week", "game", "kickoff",
                     "score", "spread", "total", "logged_at", "graded_at",
-                ] if c in show.columns
+                ] if c in filtered.columns
             ]
-            st.markdown("**All signals**")
             st.dataframe(
-                show[display_cols].rename(columns={
+                filtered[display_cols].rename(columns={
                     "confidence": "Confidence",
                     "recommendation": "Recommendation",
                     "result": "Result",
@@ -5664,11 +5735,14 @@ with tab10:
                 use_container_width=True,
                 hide_index=True,
             )
-            st.caption(f"{len(show)} signals · Pending rows grade automatically when final scores are available in the schedule.")
+            st.caption(
+                f"Showing **{len(filtered)}** of **{len(show)}** signals · "
+                "Pending rows grade automatically when final scores are available."
+            )
             st.download_button(
-                "Download signal history CSV",
-                data=hist.to_csv(index=False),
-                file_name="signal_history.csv",
+                "Download filtered CSV" if len(filtered) != len(show) else "Download signal history CSV",
+                data=filtered.drop(columns=[c for c in filtered.columns if str(c).startswith("_")], errors="ignore").to_csv(index=False),
+                file_name="signal_history_filtered.csv" if len(filtered) != len(show) else "signal_history.csv",
                 mime="text/csv",
                 key="signal_hist_dl",
             )
