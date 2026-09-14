@@ -677,6 +677,105 @@ def _serialize_lock_row(row: Dict) -> Dict:
     return out
 
 
+def _import_prekick_csv_locks(locks: Dict[str, Dict]) -> Dict[str, Dict]:
+    """Merge user-exported pre-kickoff Big Board CSV into locks (authoritative for those games)."""
+    try:
+        root = Path(__file__).resolve().parent
+        csv_path = root / "prekick_week1_board.csv"
+        if not csv_path.exists():
+            return locks
+        df = pd.read_csv(csv_path, encoding="utf-8-sig")
+        if df.empty or "Game" not in df.columns:
+            return locks
+        # name → abbr for lock keys
+        name_to_abbr = {}
+        try:
+            # full_name is abbr→name; invert if possible
+            for abbr in list(getattr(__builtins__, "_dummy", [])):
+                pass
+        except Exception:
+            pass
+        # Build invert map from common TEAM maps if available
+        try:
+            from utils.teams import TEAM_ABBR_TO_FULL  # type: ignore
+            name_to_abbr = {str(v): str(k) for k, v in TEAM_ABBR_TO_FULL.items()}
+        except Exception:
+            name_to_abbr = {
+                "Arizona Cardinals": "ARI", "Atlanta Falcons": "ATL", "Baltimore Ravens": "BAL",
+                "Buffalo Bills": "BUF", "Carolina Panthers": "CAR", "Chicago Bears": "CHI",
+                "Cincinnati Bengals": "CIN", "Cleveland Browns": "CLE", "Dallas Cowboys": "DAL",
+                "Denver Broncos": "DEN", "Detroit Lions": "DET", "Green Bay Packers": "GB",
+                "Houston Texans": "HOU", "Indianapolis Colts": "IND", "Jacksonville Jaguars": "JAX",
+                "Kansas City Chiefs": "KC", "Las Vegas Raiders": "LV", "Los Angeles Chargers": "LAC",
+                "Los Angeles Rams": "LAR", "Miami Dolphins": "MIA", "Minnesota Vikings": "MIN",
+                "New England Patriots": "NE", "New Orleans Saints": "NO", "New York Giants": "NYG",
+                "New York Jets": "NYJ", "Philadelphia Eagles": "PHI", "Pittsburgh Steelers": "PIT",
+                "San Francisco 49ers": "SF", "Seattle Seahawks": "SEA", "Tampa Bay Buccaneers": "TB",
+                "Tennessee Titans": "TEN", "Washington Commanders": "WAS",
+            }
+
+        def _fnum(x):
+            try:
+                return float(str(x).replace("+", "").replace("%", ""))
+            except Exception:
+                return None
+
+        for _, r in df.iterrows():
+            game = str(r.get("Game") or "").strip()
+            if "@" not in game:
+                continue
+            away_full, home_full = [p.strip() for p in game.split("@", 1)]
+            away = name_to_abbr.get(away_full, away_full)
+            home = name_to_abbr.get(home_full, home_full)
+            try:
+                week = int(float(r.get("Week")))
+            except Exception:
+                week = r.get("Week")
+            kick = str(r.get("Kickoff") or "")
+            gd = kick[:10]
+            key = board_lock_key(week, away, home, gd)
+            lock = {
+                "key": key,
+                "_locked": True,
+                "Week": week,
+                "Game": game,
+                "Kickoff": kick,
+                "Recommendation": r.get("Recommendation"),
+                "Confidence": r.get("Confidence"),
+                "Score": _fnum(r.get("Score")),
+                "Spread": r.get("Spread"),
+                "Total": r.get("Total"),
+                "Edge %": r.get("Edge %"),
+                "Home Imp": r.get("Home Imp"),
+                "Away Imp": r.get("Away Imp"),
+                "EPA Edge": r.get("EPA Edge"),
+                "Form Δ": r.get("Form Δ"),
+                "Pace": r.get("Pace"),
+                "TZ Diff": r.get("TZ Diff"),
+                "Div": r.get("Div"),
+                "Model %": r.get("Model %"),
+                "Market %": r.get("Market %"),
+                "Signals": r.get("Signals"),
+                "Roof": r.get("Roof"),
+                "Weather": r.get("Weather"),
+                "_home": home,
+                "_away": away,
+                "_gameday": gd,
+                "_spread": _fnum(r.get("Spread")),
+                "_total": _fnum(r.get("Total")),
+                "_source": "prekick_csv",
+            }
+            locks[key] = lock
+        # Persist merged locks
+        try:
+            _save_board_locks(locks)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return locks
+
+
 def _load_board_locks() -> Dict[str, Dict]:
     if "board_locks" in st.session_state and isinstance(st.session_state.get("board_locks"), dict):
         return st.session_state["board_locks"]
@@ -691,7 +790,6 @@ def _load_board_locks() -> Dict[str, Dict]:
                 for item in raw:
                     if isinstance(item, dict) and item.get("key"):
                         locks[str(item["key"])] = item
-        # legacy CSV fallback
         csv_legacy = Path(__file__).resolve().parent / "board_locks.csv"
         if not locks and csv_legacy.exists():
             df = pd.read_csv(csv_legacy)
@@ -701,6 +799,10 @@ def _load_board_locks() -> Dict[str, Dict]:
                     locks[key] = r.to_dict()
     except Exception:
         pass
+    # Always merge authoritative pre-kick CSV if present
+    if not st.session_state.get("_prekick_csv_merged"):
+        locks = _import_prekick_csv_locks(locks)
+        st.session_state["_prekick_csv_merged"] = True
     st.session_state["board_locks"] = locks
     return locks
 
@@ -718,6 +820,27 @@ def _save_board_locks(locks: Dict[str, Dict]) -> None:
 def board_lock_key(week, away, home, gameday) -> str:
     gd = str(gameday or "")[:10]
     return f"{week}_{str(away).upper()}_{str(home).upper()}_{gd}"
+
+
+def _find_board_lock(week, away, home, gameday, game_label: str = "") -> Optional[Dict]:
+    """Find lock by canonical key or by matchup fields / game label."""
+    locks = _load_board_locks()
+    key = board_lock_key(week, away, home, gameday)
+    if key in locks:
+        return locks[key]
+    away_u, home_u = str(away).upper(), str(home).upper()
+    gd = str(gameday or "")[:10]
+    for k, v in locks.items():
+        if not isinstance(v, dict):
+            continue
+        if str(v.get("_away", "")).upper() == away_u and str(v.get("_home", "")).upper() == home_u:
+            if not gd or str(v.get("_gameday", ""))[:10] == gd or gd in str(v.get("Kickoff", "")):
+                return v
+        if game_label and str(v.get("Game", "")) == game_label:
+            return v
+        if away_u and home_u and f"_{away_u}_{home_u}_" in f"_{k}_":
+            return v
+    return None
 
 
 def clear_board_lock_for_game(away: str, home: str, gameday: str = "") -> int:
@@ -856,12 +979,24 @@ def freeze_or_update_board_row(row: Dict, started: bool) -> Dict:
     gd = str(row.get("_gameday") or row.get("Kickoff") or "")[:10]
     key = board_lock_key(row.get("Week"), row.get("_away"), row.get("_home"), gd)
     locks = _load_board_locks()
-    existing = locks.get(key)
+    existing = locks.get(key) or _find_board_lock(
+        row.get("Week"), row.get("_away"), row.get("_home"), gd, str(row.get("Game") or "")
+    )
     row = _enrich_row_from_line_opens(row)
 
     if started:
-        # 1) Already locked pre-kickoff snapshot
-        if existing and existing.get("_locked"):
+        # 1) Already locked pre-kickoff snapshot (including CSV seed)
+        if existing and (
+            existing.get("_locked")
+            or existing.get("_source") in ("prekick_csv", "user_prekick_w1_csv")
+            or existing.get("Recommendation") not in (None, "", "—")
+        ):
+            if not existing.get("_locked"):
+                snap = _serialize_lock_row({**existing, "key": key, "_locked": True})
+                snap["_locked"] = True
+                locks[key] = snap
+                _save_board_locks(locks)
+                existing = snap
             return _apply_locked_lean_fields(row, existing)
         # 2) Had pre-game snap that wasn't flagged locked yet — freeze it now (NOT live row)
         if existing and not existing.get("_locked") and existing.get("Recommendation") not in (None, "", "—"):
@@ -4303,18 +4438,23 @@ with tab2:
                 )
                 if _started_early:
                     _lk = board_lock_key(g.get("week"), away, home, game_date)
-                    _locks = _load_board_locks()
-                    _lock_row = _locks.get(_lk) if _lk in _locks else None
+                    _lock_row = _find_board_lock(
+                        g.get("week"), away, home, game_date,
+                        f"{full_name(away)} @ {full_name(home)}",
+                    )
                     if _lock_row and (
                         _lock_row.get("_locked")
+                        or _lock_row.get("_source") in ("prekick_csv", "user_prekick_w1_csv")
                         or _lock_row.get("Recommendation") not in (None, "", "—")
                         or _row_has_spread(_lock_row)
                     ):
                         frozen = _enrich_row_from_line_opens(dict(_lock_row))
                         frozen["_locked"] = True
-                        frozen.setdefault("Game", f"{away_full} @ {home_full}" if "away_full" in dir() else frozen.get("Game"))
+                        frozen.setdefault("Game", frozen.get("Game") or f"{full_name(away)} @ {full_name(home)}")
                         frozen.setdefault("Week", g.get("week"))
                         frozen.setdefault("Kickoff", commence)
+                        frozen.setdefault("_home", home)
+                        frozen.setdefault("_away", away)
                         opportunities.append(frozen)
                         continue
                     # Recover pre-kick lean from signal history if board lock missing
@@ -6123,6 +6263,5 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
 
 
