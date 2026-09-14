@@ -245,8 +245,17 @@ if st.sidebar.button("Clear all caches"):
     st.cache_data.clear()
     st.cache_resource.clear()
     for k in list(st.session_state.keys()):
-        if "weather" in k.lower() or k.startswith("updated_"):
-            del st.session_state[k]
+        kl = str(k).lower()
+        if (
+            "weather" in kl
+            or str(k).startswith("updated_")
+            or str(k).startswith(("bb_", "byoa_", "injuries_", "depth_", "history_", "potd_"))
+            or str(k) in ("odds_data", "team_history_df", "injuries_df", "depth_df")
+        ):
+            try:
+                del st.session_state[k]
+            except Exception:
+                pass
     st.rerun()
 
 st.sidebar.markdown("---")
@@ -3663,6 +3672,29 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "⚙️ Advanced",
 ])
 
+# ---- Performance helpers: session-cached board + lazy heavy tabs ----
+import time as _time
+BB_CACHE_TTL_SEC = 15 * 60  # rebuild Big Board at most every 15 minutes unless Refresh
+
+def _bb_cache_age_sec() -> float:
+    try:
+        return max(0.0, _time.time() - float(st.session_state.get("bb_built_at") or 0))
+    except Exception:
+        return 1e9
+
+def _bb_cache_valid() -> bool:
+    opps = st.session_state.get("bb_opportunities")
+    return isinstance(opps, list) and len(opps) > 0 and _bb_cache_age_sec() < BB_CACHE_TTL_SEC
+
+# Defaults so other tabs don't NameError when board wasn't rebuilt this run
+upcoming = st.session_state.get("bb_upcoming") or []
+weather_cache = st.session_state.get("bb_weather_cache") or {}
+odds_data = st.session_state.get("odds_data")
+schedules = None
+team_epa = pd.DataFrame()
+opportunities = list(st.session_state.get("bb_opportunities") or [])
+skipped: list = []
+
 # ========== TAB 1: Homepage ==========
 with tab1:
     st.markdown(
@@ -3741,8 +3773,31 @@ with tab1:
     # ---- Play Of The Day ----
     if feature_enabled("today_card"):
         cur_wk = current_nfl_week() or 1
-        with st.spinner("Selecting Play Of The Day..."):
-            potd = build_play_of_the_day(int(cur_wk), api_key or "", n_simulations=n_simulations, form_window=form_window)
+        potd = None
+        # Fast path: locked card or Big Board session cache (skip full rebuild when possible)
+        try:
+            _locks = _load_potd_locks()
+            _lk = _locks.get(f"week_{int(cur_wk)}")
+            if isinstance(_lk, dict) and _lk.get("_locked"):
+                potd = dict(_lk)
+                try:
+                    potd = _enrich_potd_lines(potd, api_key or "")
+                except Exception:
+                    pass
+                potd["_locked"] = True
+            elif st.session_state.get("bb_play_of_day"):
+                potd = dict(st.session_state.get("bb_play_of_day") or {})
+                try:
+                    potd = _enrich_potd_lines(potd, api_key or "")
+                except Exception:
+                    pass
+        except Exception:
+            potd = None
+        if potd is None:
+            with st.spinner("Selecting Play Of The Day..."):
+                potd = build_play_of_the_day(
+                    int(cur_wk), api_key or "", n_simulations=n_simulations, form_window=form_window
+                )
         locked = bool(potd and potd.get("_locked"))
         lock_note = " · Locked for the week" if locked else " · Updates until the first kickoff of the week"
         st.markdown(
@@ -3848,30 +3903,66 @@ with tab1:
 # ========== TAB 2: The Big Board ==========
 with tab2:
     st.subheader("The Big Board")
-    with st.spinner("Loading EPA, Pace, Form, Schedule, Odds and unique weather..."):
-        team_epa = get_team_epa()
-        team_pace = get_team_pace()
-        team_success = get_team_success_metrics()
-        team_ou_rate = get_team_ou_tendency()
-        recent_form = get_recent_form(n_games=form_window)
-        schedules = load_schedules()
-        odds_data, odds_status = fetch_nfl_odds(api_key) if api_key else (None, "No API key entered")
+    _bb_top = st.columns([1.1, 1.1, 2])
+    with _bb_top[0]:
+        refresh_bb = st.button("🔄 Refresh board", use_container_width=True, help="Rebuild scores, lines, and weather now")
+    with _bb_top[1]:
+        if _bb_cache_valid():
+            st.caption(f"Using cache · {_bb_cache_age_sec():.0f}s old")
+        elif st.session_state.get("bb_opportunities"):
+            st.caption("Cache expired — refresh recommended")
+        else:
+            st.caption("No board cache yet")
+    with _bb_top[2]:
+        st.caption(f"Board auto-refreshes every {BB_CACHE_TTL_SEC // 60} min, or when you click Refresh.")
+
+    rebuild_bb = bool(refresh_bb) or not _bb_cache_valid()
+    odds_status = st.session_state.get("bb_odds_status") or ("No API key entered" if not api_key else "")
+
+    if rebuild_bb:
+        with st.spinner("Loading EPA, Pace, Form, Schedule, Odds and unique weather..."):
+            team_epa = get_team_epa()
+            team_pace = get_team_pace()
+            team_success = get_team_success_metrics()
+            team_ou_rate = get_team_ou_tendency()
+            recent_form = get_recent_form(n_games=form_window)
+            schedules = load_schedules()
+            odds_data, odds_status = fetch_nfl_odds(api_key) if api_key else (None, "No API key entered")
+            st.session_state["bb_odds_status"] = odds_status
+            if odds_data:
+                st.session_state["odds_data"] = odds_data
+            try:
+                current_season = int(nfl.get_current_season())
+            except Exception:
+                current_season = datetime.now().year if datetime.now().month >= 8 else datetime.now().year - 1
+            model_bundle = train_ats_model(list(range(current_season - 4, current_season)))
+            # Source of truth: schedule-driven game list (includes every week 1–18 game)
+            upcoming = build_upcoming_games(schedules, odds_data, days_ahead=90)
+            stamp_now("schedule")
+            if odds_data:
+                stamp_now("odds")
+            weather_cache = build_weather_cache_from_games(upcoming)
+            stamp_now("weather")
+            st.session_state["bb_upcoming"] = list(upcoming or [])
+            st.session_state["bb_weather_cache"] = weather_cache or {}
+    else:
+        # Fast path: reuse session cache (homepage + other widgets won't wait on full rebuild)
+        opportunities = list(st.session_state.get("bb_opportunities") or [])
+        upcoming = st.session_state.get("bb_upcoming") or []
+        weather_cache = st.session_state.get("bb_weather_cache") or {}
+        odds_data = st.session_state.get("odds_data")
+        model_bundle = None
+        team_pace = pd.DataFrame()
+        team_success = pd.DataFrame()
+        team_ou_rate = {}
+        recent_form = {}
         try:
             current_season = int(nfl.get_current_season())
         except Exception:
             current_season = datetime.now().year if datetime.now().month >= 8 else datetime.now().year - 1
-        model_bundle = train_ats_model(list(range(current_season - 4, current_season)))
-        # Source of truth: schedule-driven game list (includes every week 1–18 game)
-        # Falls back to Odds API events if schedule rows are empty
-        upcoming = build_upcoming_games(schedules, odds_data, days_ahead=90)
-        stamp_now("schedule")
-        if odds_data:
-            stamp_now("odds")
-        weather_cache = build_weather_cache_from_games(upcoming)
-        stamp_now("weather")
 
     # Helpful diagnostics when the game list is empty
-    if not upcoming:
+    if rebuild_bb and not upcoming:
         with st.expander("Schedule / odds diagnostics (why no games?)", expanded=True):
             st.write({
                 "schedules_rows": 0 if schedules is None or schedules.empty else len(schedules),
@@ -3889,9 +3980,12 @@ with tab2:
                 "If odds_events is 0, enter a valid Odds API key. "
                 "The app will use whichever source has data."
             )
-    opportunities = []
     skipped = []
-    if upcoming:
+    if not rebuild_bb:
+        opportunities = list(st.session_state.get("bb_opportunities") or [])
+    else:
+        opportunities = []
+    if rebuild_bb and upcoming:
         model = model_bundle[0] if model_bundle else None
         feature_cols = model_bundle[1] if model_bundle else None
         league_avg_pace = float(team_pace["plays_per_game"].mean()) if not team_pace.empty else 65.0
@@ -4265,194 +4359,165 @@ with tab2:
                 _upsert_signals_from_opportunities(opportunities)
             except Exception:
                 pass
-            # Cache for Play Of The Day so Homepage matches The Big Board exactly
+            # Session cache — homepage / BYOA / reruns reuse without full rebuild
             try:
                 st.session_state["bb_opportunities"] = list(opportunities)
                 st.session_state["bb_play_of_day"] = _pick_top_play(list(opportunities))
+                st.session_state["bb_built_at"] = _time.time()
+                st.session_state["bb_upcoming"] = list(upcoming or [])
+                st.session_state["bb_weather_cache"] = weather_cache or {}
             except Exception:
                 pass
-            df = pd.DataFrame(opportunities).sort_values("Score", ascending=False)
 
-            # ---- FILTER CONTROLS ----
-            st.markdown("##### Filters")
-            f1, f2, f3 = st.columns([1, 1.4, 1])
-            with f1:
-                min_score = st.slider(
-                    "Min Score",
-                    min_value=0.0,
-                    max_value=max(10.0, float(df["Score"].max()) if len(df) else 10.0),
-                    value=0.0,
-                    step=0.5,
-                    key="opp_min_score",
-                )
-            with f2:
-                rec_options = {
-                    "Home ATS": "Home ATS",
-                    "Away ATS": "Away ATS",
-                    "Over": "Over",
-                    "Under": "Under",
-                    "No strong lean": "No strong lean",
-                }
-                selected_recs = st.multiselect(
-                    "Recommendation",
-                    options=list(rec_options.keys()),
-                    default=["Home ATS", "Away ATS", "Over", "Under", "No strong lean"],
-                    key="opp_rec_filter",
-                )
-            with f3:
-                df["_Week_num"] = pd.to_numeric(df["Week"], errors="coerce")
-                available_weeks = sorted(df["_Week_num"].dropna().unique().tolist())
-                week_choices = ["All weeks"] + [f"Week {int(w)}" for w in available_weeks]
-                # Default to current NFL week when available
-                cur_wk = current_nfl_week()
-                default_week_idx = 0
-                if cur_wk is not None and available_weeks:
-                    label = f"Week {int(cur_wk)}"
+    # Display from live rebuild or session cache
+    if opportunities:
+        df = pd.DataFrame(opportunities).sort_values("Score", ascending=False)
+
+        st.markdown("##### Filters")
+        f1, f2, f3 = st.columns([1, 1.4, 1])
+        with f1:
+            min_score = st.slider(
+                "Min Score",
+                min_value=0.0,
+                max_value=max(10.0, float(df["Score"].max()) if len(df) else 10.0),
+                value=0.0,
+                step=0.5,
+                key="opp_min_score",
+            )
+        with f2:
+            rec_options = {
+                "Home ATS": "Home ATS",
+                "Away ATS": "Away ATS",
+                "Over": "Over",
+                "Under": "Under",
+                "No strong lean": "No strong lean",
+            }
+            selected_recs = st.multiselect(
+                "Recommendation",
+                options=list(rec_options.keys()),
+                default=["Home ATS", "Away ATS", "Over", "Under", "No strong lean"],
+                key="opp_rec_filter",
+            )
+        with f3:
+            df["_Week_num"] = pd.to_numeric(df["Week"], errors="coerce")
+            available_weeks = sorted(df["_Week_num"].dropna().unique().tolist())
+            week_choices = ["All weeks"] + [f"Week {int(w)}" for w in available_weeks]
+            cur_wk = current_nfl_week()
+            default_week_idx = 0
+            if cur_wk is not None and available_weeks:
+                label = f"Week {int(cur_wk)}"
+                if label in week_choices:
+                    default_week_idx = week_choices.index(label)
+                else:
+                    future = [w for w in available_weeks if w >= cur_wk]
+                    pick = int(future[0]) if future else int(available_weeks[0])
+                    label = f"Week {pick}"
                     if label in week_choices:
                         default_week_idx = week_choices.index(label)
-                    else:
-                        # nearest upcoming week in list
-                        future = [w for w in available_weeks if w >= cur_wk]
-                        pick = int(future[0]) if future else int(available_weeks[0])
-                        label = f"Week {pick}"
-                        if label in week_choices:
-                            default_week_idx = week_choices.index(label)
-                selected_week_filter = st.selectbox(
-                    "Week",
-                    options=week_choices,
-                    index=default_week_idx,
-                    key="opp_week_filter",
-                )
-
-            filtered = df[df["Score"] >= min_score].copy()
-            if selected_recs:
-                allowed = {rec_options[r] for r in selected_recs if r in rec_options}
-                filtered = filtered[filtered["Recommendation"].isin(allowed)]
-            if selected_week_filter != "All weeks" and available_weeks:
-                try:
-                    wk = int(selected_week_filter.replace("Week ", ""))
-                    filtered = filtered[filtered["_Week_num"] == wk]
-                except Exception:
-                    pass
-
-            # Week completeness vs official embedded slate
-            week_note = ""
-            if selected_week_filter != "All weeks":
-                try:
-                    wk = int(selected_week_filter.replace("Week ", ""))
-                    expected_n = sum(1 for r in EMBEDDED_2026_SCHEDULE if int(r["week"]) == wk)
-                    week_note = f" · Week {wk} official slate: **{expected_n}** games"
-                    if len(filtered) < expected_n:
-                        week_note += f" (showing {len(filtered)} after filters)"
-                except Exception:
-                    pass
-            st.caption(
-                f"Showing **{len(filtered)}** of **{len(df)}** games "
-                f"(Min Score ≥ {min_score}"
-                + (f", Week filter: {selected_week_filter}" if selected_week_filter != "All weeks" else "")
-                + ")"
-                + week_note
+            selected_week_filter = st.selectbox(
+                "Week",
+                options=week_choices,
+                index=default_week_idx,
+                key="opp_week_filter",
             )
 
-            helper_cols = [c for c in filtered.columns if c.startswith("_")]
-            drop_cols = ["_Week_num", "key"] + helper_cols
-            display_df = filtered.drop(columns=[c for c in drop_cols if c in filtered.columns], errors="ignore")
-            if "key" in display_df.columns:
-                display_df = display_df.drop(columns=["key"])
-            # Strip "Lean " from recommendation labels if any remain
-            if "Recommendation" in display_df.columns:
-                display_df["Recommendation"] = (
-                    display_df["Recommendation"].astype(str)
-                    .str.replace(r"^Lean\s+", "", regex=True)
-                )
-            # Recommendation & Confidence as 4th and 5th columns
-            preferred = [
-                "Week", "Game", "Kickoff", "Recommendation", "Confidence",
-                "Score", "Edge %", "Spread", "Total", "Home Imp", "Away Imp",
-                "EPA Edge", "Form Δ", "Pace", "TZ Diff", "Div",
-                "Model %", "Market %", "ML Home %", "MC Home %", "MC Over %",
-                "Roof", "Weather", "Signals",
-            ]
-            ordered = [c for c in preferred if c in display_df.columns]
-            ordered += [c for c in display_df.columns if c not in ordered]
-            display_df = display_df[ordered]
-            st.markdown("##### The NFL Big Board")
-            st.caption("Values lock at kickoff — lines, scores, and signals stop updating once a game starts.")
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
-            st.caption(last_update_caption("odds", "schedule", "weather", label="Last update (Big Board)"))
+        filtered = df[df["Score"] >= min_score].copy()
+        if selected_recs:
+            allowed = {rec_options[r] for r in selected_recs if r in rec_options}
+            filtered = filtered[filtered["Recommendation"].isin(allowed)]
+        if selected_week_filter != "All weeks" and available_weeks:
+            try:
+                wk = int(selected_week_filter.replace("Week ", ""))
+                filtered = filtered[filtered["_Week_num"] == wk]
+            except Exception:
+                pass
 
-            # ---- TOP 5 SIGNALED GAMES BY WEEK ----
-            st.markdown("---")
-            st.subheader("🏆 Top 5 Signaled Games by Week")
-            st.caption(
-                "Select a week from the dropdown to see its 5 highest-Score opportunities. "
-                "Every scheduled game for that week is considered (schedule is source of truth)."
+        week_note = ""
+        if selected_week_filter != "All weeks":
+            try:
+                wk = int(selected_week_filter.replace("Week ", ""))
+                expected_n = sum(1 for r in EMBEDDED_2026_SCHEDULE if int(r["week"]) == wk)
+                week_note = f" · Week {wk} official slate: **{expected_n}** games"
+                if len(filtered) < expected_n:
+                    week_note += f" (showing {len(filtered)} after filters)"
+            except Exception:
+                pass
+        st.caption(
+            f"Showing **{len(filtered)}** of **{len(df)}** games "
+            f"(Min Score ≥ {min_score}"
+            + (f", rec filter on" if selected_recs else "")
+            + (f", {selected_week_filter}" if selected_week_filter != "All weeks" else "")
+            + ")"
+            + week_note
+        )
+
+        display_df = filtered.copy()
+        if "Recommendation" in display_df.columns:
+            display_df["Recommendation"] = (
+                display_df["Recommendation"].astype(str)
             )
-            df_week = df.copy()
-            df_week["Week_num"] = pd.to_numeric(df_week["Week"], errors="coerce")
-            df_known = df_week[df_week["Week_num"].notna()].copy()
-            display_cols = [
-                "Game", "Kickoff", "Spread", "Total", "Home Imp", "Away Imp",
-                "EPA Edge", "Form Δ", "Recommendation", "Confidence", "Score", "Signals"
-            ]
-            if not df_known.empty:
-                weeks_sorted = sorted(df_known["Week_num"].unique())
-                week_labels = {int(w): f"Week {int(w)}" for w in weeks_sorted}
-                default_idx = 0
-                cur_wk = current_nfl_week()
-                if cur_wk is not None:
-                    if int(cur_wk) in week_labels:
-                        default_idx = list(weeks_sorted).index(
-                            [w for w in weeks_sorted if int(w) == int(cur_wk)][0]
-                        )
-                    else:
-                        future = [w for w in weeks_sorted if int(w) >= int(cur_wk)]
-                        if future:
-                            default_idx = list(weeks_sorted).index(future[0])
-                selected_label = st.selectbox(
-                    "Select week",
-                    options=[week_labels[int(w)] for w in weeks_sorted],
-                    index=default_idx,
-                    key="top5_week_select",
-                )
-                selected_week = next(
-                    int(w) for w, lab in week_labels.items() if lab == selected_label
-                )
-                week_df = (
-                    df_known[df_known["Week_num"] == selected_week]
-                    .sort_values("Score", ascending=False)
-                    .head(5)
-                )
-                cols = [c for c in display_cols if c in week_df.columns]
+        display_cols = [
+            "Week", "Game", "Kickoff", "Recommendation", "Confidence",
+            "Score", "Spread", "Total", "Home Imp", "Away Imp",
+            "EPA Edge", "Form Δ", "Pace", "TZ Diff", "Div",
+            "Model %", "Market %", "Edge %", "Signals",
+        ]
+        cols = [c for c in display_cols if c in display_df.columns]
+        st.dataframe(display_df[cols], use_container_width=True, hide_index=True)
+
+        st.markdown("#### Top by week")
+        if available_weeks:
+            # default select current week
+            cur_wk = current_nfl_week()
+            default_lab = week_choices[1] if len(week_choices) > 1 else week_choices[0]
+            if cur_wk is not None:
+                lab = f"Week {int(cur_wk)}"
+                if lab in week_choices:
+                    default_lab = lab
+            selected_label = st.selectbox(
+                "Highlight week",
+                options=[c for c in week_choices if c != "All weeks"] or week_choices,
+                index=max(0, ([c for c in week_choices if c != "All weeks"] or week_choices).index(default_lab)
+                         if default_lab in ([c for c in week_choices if c != "All weeks"] or week_choices) else 0),
+                key="tab2_week_filter",
+            )
+            try:
+                wk = int(selected_label.replace("Week ", ""))
+                week_df = df[df["_Week_num"] == wk].sort_values("Score", ascending=False).head(10)
                 st.markdown(f"**{selected_label}** — top {len(week_df)} by Score")
                 st.dataframe(week_df[cols], use_container_width=True, hide_index=True)
-            else:
-                st.warning(
-                    "Could not resolve NFL week numbers from the schedule. "
-                    "Showing overall Top 5 instead."
-                )
+            except Exception:
                 top5 = df.head(5)
-                cols = [c for c in display_cols if c in top5.columns]
                 st.dataframe(top5[cols], use_container_width=True, hide_index=True)
-
-            st.markdown("#### Top Signal Summary")
-            st.caption("Implied Team Totals, Recent Form, Pace, Travel/TZ and Divisional are folded into Score + Signals. Schedule is the source of truth for weeks and kickoff times.")
         else:
+            st.warning(
+                "Could not resolve NFL week numbers from the schedule. "
+                "Showing overall Top 5 instead."
+            )
+            top5 = df.head(5)
+            st.dataframe(top5[cols], use_container_width=True, hide_index=True)
+
+        st.markdown("#### Top Signal Summary")
+        st.caption(
+            "Implied Team Totals, Recent Form, Pace, Travel/TZ and Divisional are folded into Score + Signals. "
+            "Schedule is the source of truth for weeks and kickoff times."
+        )
+        if filtered.empty:
             st.warning("No opportunities matched the filters.")
             if skipped:
                 with st.expander("Skipped"):
                     for s in skipped:
                         st.text(s)
     else:
-        if not upcoming:
+        if rebuild_bb and not upcoming:
             st.warning(
                 "No upcoming games found. Enter an Odds API key and/or ensure "
                 "nflreadpy has the current season schedule (try Clear all caches)."
             )
-        elif team_epa.empty:
-            st.error("Could not load EPA data from nflreadpy.")
-        else:
+        elif rebuild_bb:
             st.warning("No opportunities to display.")
+        else:
+            st.info("No cached Big Board yet. Click **Refresh board** to build it.")
 
 # ========== TAB 3: BYOA ==========
 with tab3:
@@ -4922,17 +4987,28 @@ with tab6:
         "Official report from [NFL.com/injuries](https://www.nfl.com/injuries/). "
         "Filter by team. Game Status reflects the league designation (Out / Doubtful / Questionable / etc.)."
     )
-    with st.spinner("Loading NFL.com injury report..."):
-        inj_df = load_nfl_injury_report()
-        if inj_df is not None and not inj_df.empty:
-            stamp_now("injuries")
-    if inj_df is None or inj_df.empty:
+    # Lazy: only fetch when user asks (Streamlit runs every tab on each rerun)
+    c_inj1, c_inj2 = st.columns([1, 2])
+    with c_inj1:
+        do_load_inj = st.button("Load / refresh injuries", key="btn_load_injuries", use_container_width=True)
+    if do_load_inj or st.session_state.get("injuries_ready"):
+        if do_load_inj or "injuries_df" not in st.session_state:
+            with st.spinner("Loading NFL.com injury report..."):
+                st.session_state["injuries_df"] = load_nfl_injury_report()
+                st.session_state["injuries_ready"] = True
+                if st.session_state["injuries_df"] is not None and not st.session_state["injuries_df"].empty:
+                    stamp_now("injuries")
+        inj_df = st.session_state.get("injuries_df")
+    else:
+        st.info("Click **Load / refresh injuries** to fetch data (keeps the rest of the app fast until you need this).")
+        inj_df = None
+    if st.session_state.get("injuries_ready") and (inj_df is None or (isinstance(inj_df, pd.DataFrame) and inj_df.empty)):
         st.warning(
             "Could not load injury data from NFL.com or ESPN right now. "
             "Click **Clear all caches** in the sidebar, then reload this tab. "
             "You can also open https://www.nfl.com/injuries/ directly."
         )
-    else:
+    elif inj_df is not None and not inj_df.empty:
         teams = sorted(inj_df["Team"].dropna().unique().tolist())
         c1, c2, c3 = st.columns([1.4, 1, 1])
         with c1:
@@ -4991,13 +5067,21 @@ with tab7:
         "Current team depth charts from [Ourlads](https://www.ourlads.com/nfldepthcharts/). "
         "Pick a team to view starters first, then full depth."
     )
-    with st.spinner("Loading depth charts..."):
-        dc_df = load_depth_charts()
-        if dc_df is not None and not dc_df.empty:
-            stamp_now("depth")
-    if dc_df is None or dc_df.empty:
-        st.warning("Could not load depth charts right now. Try clearing caches and reloading.")
+    do_load_dc = st.button("Load / refresh depth charts", key="btn_load_depth", use_container_width=True)
+    if do_load_dc or st.session_state.get("depth_ready"):
+        if do_load_dc or "depth_df" not in st.session_state:
+            with st.spinner("Loading depth charts..."):
+                st.session_state["depth_df"] = load_depth_charts()
+                st.session_state["depth_ready"] = True
+                if st.session_state["depth_df"] is not None and not st.session_state["depth_df"].empty:
+                    stamp_now("depth")
+        dc_df = st.session_state.get("depth_df")
     else:
+        st.info("Click **Load / refresh depth charts** when you need them (32 team pages — loaded on demand).")
+        dc_df = None
+    if st.session_state.get("depth_ready") and (dc_df is None or (isinstance(dc_df, pd.DataFrame) and dc_df.empty)):
+        st.warning("Could not load depth charts right now. Try clearing caches and reloading.")
+    elif dc_df is not None and not dc_df.empty:
         teams = sorted(dc_df["Team"].dropna().unique().tolist())
         c1, c2 = st.columns([2, 1])
         with c1:
@@ -5041,11 +5125,19 @@ with tab8:
         "ATS (against the spread) and Over/Under records by team — last 5 seasons of completed games. "
         "Filter by team and year."
     )
-    with st.spinner("Loading team history (5 seasons)..."):
-        th = build_team_history()
-    if th is None or th.empty:
-        st.warning("Could not load historical schedule results. Try Clear all caches.")
+    do_load_th = st.button("Load / refresh team history", key="btn_load_history", use_container_width=True)
+    if do_load_th or st.session_state.get("history_ready"):
+        if do_load_th or "team_history_df" not in st.session_state:
+            with st.spinner("Loading team history (5 seasons)..."):
+                st.session_state["team_history_df"] = build_team_history()
+                st.session_state["history_ready"] = True
+        th = st.session_state.get("team_history_df")
     else:
+        st.info("Click **Load / refresh team history** when you need ATS/OU records (heavy multi-season pull).")
+        th = None
+    if st.session_state.get("history_ready") and (th is None or (isinstance(th, pd.DataFrame) and th.empty)):
+        st.warning("Could not load historical schedule results. Try Clear all caches.")
+    elif th is not None and not th.empty:
         teams = sorted(th["team"].dropna().unique().tolist())
         years = sorted([int(y) for y in th["season"].dropna().unique().tolist()], reverse=True)
         c1, c2 = st.columns(2)
