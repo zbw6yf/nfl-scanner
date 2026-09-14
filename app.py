@@ -797,10 +797,61 @@ def _apply_locked_lean_fields(live_row: Dict, locked: Dict) -> Dict:
     return out
 
 
+def _signal_snapshot_for_game(week, away: str, home: str, game_label: str = "") -> Optional[Dict]:
+    """Recover last logged pre-game lean from signal history for this matchup."""
+    try:
+        hist = _load_signal_history()
+        if hist is None or hist.empty:
+            return None
+        away_u, home_u = str(away).upper(), str(home).upper()
+        week_s = str(week)
+        candidates = []
+        for _, r in hist.iterrows():
+            if str(r.get("week")) != week_s and str(r.get("week")) != str(week):
+                # allow int/str mismatch
+                try:
+                    if int(float(r.get("week"))) != int(float(week)):
+                        continue
+                except Exception:
+                    continue
+            g = str(r.get("game") or "")
+            h = str(r.get("home") or "").upper()
+            a = str(r.get("away") or "").upper()
+            match = (
+                (h == home_u and a == away_u)
+                or (away_u and home_u and away_u in g.upper() and home_u in g.upper())
+                or (game_label and g == game_label)
+            )
+            if not match:
+                continue
+            candidates.append(r)
+        if not candidates:
+            return None
+        # Prefer most recently logged pending/graded row
+        def _log_key(r):
+            return str(r.get("logged_at") or "")
+        best = sorted(candidates, key=_log_key, reverse=True)[0]
+        return {
+            "Recommendation": best.get("recommendation"),
+            "Confidence": best.get("confidence"),
+            "Score": best.get("score"),
+            "Spread": best.get("spread"),
+            "Total": best.get("total"),
+            "_spread": best.get("spread"),
+            "_total": best.get("total"),
+            "_home": home_u,
+            "_away": away_u,
+            "_from_signal_history": True,
+        }
+    except Exception:
+        return None
+
+
 def freeze_or_update_board_row(row: Dict, started: bool) -> Dict:
     """
-    Before kickoff: refresh stored snapshot (Recommendation / Score / Confidence).
-    After kickoff: force those fields from the frozen snapshot — never update them again.
+    Before kickoff: continuously save Recommendation / Score / Confidence snapshot.
+    After kickoff: ALWAYS show the last pre-kickoff snapshot — never mid-game recalculation.
+    Recovery order if lock missing: unlocked pre-game snap → signal history → leave unlocked warning.
     """
     gd = str(row.get("_gameday") or row.get("Kickoff") or "")[:10]
     key = board_lock_key(row.get("Week"), row.get("_away"), row.get("_home"), gd)
@@ -809,33 +860,54 @@ def freeze_or_update_board_row(row: Dict, started: bool) -> Dict:
     row = _enrich_row_from_line_opens(row)
 
     if started:
-        # Prefer already-locked snapshot; else lock the last pre-game snapshot; else lock current
+        # 1) Already locked pre-kickoff snapshot
         if existing and existing.get("_locked"):
             return _apply_locked_lean_fields(row, existing)
-        if existing and not existing.get("_locked"):
+        # 2) Had pre-game snap that wasn't flagged locked yet — freeze it now (NOT live row)
+        if existing and not existing.get("_locked") and existing.get("Recommendation") not in (None, "", "—"):
             snap = _serialize_lock_row({**existing, "key": key, "_locked": True})
             snap["_locked"] = True
             locks[key] = snap
             _save_board_locks(locks)
             return _apply_locked_lean_fields(row, snap)
-        snap = _serialize_lock_row({**row, "key": key, "_locked": True})
-        snap["_locked"] = True
-        locks[key] = snap
-        _save_board_locks(locks)
-        return _apply_locked_lean_fields(row, snap)
+        # 3) Recover from signal history (logged before/at board runs pre-game)
+        sig = _signal_snapshot_for_game(
+            row.get("Week"), row.get("_away") or "", row.get("_home") or "", str(row.get("Game") or "")
+        )
+        if sig and sig.get("Recommendation") not in (None, "", "—"):
+            merged = {**row, **sig, "key": key, "_locked": True}
+            snap = _serialize_lock_row(merged)
+            snap["_locked"] = True
+            locks[key] = snap
+            _save_board_locks(locks)
+            return _apply_locked_lean_fields(row, snap)
+        # 4) No trustworthy pre-kickoff lean — do NOT freeze live mid-game as truth
+        out = dict(row)
+        out["_locked"] = False
+        out["_missing_prekick_lock"] = True
+        if out.get("Recommendation") not in (None, "", "—"):
+            out["Signals"] = (
+                str(out.get("Signals") or "")
+                + (" · " if out.get("Signals") else "")
+                + "No pre-kickoff snapshot on file"
+            )
+        return out
 
-    # Pre-game: if somehow locked already, keep lean fields frozen
+    # Pre-game: if locked already, keep lean fields frozen
     if existing and existing.get("_locked"):
         return _apply_locked_lean_fields(row, existing)
 
-    # Update pre-kickoff snapshot whenever we have a real lean (spread optional but preferred)
+    # Continuously overwrite pre-kickoff snapshot with latest board lean
     snap = _serialize_lock_row({**row, "key": key, "_locked": False})
     snap["_locked"] = False
     if _row_has_spread(row) or row.get("Recommendation") not in (None, "", "—"):
         locks[key] = snap
         _save_board_locks(locks)
-    elif existing and _row_has_spread(existing):
-        return dict(row)  # keep prior better snapshot, show live row
+    elif existing and (
+        _row_has_spread(existing) or existing.get("Recommendation") not in (None, "", "—")
+    ):
+        # Keep better existing pre-game snapshot; still show live row until start
+        return dict(row)
     else:
         locks[key] = snap
         _save_board_locks(locks)
@@ -1762,29 +1834,52 @@ def confidence_grade(
 
 
 def _upsert_signals_from_opportunities(opps: list) -> None:
-    """Add new Game Signals rows to history (skip duplicates by week+game+recommendation)."""
+    """
+    Maintain one Pending signal per week+game from the *pre-kickoff* board only.
+
+    - Before kickoff: create or update the pending row so the last pre-game lean is stored.
+    - After kickoff: never insert or change recommendation/confidence/score (grades use the frozen lean).
+    """
     if not opps:
         return
     hist = _load_signal_history()
-    existing = set()
-    if not hist.empty:
-        for _, r in hist.iterrows():
-            existing.add((str(r.get("week")), str(r.get("game")), str(r.get("recommendation"))))
-    new_rows = []
     import uuid
+
+    # Map existing pending rows by week+game
+    pending_idx: Dict[str, int] = {}
+    if hist is not None and not hist.empty:
+        for i, r in hist.iterrows():
+            if str(r.get("result") or "") not in ("Pending", "", "None", "nan"):
+                continue
+            k = f"{r.get('week')}::{r.get('game')}"
+            pending_idx[k] = i
+
+    changed = False
+    new_rows = []
     for o in opps:
         game = str(o.get("Game", ""))
         rec = str(o.get("Recommendation", ""))
-        week = str(o.get("Week", ""))
-        key = (week, game, rec)
-        if key in existing:
+        week = o.get("Week")
+        if rec in ("", "—", "None", "No strong lean"):
+            # Still allow logging "No strong lean" as a snapshot? Skip weak noise.
+            if rec != "No strong lean":
+                continue
+        started = bool(o.get("_locked")) or game_has_started(
+            kickoff=str(o.get("Kickoff") or ""),
+            gameday=str(o.get("_gameday") or o.get("Kickoff") or "")[:10],
+            commence_raw=str(o.get("_commence_raw") or ""),
+        )
+        # Also respect missing pre-kick snapshot — don't log mid-game invention
+        if o.get("_missing_prekick_lock"):
             continue
-        if rec in ("", "—", "None"):
+
+        gk = f"{week}::{game}"
+        if started:
+            # Do not touch history after kickoff (existing pending row is the record to grade)
             continue
-        new_rows.append({
-            "id": str(uuid.uuid4())[:8],
-            "logged_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "week": o.get("Week"),
+
+        payload = {
+            "week": week,
             "game": game,
             "home": o.get("_home"),
             "away": o.get("_away"),
@@ -1797,10 +1892,22 @@ def _upsert_signals_from_opportunities(opps: list) -> None:
             "result": "Pending",
             "correct": None,
             "graded_at": None,
-        })
-        existing.add(key)
+            "logged_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        if gk in pending_idx and hist is not None and not hist.empty:
+            i = pending_idx[gk]
+            for col, val in payload.items():
+                hist.at[i, col] = val
+            changed = True
+        else:
+            payload["id"] = str(uuid.uuid4())[:8]
+            new_rows.append(payload)
+            pending_idx[gk] = -1
+
     if new_rows:
-        hist = pd.concat([hist, pd.DataFrame(new_rows)], ignore_index=True)
+        hist = pd.concat([hist, pd.DataFrame(new_rows)], ignore_index=True) if hist is not None and not hist.empty else pd.DataFrame(new_rows)
+        changed = True
+    if changed and hist is not None:
         _save_signal_history(hist)
 
 
@@ -4197,23 +4304,52 @@ with tab2:
                 if _started_early:
                     _lk = board_lock_key(g.get("week"), away, home, game_date)
                     _locks = _load_board_locks()
-                    if _lk in _locks and (
-                        _locks[_lk].get("_locked")
-                        or _row_has_spread(_locks[_lk])
+                    _lock_row = _locks.get(_lk) if _lk in _locks else None
+                    if _lock_row and (
+                        _lock_row.get("_locked")
+                        or _lock_row.get("Recommendation") not in (None, "", "—")
+                        or _row_has_spread(_lock_row)
                     ):
-                        frozen = _enrich_row_from_line_opens(dict(_locks[_lk]))
+                        frozen = _enrich_row_from_line_opens(dict(_lock_row))
                         frozen["_locked"] = True
+                        frozen.setdefault("Game", f"{away_full} @ {home_full}" if "away_full" in dir() else frozen.get("Game"))
+                        frozen.setdefault("Week", g.get("week"))
+                        frozen.setdefault("Kickoff", commence)
                         opportunities.append(frozen)
                         continue
-                    # Recover lines from tracker so spread doesn't go blank mid-calc
+                    # Recover pre-kick lean from signal history if board lock missing
+                    _sig = _signal_snapshot_for_game(g.get("week"), away, home, f"{full_name(away)} @ {full_name(home)}")
+                    if _sig and _sig.get("Recommendation") not in (None, "", "—"):
+                        frozen = {
+                            "Week": g.get("week"),
+                            "Game": f"{full_name(away)} @ {full_name(home)}",
+                            "Kickoff": commence,
+                            "Recommendation": _sig.get("Recommendation"),
+                            "Confidence": _sig.get("Confidence"),
+                            "Score": _sig.get("Score"),
+                            "Spread": _sig.get("Spread", "—"),
+                            "Total": _sig.get("Total", "—"),
+                            "Signals": "Restored from pre-kickoff signal history",
+                            "_home": home,
+                            "_away": away,
+                            "_gameday": game_date,
+                            "_locked": True,
+                        }
+                        frozen = _enrich_row_from_line_opens(frozen)
+                        # Persist as board lock so future loads stay stable
+                        try:
+                            _locks[_lk] = _serialize_lock_row({**frozen, "key": _lk, "_locked": True})
+                            _locks[_lk]["_locked"] = True
+                            _save_board_locks(_locks)
+                        except Exception:
+                            pass
+                        opportunities.append(frozen)
+                        continue
+                    # No pre-kick snapshot: still try to show a shell without treating live score as the lean
                     try:
                         info = resolve_open_lines(api_key or "", home, away, game_date, avg_spread, avg_total)
-                        if avg_spread is None and info.get("cur_spread") is not None:
-                            avg_spread = info.get("cur_spread")
                         if avg_spread is None and info.get("open_spread") is not None:
                             avg_spread = info.get("open_spread")
-                        if (avg_total is None or avg_total == 45.0) and info.get("cur_total") is not None:
-                            avg_total = info.get("cur_total")
                         if (avg_total is None or avg_total == 45.0) and info.get("open_total") is not None:
                             avg_total = info.get("open_total")
                     except Exception:
