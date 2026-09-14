@@ -3118,6 +3118,161 @@ def monte_carlo_game(
 # TABS
 # -----------------------------
 
+def _potd_lock_path() -> Path:
+    return Path(__file__).resolve().parent / "potd_locks.json"
+
+
+def _load_potd_locks() -> Dict[str, Any]:
+    if "potd_locks" in st.session_state and isinstance(st.session_state.get("potd_locks"), dict):
+        return st.session_state["potd_locks"]
+    locks: Dict[str, Any] = {}
+    try:
+        p = _potd_lock_path()
+        if p.exists():
+            import json as _json
+            raw = _json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                locks = raw
+    except Exception:
+        pass
+    st.session_state["potd_locks"] = locks
+    return locks
+
+
+def _save_potd_locks(locks: Dict[str, Any]) -> None:
+    st.session_state["potd_locks"] = locks
+    try:
+        import json as _json
+        _potd_lock_path().write_text(_json.dumps(locks, default=str), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _week_first_game_started(week: int, schedules: Optional[pd.DataFrame] = None) -> bool:
+    """True once any game in this NFL week has kicked off."""
+    try:
+        week = int(week)
+        now = pd.Timestamp.now(tz="UTC")
+        # 1) From schedule rows for this week
+        if schedules is not None and not getattr(schedules, "empty", True):
+            s = schedules.copy()
+            if "week" in s.columns:
+                s = s[pd.to_numeric(s["week"], errors="coerce") == week]
+            for _, row in s.iterrows():
+                gd = str(row.get("gameday") or row.get("gameday_time") or "")[:10]
+                gt = str(row.get("gametime") or "13:00")
+                kick = format_schedule_kickoff(gd, gt) if gd else ""
+                if game_has_started(kickoff=kick, gameday=gd, gametime=gt):
+                    return True
+        # 2) From Big Board / upcoming rows in session
+        for o in (st.session_state.get("bb_opportunities") or []):
+            try:
+                w = o.get("Week")
+                if w is None or int(float(w)) != week:
+                    continue
+            except Exception:
+                continue
+            if game_has_started(
+                kickoff=str(o.get("Kickoff") or ""),
+                gameday=str(o.get("_gameday") or o.get("Kickoff") or "")[:10],
+                commence_raw=str(o.get("_commence_raw") or ""),
+            ):
+                return True
+        # 3) Embedded schedule fallback
+        try:
+            for row in EMBEDDED_2026_SCHEDULE:
+                if int(row.get("week") or 0) != week:
+                    continue
+                gd, gt = row.get("gameday"), row.get("gametime") or "13:00"
+                kick = format_schedule_kickoff(gd, gt)
+                if game_has_started(kickoff=kick, gameday=str(gd), gametime=str(gt)):
+                    return True
+        except Exception:
+            pass
+        return False
+    except Exception:
+        return False
+
+
+def _enrich_potd_lines(row: Dict, api_key: str = "") -> Dict:
+    """Fill Open/Curr spread & total from line tracker, Action Network, and live fields."""
+    out = dict(row)
+    home = str(out.get("_home") or "")
+    away = str(out.get("_away") or "")
+    # Parse teams from "Away @ Home" if needed
+    if (not home or not away) and out.get("Game"):
+        try:
+            parts = str(out["Game"]).split("@")
+            if len(parts) == 2:
+                away = away or to_abbr(parts[0].strip())
+                home = home or to_abbr(parts[1].strip())
+        except Exception:
+            pass
+    gd = str(out.get("_gameday") or out.get("Kickoff") or "")[:10]
+    try:
+        cur_s = out.get("_spread")
+        if cur_s is None and out.get("Spread") not in (None, "—", ""):
+            cur_s = float(str(out.get("Spread")).replace("+", ""))
+    except Exception:
+        cur_s = None
+    try:
+        cur_t = out.get("_total")
+        if cur_t is None and out.get("Total") not in (None, "—", ""):
+            cur_t = float(str(out.get("Total")).replace("+", ""))
+    except Exception:
+        cur_t = None
+
+    info: Dict[str, Any] = {}
+    try:
+        if home and away:
+            info = resolve_open_lines(api_key or "", home, away, gd, cur_s, cur_t) or {}
+    except Exception:
+        info = {}
+
+    an: Dict[str, Any] = {}
+    try:
+        an_map = fetch_action_network_lines() or {}
+        an = an_map.get(f"{away}_{home}") or an_map.get(f"{home}_{away}") or {}
+    except Exception:
+        an = {}
+
+    open_s = info.get("open_spread")
+    if open_s is None:
+        open_s = an.get("open_spread")
+    open_t = info.get("open_total")
+    if open_t is None:
+        open_t = an.get("open_total")
+    live_s = info.get("cur_spread")
+    if live_s is None:
+        live_s = an.get("cur_spread")
+    if live_s is None:
+        live_s = cur_s
+    live_t = info.get("cur_total")
+    if live_t is None:
+        live_t = an.get("cur_total")
+    if live_t is None:
+        live_t = cur_t
+
+    # If still no open, treat first seen current as open for display
+    if open_s is None and live_s is not None:
+        open_s = live_s
+    if open_t is None and live_t is not None:
+        open_t = live_t
+
+    out["Open Spread"] = f"{float(open_s):+.1f}" if open_s is not None else "—"
+    out["Curr Spread"] = f"{float(live_s):+.1f}" if live_s is not None else "—"
+    out["Open Total"] = f"{float(open_t):.1f}" if open_t is not None else "—"
+    out["Curr Total"] = f"{float(live_t):.1f}" if live_t is not None else "—"
+    if live_s is not None and out.get("Spread") in (None, "—", ""):
+        out["Spread"] = f"{float(live_s):+.1f}"
+    if live_t is not None and out.get("Total") in (None, "—", ""):
+        out["Total"] = f"{float(live_t):.1f}"
+    out["_home"] = home
+    out["_away"] = away
+    out["_gameday"] = gd
+    return out
+
+
 def build_play_of_the_day(
     week: int,
     api_key: str = "",
@@ -3127,9 +3282,74 @@ def build_play_of_the_day(
     """
     Pick the current-week play using the SAME Score / Confidence / Recommendation
     rules as The Big Board (full signal stack for that week's games only).
+
+    Once the first game of the week has kicked off, the Play of the Day is frozen
+    for the rest of the week (Recommendation / Score / Confidence / game identity).
     """
     try:
         week = int(week)
+        lock_key = f"week_{week}"
+        locks = _load_potd_locks()
+        existing = locks.get(lock_key) if isinstance(locks.get(lock_key), dict) else None
+
+        # Detect whether the week has started (any game kicked off)
+        try:
+            sched_for_week = load_schedules()
+        except Exception:
+            sched_for_week = None
+        week_started = _week_first_game_started(week, sched_for_week)
+
+        # If locked for this week, always return the frozen card (re-enrich lines for display only)
+        if existing and existing.get("_locked"):
+            frozen = dict(existing)
+            try:
+                frozen = _enrich_potd_lines(frozen, api_key)
+            except Exception:
+                pass
+            frozen["_locked"] = True
+            return frozen
+
+        def _finalize_pick(pick: Optional[Dict]) -> Optional[Dict]:
+            if not pick:
+                return None
+            pick = _enrich_potd_lines(pick, api_key)
+            if week_started:
+                # Freeze at first kickoff of the week
+                snap = dict(pick)
+                snap["_locked"] = True
+                snap["_locked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                snap["_week"] = week
+                locks[lock_key] = {
+                    k: (v if isinstance(v, (str, int, float, bool, type(None))) else str(v))
+                    for k, v in snap.items()
+                    if not str(k).startswith("_features")
+                }
+                locks[lock_key]["_locked"] = True
+                locks[lock_key]["_week"] = week
+                for fld in (
+                    "Recommendation", "Confidence", "Score", "Game", "Kickoff", "Signals",
+                    "Spread", "Total", "Open Spread", "Curr Spread", "Open Total", "Curr Total",
+                    "Edge %", "_home", "_away", "_gameday",
+                ):
+                    if fld in snap:
+                        locks[lock_key][fld] = snap.get(fld)
+                _save_potd_locks(locks)
+                pick["_locked"] = True
+            else:
+                # Pre-week: keep updating unlocked snapshot
+                snap = dict(pick)
+                snap["_locked"] = False
+                snap["_week"] = week
+                locks[lock_key] = {
+                    k: (v if isinstance(v, (str, int, float, bool, type(None))) else str(v))
+                    for k, v in snap.items()
+                    if not str(k).startswith("_features")
+                }
+                locks[lock_key]["_locked"] = False
+                _save_potd_locks(locks)
+                pick["_locked"] = False
+            return pick
+
         # Prefer live Big Board results from this session when available
         cached = st.session_state.get("bb_opportunities")
         if isinstance(cached, list) and cached:
@@ -3143,7 +3363,11 @@ def build_play_of_the_day(
                 except Exception:
                     continue
             if week_rows:
-                return _pick_top_play(week_rows)
+                # If week already started and we have a pre-lock snapshot, prefer locking that
+                if week_started and existing and not existing.get("_locked"):
+                    return _finalize_pick(dict(existing))
+                pick = _pick_top_play(week_rows)
+                return _finalize_pick(pick)
 
         team_epa = get_team_epa()
         team_pace = get_team_pace()
@@ -3364,7 +3588,7 @@ def build_play_of_the_day(
                 else:
                     edge_pct = edge_home
                 conf = confidence_grade(rec, total_score, ml_home, mc, edge_pct, len(signals), agree)
-                opportunities.append({
+                row_out = {
                     "Week": week,
                     "Game": f"{away_full} @ {home_full}",
                     "Kickoff": commence,
@@ -3373,16 +3597,36 @@ def build_play_of_the_day(
                     "Score": round(total_score, 2),
                     "Spread": f"{avg_spread:+.1f}" if avg_spread is not None else "—",
                     "Total": f"{avg_total:.1f}" if avg_total is not None else "—",
-                    "Open Spread": f"{an.get('open_spread'):+.1f}" if an.get("open_spread") is not None else "—",
-                    "Curr Spread": f"{an.get('cur_spread'):+.1f}" if an.get("cur_spread") is not None else "—",
-                    "Open Total": f"{an.get('open_total'):.1f}" if an.get("open_total") is not None else "—",
-                    "Curr Total": f"{an.get('cur_total'):.1f}" if an.get("cur_total") is not None else "—",
+                    "Open Spread": "—",
+                    "Curr Spread": "—",
+                    "Open Total": "—",
+                    "Curr Total": "—",
                     "Signals": " • ".join(signals) if signals else "—",
                     "Edge %": f"{edge_pct:+.1f}" if edge_pct is not None else "—",
-                })
+                    "_home": home,
+                    "_away": away,
+                    "_gameday": game_date,
+                    "_spread": avg_spread,
+                    "_total": avg_total,
+                }
+                try:
+                    row_out = _enrich_potd_lines(row_out, api_key)
+                except Exception:
+                    # Fallback to Action Network only
+                    if an.get("open_spread") is not None:
+                        row_out["Open Spread"] = f"{an.get('open_spread'):+.1f}"
+                    if an.get("cur_spread") is not None:
+                        row_out["Curr Spread"] = f"{an.get('cur_spread'):+.1f}"
+                    if an.get("open_total") is not None:
+                        row_out["Open Total"] = f"{an.get('open_total'):.1f}"
+                    if an.get("cur_total") is not None:
+                        row_out["Curr Total"] = f"{an.get('cur_total'):.1f}"
+                opportunities.append(row_out)
             except Exception:
                 continue
-        return _pick_top_play(opportunities)
+        if week_started and existing and not existing.get("_locked"):
+            return _finalize_pick(dict(existing))
+        return _finalize_pick(_pick_top_play(opportunities))
     except Exception:
         return None
 
@@ -3499,11 +3743,13 @@ with tab1:
         cur_wk = current_nfl_week() or 1
         with st.spinner("Selecting Play Of The Day..."):
             potd = build_play_of_the_day(int(cur_wk), api_key or "", n_simulations=n_simulations, form_window=form_window)
+        locked = bool(potd and potd.get("_locked"))
+        lock_note = " · Locked for the week" if locked else " · Updates until the first kickoff of the week"
         st.markdown(
             f"""
 <div class="tm-today-header">
   <h3>Play Of The Day · Week {int(cur_wk)}</h3>
-  <p>Highest confidence, then highest model Score on this week's slate.</p>
+  <p>Highest confidence, then highest model Score on this week's slate{lock_note}.</p>
 </div>
             """,
             unsafe_allow_html=True,
@@ -3519,13 +3765,22 @@ with tab1:
             spread = potd.get("Spread", "—")
             total = potd.get("Total", "—")
             signals = potd.get("Signals", "—")
+            open_sp = potd.get("Open Spread", "—")
+            cur_sp = potd.get("Curr Spread", "—")
+            open_tot = potd.get("Open Total", "—")
+            cur_tot = potd.get("Curr Total", "—")
             conf_color = {"A": "#4ade80", "B": "#38bdf8", "C": "#fbbf24", "D": "#fb923c", "F": "#f87171"}.get(str(conf), "#94a3b8")
+            lock_badge = (
+                '<span style="background:#334155;color:#e2e8f0;font-size:0.7rem;font-weight:700;'
+                'padding:2px 8px;border-radius:999px;margin-left:6px;">LOCKED</span>'
+                if locked else ""
+            )
             st.markdown(
                 f"""
 <div class="tm-ticket" style="border-color:{conf_color};box-shadow:0 0 0 1px {conf_color}33;">
   <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:flex-start;">
     <div>
-      <div style="color:{conf_color};font-weight:800;font-size:0.85rem;letter-spacing:0.06em;">{conf} · {rec}</div>
+      <div style="color:{conf_color};font-weight:800;font-size:0.85rem;letter-spacing:0.06em;">{conf} · {rec}{lock_badge}</div>
       <div style="color:#f8fafc;font-weight:700;font-size:1.15rem;margin-top:4px;">{game}</div>
       <div style="color:#94a3b8;font-size:0.85rem;margin-top:2px;">Kickoff {kick}</div>
       <div style="color:#cbd5e1;font-size:0.85rem;margin-top:8px;">{signals}</div>
@@ -3535,16 +3790,20 @@ with tab1:
       <div style="color:#f8fafc;font-weight:800;font-size:1.4rem;">{score}</div>
       <div style="color:#94a3b8;font-size:0.75rem;margin-top:8px;">SPREAD · TOTAL</div>
       <div style="color:#e2e8f0;font-weight:600;">{spread} · {total}</div>
-      <div style="color:#94a3b8;font-size:0.75rem;margin-top:8px;">OPEN → CURR</div>
-      <div style="color:#e2e8f0;font-size:0.9rem;">{potd.get("Open Spread","—")} → {potd.get("Curr Spread","—")}</div>
-      <div style="color:#e2e8f0;font-size:0.9rem;">{potd.get("Open Total","—")} → {potd.get("Curr Total","—")}</div>
+      <div style="color:#94a3b8;font-size:0.75rem;margin-top:8px;">OPEN → CURR SPREAD</div>
+      <div style="color:#e2e8f0;font-size:0.9rem;">{open_sp} → {cur_sp}</div>
+      <div style="color:#94a3b8;font-size:0.75rem;margin-top:4px;">OPEN → CURR TOTAL</div>
+      <div style="color:#e2e8f0;font-size:0.9rem;">{open_tot} → {cur_tot}</div>
     </div>
   </div>
 </div>
                 """,
                 unsafe_allow_html=True,
             )
-            st.caption(last_update_caption("odds", "schedule", label="Last update (Play Of The Day)"))
+            if locked:
+                st.caption("Play of the Day is locked for this week (first game has kicked off). Open→Curr lines still refresh when available.")
+            else:
+                st.caption(last_update_caption("odds", "schedule", label="Last update (Play Of The Day)"))
         st.markdown("---")
 
     # ---- Rest of homepage (no hero) ----
