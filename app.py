@@ -16,6 +16,24 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import streamlit as st
+
+# set_page_config MUST be the first Streamlit command (before any st.error / imports that use st)
+_page_icon = "🏈"
+for _p in [
+    Path(__file__).resolve().parent / "tailme_logo.png",
+    Path("tailme_logo.png"),
+]:
+    if _p.exists():
+        _page_icon = str(_p)
+        break
+
+st.set_page_config(
+    page_title="TAIL ME Sports",
+    page_icon=_page_icon,
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
 import pandas as pd
 import requests
 import re
@@ -29,67 +47,63 @@ warnings.filterwarnings("ignore")
 try:
     import nflreadpy as nfl
 except ImportError:
-    st.error("nflreadpy is not installed. Run: pip install nflreadpy")
+    st.error("nflreadpy is not installed. Add it to requirements.txt and reboot.")
     st.stop()
 
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
+try:
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import Pipeline
+except ImportError:
+    st.error("scikit-learn is not installed. Add scikit-learn to requirements.txt and reboot.")
+    st.stop()
 
-from byoa import render_byoa_tab, features_dict_for_board_row
+try:
+    from byoa import render_byoa_tab, features_dict_for_board_row
+except Exception as _e:
+    st.error(f"Failed to import byoa.py: {_e}")
+    st.stop()
 
 # ---- Modular imports ----
-from config.constants import (
-    TEAM_NAME_TO_ABBR, ABBR_TO_FULL, STADIUM_COORDS, TEAM_TZ, DIVISIONS, TEAM_TO_DIV,
-    TEAM_COLORS, CONF_COLORS, DEFAULT_FEATURE_FLAGS, TEAM_ALIASES, SLUG_TO_ABBR,
-)
-from utils.teams import (
-    to_abbr, full_name, expand_team, is_divisional, timezone_diff, travel_direction,
-    normalize_team_abbr,
-)
-from utils.dates import (
-    format_kickoff, format_schedule_kickoff, estimate_week_from_date, current_nfl_week,
-)
-from utils.odds_utils import (
-    implied_team_totals, american_to_implied_prob, remove_vig_two_way,
-    compute_edge, american_profit, clv_spread, clv_total,
-)
-from utils.features import (
-    feature_enabled, user_tier, require_pro, stripe_payment_link, render_upgrade_cta,
-)
-from ui.theme import (
-    inject_theme_css, get_logo_data_uri, conf_pill,
-    stamp_now, stamp_text, last_update_caption,
-)
-from persistence.storage import (
-    _load_saved_api_key, _save_api_key,
-    _load_signal_history, _save_signal_history,
-    _load_bet_log, _save_bet_log,
-)
+try:
+    from config.constants import (
+        TEAM_NAME_TO_ABBR, ABBR_TO_FULL, STADIUM_COORDS, TEAM_TZ, DIVISIONS, TEAM_TO_DIV,
+        TEAM_COLORS, CONF_COLORS, DEFAULT_FEATURE_FLAGS, TEAM_ALIASES, SLUG_TO_ABBR,
+    )
+    from utils.teams import (
+        to_abbr, full_name, expand_team, is_divisional, timezone_diff, travel_direction,
+        normalize_team_abbr,
+    )
+    from utils.dates import (
+        format_kickoff, format_schedule_kickoff, estimate_week_from_date, current_nfl_week,
+    )
+    from utils.odds_utils import (
+        implied_team_totals, american_to_implied_prob, remove_vig_two_way,
+        compute_edge, american_profit, clv_spread, clv_total,
+    )
+    from utils.features import (
+        feature_enabled, user_tier, require_pro, stripe_payment_link, render_upgrade_cta,
+    )
+    from ui.theme import (
+        inject_theme_css, get_logo_data_uri, conf_pill,
+        stamp_now, stamp_text, last_update_caption,
+    )
+    from persistence.storage import (
+        _load_saved_api_key, _save_api_key,
+        _load_signal_history, _save_signal_history,
+        _load_bet_log, _save_bet_log,
+    )
+except Exception as _e:
+    st.error(
+        "Failed to import modular packages (config/utils/ui/persistence). "
+        "Make sure those folders exist on GitHub next to app.py.\n\n"
+        f"Details: {_e}"
+    )
+    st.stop()
 
 # Alias used by older code
 _expand_team = expand_team
 _normalize_team_abbr = normalize_team_abbr
-
-# -----------------------------
-# PAGE CONFIG
-# -----------------------------
-_page_icon = "🏈"
-for _p in [
-    Path(__file__).resolve().parent / "tailme_logo.png",
-    Path("/home/workdir/artifacts/tailme_logo.png"),
-    Path("tailme_logo.png"),
-]:
-    if _p.exists():
-        _page_icon = str(_p)
-        break
-
-st.set_page_config(
-    page_title="TAIL ME Sports",
-    page_icon=_page_icon,
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
 if "ui_theme" not in st.session_state:
     st.session_state["ui_theme"] = "Dark"
@@ -246,23 +260,56 @@ st.sidebar.caption("Weather is unique per stadium + kickoff.")
 # -----------------------------
 # DATA FUNCTIONS
 # -----------------------------
+def _default_pbp_seasons() -> List[int]:
+    try:
+        current = int(nfl.get_current_season())
+    except Exception:
+        current = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
+    return [current - 1, current]
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _load_pbp_cached(seasons: Tuple[int, ...]) -> pd.DataFrame:
+    """
+    Single shared play-by-play load for EPA / pace / success / RZ.
+    seasons must be a tuple so the cache key is hashable.
+    """
+    try:
+        pbp = nfl.load_pbp(seasons=list(seasons))
+        if hasattr(pbp, "to_pandas"):
+            pbp = pbp.to_pandas()
+        if pbp is None or getattr(pbp, "empty", True):
+            return pd.DataFrame()
+        return pbp
+    except Exception:
+        return pd.DataFrame()
+
+
+def _pbp_pass_run(seasons: Optional[List[int]] = None) -> pd.DataFrame:
+    """Filtered pass/run plays with EPA (shared by metric builders)."""
+    if seasons is None:
+        seasons = _default_pbp_seasons()
+    pbp = _load_pbp_cached(tuple(sorted(int(s) for s in seasons)))
+    if pbp is None or pbp.empty:
+        return pd.DataFrame()
+    need = {"play_type", "epa", "posteam", "defteam"}
+    if not need.issubset(set(pbp.columns)):
+        return pd.DataFrame()
+    out = pbp[
+        (pbp["play_type"].isin(["pass", "run"]))
+        & pbp["epa"].notna()
+        & pbp["posteam"].notna()
+        & pbp["defteam"].notna()
+    ].copy()
+    return out
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def get_team_epa(seasons: Optional[List[int]] = None) -> pd.DataFrame:
     try:
         if seasons is None:
-            current = int(nfl.get_current_season())
-            seasons = [current - 1, current]
-        pbp = nfl.load_pbp(seasons=seasons)
-        if hasattr(pbp, "to_pandas"):
-            pbp = pbp.to_pandas()
-        if pbp is None or pbp.empty:
-            return pd.DataFrame()
-        pbp = pbp[
-            (pbp["play_type"].isin(["pass", "run"])) &
-            (pbp["epa"].notna()) &
-            (pbp["posteam"].notna()) &
-            (pbp["defteam"].notna())
-        ].copy()
+            seasons = _default_pbp_seasons()
+        pbp = _pbp_pass_run(seasons)
         if pbp.empty:
             return pd.DataFrame()
         off = pbp.groupby("posteam")["epa"].mean().reset_index().rename(
@@ -275,23 +322,24 @@ def get_team_epa(seasons: Optional[List[int]] = None) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def get_team_pace(seasons: Optional[List[int]] = None) -> pd.DataFrame:
-    """Plays per game (offense + defense snaps approx via play counts)."""
+    """Plays per game (offense snaps via play counts)."""
     try:
         if seasons is None:
-            current = int(nfl.get_current_season())
-            seasons = [current - 1, current]
-        pbp = nfl.load_pbp(seasons=seasons)
-        if hasattr(pbp, "to_pandas"):
-            pbp = pbp.to_pandas()
+            seasons = _default_pbp_seasons()
+        # Pace uses pass/run with posteam; can include rows without defteam/epa
+        pbp = _load_pbp_cached(tuple(sorted(int(s) for s in seasons)))
         if pbp is None or pbp.empty:
             return pd.DataFrame()
         plays = pbp[
-            (pbp["play_type"].isin(["pass", "run"])) &
-            (pbp["posteam"].notna())
+            (pbp["play_type"].isin(["pass", "run"]))
+            & pbp["posteam"].notna()
         ].copy()
         if plays.empty:
+            return pd.DataFrame()
+        if "game_id" not in plays.columns:
             return pd.DataFrame()
         g = plays.groupby(["game_id", "posteam"]).size().reset_index(name="off_plays")
         pace = g.groupby("posteam")["off_plays"].mean().reset_index()
@@ -301,33 +349,19 @@ def get_team_pace(seasons: Optional[List[int]] = None) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def get_team_success_metrics(seasons: Optional[List[int]] = None) -> pd.DataFrame:
     """
-    Success rate and explosive-play rate by team (offense & defense).
-    Success ≈ EPA > 0 on a play; explosive ≈ EPA >= 1.0 (chunk plays).
+    Success rate, explosive-play rate, and red-zone TD rate by team.
+    Derived from the same cached PBP as EPA/pace (no extra load_pbp call).
     """
     try:
         if seasons is None:
-            try:
-                current = int(nfl.get_current_season())
-            except Exception:
-                current = datetime.now().year if datetime.now().month >= 3 else datetime.now().year - 1
-            seasons = [current - 1, current]
-        pbp = nfl.load_pbp(seasons=seasons)
-        if hasattr(pbp, "to_pandas"):
-            pbp = pbp.to_pandas()
-        if pbp is None or pbp.empty:
-            return pd.DataFrame()
-        pbp = pbp[
-            (pbp["play_type"].isin(["pass", "run"]))
-            & pbp["epa"].notna()
-            & pbp["posteam"].notna()
-            & pbp["defteam"].notna()
-        ].copy()
+            seasons = _default_pbp_seasons()
+        pbp = _pbp_pass_run(seasons)
         if pbp.empty:
             return pd.DataFrame()
+        pbp = pbp.copy()
         pbp["success"] = (pbp["epa"] > 0).astype(float)
         pbp["explosive"] = (pbp["epa"] >= 1.0).astype(float)
         off = pbp.groupby("posteam").agg(
@@ -336,20 +370,18 @@ def get_team_success_metrics(seasons: Optional[List[int]] = None) -> pd.DataFram
             off_n=("epa", "count"),
         ).reset_index().rename(columns={"posteam": "team"})
         deff = pbp.groupby("defteam").agg(
-            def_success=("success", "mean"),  # rate allowed
+            def_success=("success", "mean"),
             def_explosive=("explosive", "mean"),
             def_n=("epa", "count"),
         ).reset_index().rename(columns={"defteam": "team"})
         out = off.merge(deff, on="team", how="outer")
 
-        # Red-zone TD rate (yardline_100 <= 20)
         try:
             if "yardline_100" in pbp.columns:
                 rz = pbp[pbp["yardline_100"].notna() & (pbp["yardline_100"] <= 20)].copy()
                 if not rz.empty:
-                    td_col = "touchdown" if "touchdown" in rz.columns else None
-                    if td_col:
-                        rz["rz_td"] = (rz[td_col].fillna(0).astype(float) > 0).astype(float)
+                    if "touchdown" in rz.columns:
+                        rz["rz_td"] = (rz["touchdown"].fillna(0).astype(float) > 0).astype(float)
                     else:
                         rz["rz_td"] = 0.0
                     off_rz = rz.groupby("posteam")["rz_td"].mean().rename("off_rz_td")
@@ -545,22 +577,43 @@ def is_primetime_kickoff(kickoff: str, gametime: Optional[str] = None) -> bool:
         return False
 
 
-BOARD_LOCK_PATH = Path("/home/workdir/artifacts/board_locks.csv")
+# Persist board locks next to app.py (works on Streamlit Cloud better than /home/workdir/...)
+BOARD_LOCK_PATH = Path(__file__).resolve().parent / "board_locks.json"
+# Fields that freeze at kickoff and must not keep changing in-game
+_BOARD_LOCK_FIELDS = (
+    "Recommendation", "Confidence", "Score", "Signals",
+    "Spread", "Total", "Home Imp", "Away Imp",
+    "EPA Edge", "Form Δ", "Model %", "Market %", "Edge %",
+    "ML Home %", "MC Home %", "MC Over %",
+    "_model_prob", "_market_prob", "_edge_pct", "_spread", "_total",
+    "_features",
+)
 
 
 def _parse_kickoff_ts(kickoff: str, gameday: str = "", gametime: str = "") -> Optional[pd.Timestamp]:
-    """Best-effort kickoff timestamp in local-naive ET-ish for started checks."""
+    """Best-effort kickoff as UTC-aware timestamp for started checks."""
     try:
         if kickoff:
-            # e.g. 2026-09-14 13:00 ET
             cleaned = str(kickoff).replace(" ET", "").replace("ET", "").strip()
             ts = pd.to_datetime(cleaned, errors="coerce")
             if pd.notna(ts):
-                return ts
+                # Treat display strings without TZ as US/Eastern
+                if getattr(ts, "tzinfo", None) is None:
+                    try:
+                        ts = ts.tz_localize("America/New_York", ambiguous="NaT", nonexistent="NaT")
+                    except Exception:
+                        ts = ts.tz_localize("UTC")
+                return ts.tz_convert("UTC") if getattr(ts, "tzinfo", None) else ts
         if gameday:
             gt = str(gametime or "13:00")
             ts = pd.to_datetime(f"{str(gameday)[:10]} {gt}", errors="coerce")
             if pd.notna(ts):
+                try:
+                    ts = ts.tz_localize("America/New_York", ambiguous="NaT", nonexistent="NaT")
+                except Exception:
+                    pass
+                if getattr(ts, "tzinfo", None) is not None:
+                    return ts.tz_convert("UTC")
                 return ts
     except Exception:
         pass
@@ -570,29 +623,69 @@ def _parse_kickoff_ts(kickoff: str, gameday: str = "", gametime: str = "") -> Op
 def game_has_started(kickoff: str = "", gameday: str = "", gametime: str = "", commence_raw: str = "") -> bool:
     """True when kickoff is in the past (game underway or final)."""
     try:
-        now = pd.Timestamp.now()
-        ts = _parse_kickoff_ts(kickoff, gameday, gametime)
-        if ts is None and commence_raw:
+        now = pd.Timestamp.now(tz="UTC")
+        ts = None
+        if commence_raw:
             ts = pd.to_datetime(commence_raw, utc=True, errors="coerce")
-            if pd.notna(ts):
-                try:
-                    ts = ts.tz_convert(None) - pd.Timedelta(hours=4)
-                except Exception:
-                    ts = ts.tz_localize(None) if getattr(ts, "tzinfo", None) else ts
+        if ts is None or pd.isna(ts):
+            ts = _parse_kickoff_ts(kickoff, gameday, gametime)
         if ts is None or pd.isna(ts):
             return False
+        if getattr(ts, "tzinfo", None) is None:
+            # Assume Eastern if naive
+            try:
+                ts = ts.tz_localize("America/New_York").tz_convert("UTC")
+            except Exception:
+                ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
         return now >= ts
     except Exception:
         return False
 
 
+def _serialize_lock_row(row: Dict) -> Dict:
+    """JSON-safe subset of a board row for lock storage."""
+    out = {"key": row.get("key"), "_locked": bool(row.get("_locked")),
+           "Week": row.get("Week"), "Game": row.get("Game"), "Kickoff": row.get("Kickoff"),
+           "_home": row.get("_home"), "_away": row.get("_away"), "_gameday": row.get("_gameday")}
+    for f in _BOARD_LOCK_FIELDS:
+        if f not in row:
+            continue
+        val = row.get(f)
+        if f == "_features" and isinstance(val, dict):
+            try:
+                out[f] = {str(k): float(v) if isinstance(v, (int, float)) else v for k, v in val.items()}
+            except Exception:
+                out[f] = {}
+        elif isinstance(val, (str, int, float, bool)) or val is None:
+            out[f] = val
+        else:
+            try:
+                out[f] = float(val)
+            except Exception:
+                out[f] = str(val)
+    return out
+
+
 def _load_board_locks() -> Dict[str, Dict]:
     if "board_locks" in st.session_state and isinstance(st.session_state.get("board_locks"), dict):
         return st.session_state["board_locks"]
-    locks = {}
+    locks: Dict[str, Dict] = {}
     try:
         if BOARD_LOCK_PATH.exists():
-            df = pd.read_csv(BOARD_LOCK_PATH)
+            import json as _json
+            raw = _json.loads(BOARD_LOCK_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                locks = raw
+            elif isinstance(raw, list):
+                for item in raw:
+                    if isinstance(item, dict) and item.get("key"):
+                        locks[str(item["key"])] = item
+        # legacy CSV fallback
+        csv_legacy = Path(__file__).resolve().parent / "board_locks.csv"
+        if not locks and csv_legacy.exists():
+            df = pd.read_csv(csv_legacy)
             for _, r in df.iterrows():
                 key = str(r.get("key") or "")
                 if key:
@@ -606,7 +699,9 @@ def _load_board_locks() -> Dict[str, Dict]:
 def _save_board_locks(locks: Dict[str, Dict]) -> None:
     st.session_state["board_locks"] = locks
     try:
-        pd.DataFrame(list(locks.values())).to_csv(BOARD_LOCK_PATH, index=False)
+        import json as _json
+        clean = {k: _serialize_lock_row(v) if isinstance(v, dict) else v for k, v in locks.items()}
+        BOARD_LOCK_PATH.write_text(_json.dumps(clean, default=str), encoding="utf-8")
     except Exception:
         pass
 
@@ -654,7 +749,6 @@ def _enrich_row_from_line_opens(row: Dict) -> Dict:
         key = f"{away}_{home}_{gd}"
         opens = _load_line_opens()
         entry = opens.get(key) or {}
-        # try alternate key patterns
         if not entry:
             for k, v in opens.items():
                 if away.upper() in k.upper() and home.upper() in k.upper() and (not gd or gd in k):
@@ -684,11 +778,20 @@ def _enrich_row_from_line_opens(row: Dict) -> Dict:
         return row
 
 
+def _apply_locked_lean_fields(live_row: Dict, locked: Dict) -> Dict:
+    """Keep live display row but force Recommendation / Confidence / Score (and related) from lock."""
+    out = dict(live_row)
+    for f in _BOARD_LOCK_FIELDS:
+        if f in locked and locked.get(f) is not None:
+            out[f] = locked[f]
+    out["_locked"] = True
+    return out
+
+
 def freeze_or_update_board_row(row: Dict, started: bool) -> Dict:
     """
-    Before kickoff: keep refreshing the live row and store as lock snapshot
-    (only when Spread is present).
-    After kickoff: return the frozen pre-kickoff snapshot (never overwrite once locked).
+    Before kickoff: refresh stored snapshot (Recommendation / Score / Confidence).
+    After kickoff: force those fields from the frozen snapshot — never update them again.
     """
     gd = str(row.get("_gameday") or row.get("Kickoff") or "")[:10]
     key = board_lock_key(row.get("Week"), row.get("_away"), row.get("_home"), gd)
@@ -697,42 +800,37 @@ def freeze_or_update_board_row(row: Dict, started: bool) -> Dict:
     row = _enrich_row_from_line_opens(row)
 
     if started:
+        # Prefer already-locked snapshot; else lock the last pre-game snapshot; else lock current
         if existing and existing.get("_locked"):
-            frozen = _enrich_row_from_line_opens(dict(existing))
-            frozen.setdefault("Game", row.get("Game"))
-            # Preserve recommendation/confidence from lock
-            return frozen
+            return _apply_locked_lean_fields(row, existing)
         if existing and not existing.get("_locked"):
-            snap = _enrich_row_from_line_opens(dict(existing))
-            snap["key"] = key
+            snap = _serialize_lock_row({**existing, "key": key, "_locked": True})
             snap["_locked"] = True
             locks[key] = snap
             _save_board_locks(locks)
-            return snap
-        # No prior snapshot — lock current if it has a spread; else enrich first
-        snap = _enrich_row_from_line_opens(dict(row))
-        snap["key"] = key
+            return _apply_locked_lean_fields(row, snap)
+        snap = _serialize_lock_row({**row, "key": key, "_locked": True})
         snap["_locked"] = True
         locks[key] = snap
         _save_board_locks(locks)
-        return snap
+        return _apply_locked_lean_fields(row, snap)
 
-    # Pre-game: refresh unlocked snapshot only when we have a real spread
+    # Pre-game: if somehow locked already, keep lean fields frozen
     if existing and existing.get("_locked"):
-        return _enrich_row_from_line_opens(dict(existing))
-    snap = dict(row)
-    snap["key"] = key
+        return _apply_locked_lean_fields(row, existing)
+
+    # Update pre-kickoff snapshot whenever we have a real lean (spread optional but preferred)
+    snap = _serialize_lock_row({**row, "key": key, "_locked": False})
     snap["_locked"] = False
-    if _row_has_spread(snap) or not existing:
+    if _row_has_spread(row) or row.get("Recommendation") not in (None, "", "—"):
         locks[key] = snap
         _save_board_locks(locks)
-    elif existing and _row_has_spread(existing) and not _row_has_spread(snap):
-        # keep better existing pre-game snapshot
-        return dict(existing)
+    elif existing and _row_has_spread(existing):
+        return dict(row)  # keep prior better snapshot, show live row
     else:
         locks[key] = snap
         _save_board_locks(locks)
-    return snap
+    return row
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -3890,7 +3988,7 @@ with tab2:
                     "_gameday": game_date,
                     "_features": _byoa_feats,
                 })
-                # Lock Full-board values at kickoff — no live updates after game starts
+                # Lock Recommendation / Score / Confidence at kickoff — no in-game changes
                 started = game_has_started(
                     kickoff=str(commence or ""),
                     gameday=str(game_date or ""),
@@ -3898,11 +3996,8 @@ with tab2:
                     commence_raw=str(commence_raw or ""),
                 )
                 row_final = freeze_or_update_board_row(opportunities[-1], started)
-                if started:
-                    opportunities[-1] = row_final
-                    opportunities[-1]["_locked"] = True
-                else:
-                    opportunities[-1]["_locked"] = False
+                opportunities[-1] = row_final
+                opportunities[-1]["_locked"] = bool(started or row_final.get("_locked"))
             except Exception as e:
                 skipped.append(f"Error: {e}")
                 continue
