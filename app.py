@@ -4479,7 +4479,7 @@ with tab2:
                 options=[c for c in week_choices if c != "All weeks"] or week_choices,
                 index=max(0, ([c for c in week_choices if c != "All weeks"] or week_choices).index(default_lab)
                          if default_lab in ([c for c in week_choices if c != "All weeks"] or week_choices) else 0),
-                key="tab2_week_filter",
+                key="bb_highlight_week",
             )
             try:
                 wk = int(selected_label.replace("Week ", ""))
@@ -4804,7 +4804,7 @@ with tab4:
             options=["All weeks"] + [f"Week {int(w)}" for w in all_weeks],
             index=(["All weeks"] + [f"Week {int(w)}" for w in all_weeks]).index(f"Week {int(cur_wk)}")
             if f"Week {int(cur_wk)}" in [f"Week {int(w)}" for w in all_weeks] else 0,
-            key="tab2_week_filter",
+            key="games_odds_week_filter",
         )
         display = games_df
         if week_filter != "All weeks":
