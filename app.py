@@ -5581,12 +5581,35 @@ with tab10:
                 "then return here after games complete to see graded results."
             )
         else:
+            # One-time reset: pre-lock board grades were unreliable — wipe history once
+            _sig_reset_flag = Path(__file__).resolve().parent / ".signal_history_reset_v2"
+            try:
+                if not _sig_reset_flag.exists():
+                    empty_cols = list(hist.columns) if hist is not None else [
+                        "id", "week", "game", "kickoff", "recommendation", "confidence",
+                        "score", "spread", "total", "result", "logged_at", "graded_at",
+                    ]
+                    _save_signal_history(pd.DataFrame(columns=empty_cols))
+                    _sig_reset_flag.write_text(
+                        "reset after board lock fix — records start from post-lock leans\n",
+                        encoding="utf-8",
+                    )
+                    hist = _load_signal_history()
+                    st.info(
+                        "Signal history was reset so older pre-lock grades don’t skew the record. "
+                        "New grades will appear as games complete (including tonight’s slate)."
+                    )
+            except Exception:
+                pass
+
             # Only truly graded rows (Correct/Incorrect). Pending/Push/N/A excluded.
-            graded = hist[hist["result"].isin(["Correct", "Incorrect"])].copy()
+            graded = (
+                hist[hist["result"].isin(["Correct", "Incorrect"])].copy()
+                if hist is not None and not hist.empty
+                else pd.DataFrame()
+            )
             conf_order = ["A", "B", "C", "D", "F"]
-            rec_order = ["Home ATS", "Away ATS", "Over", "Under"]
             summary_rows = []
-            detail_rows = []
             if not graded.empty:
                 graded["confidence"] = graded["confidence"].astype(str).str.upper().str[:1]
                 for conf in conf_order:
@@ -5602,20 +5625,6 @@ with tab10:
                         "Win %": f"{wins / total:.0%}" if total else "—",
                         "N": total,
                     })
-                    for rec in rec_order:
-                        rsub = sub[sub["recommendation"].astype(str) == rec]
-                        if rsub.empty:
-                            continue
-                        rw = int((rsub["result"] == "Correct").sum())
-                        rl = int((rsub["result"] == "Incorrect").sum())
-                        rt = rw + rl
-                        detail_rows.append({
-                            "Confidence": conf,
-                            "Recommendation": rec.replace("Lean ", ""),
-                            "Record": f"{rw}-{rl}",
-                            "Win %": f"{rw / rt:.0%}" if rt else "—",
-                            "N": rt,
-                        })
                 ow = int((graded["result"] == "Correct").sum())
                 ol = int((graded["result"] == "Incorrect").sum())
                 summary_rows.append({
@@ -5624,131 +5633,139 @@ with tab10:
                     "Win %": f"{ow / (ow + ol):.0%}" if (ow + ol) else "—",
                     "N": ow + ol,
                 })
-            pending_n = int((hist["result"].astype(str) == "Pending").sum()) if not hist.empty else 0
+            pending_n = (
+                int((hist["result"].astype(str) == "Pending").sum())
+                if hist is not None and not hist.empty
+                else 0
+            )
             st.caption(f"Graded completed games only · **{pending_n}** still Pending")
             if summary_rows:
                 st.markdown("**Record by confidence**")
                 st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-            if detail_rows:
-                st.markdown("**By confidence × recommendation type**")
-                st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
-            if not summary_rows:
-                st.info("No completed/graded signals yet. Only finished games appear in the records above.")
+            else:
+                st.info(
+                    "No completed/graded signals yet. "
+                    "Record by confidence will fill in as games finish and Big Board leans are graded."
+                )
 
             # Full table sorted by confidence then date
-            show = hist.copy()
-            conf_rank = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
-            show["_cr"] = show["confidence"].astype(str).str.upper().str[:1].map(lambda x: conf_rank.get(x, 9))
-            show["_conf_letter"] = show["confidence"].astype(str).str.upper().str[:1]
-            show["_rec_str"] = show["recommendation"].astype(str)
-            show["_week_num"] = pd.to_numeric(show["week"], errors="coerce")
-            show = show.sort_values(["_cr", "week", "logged_at"], ascending=[True, True, False])
+            if hist is None or hist.empty:
+                st.caption("All signals table will appear once Big Board logs recommendations again.")
+            else:
+                show = hist.copy()
+                conf_rank = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
+                show["_cr"] = show["confidence"].astype(str).str.upper().str[:1].map(lambda x: conf_rank.get(x, 9))
+                show["_conf_letter"] = show["confidence"].astype(str).str.upper().str[:1]
+                show["_rec_str"] = show["recommendation"].astype(str)
+                show["_week_num"] = pd.to_numeric(show["week"], errors="coerce")
+                show = show.sort_values(["_cr", "week", "logged_at"], ascending=[True, True, False])
 
-            st.markdown("**All signals**")
-            st.caption("Filter by week, recommendation, and/or confidence (e.g. Week 1 + Under + A).")
-            fw1, fw2, fw3, fw4 = st.columns([1.1, 1.4, 1.0, 1.0])
-            with fw1:
-                week_vals = sorted(
-                    {int(w) for w in show["_week_num"].dropna().unique().tolist()}
-                )
-                week_opts = ["All weeks"] + [f"Week {w}" for w in week_vals]
-                week_pick = st.multiselect(
-                    "Week",
-                    options=week_opts,
-                    default=[],
-                    key="sig_hist_week_filter",
-                    help="Leave empty for all weeks. Select one or more weeks.",
-                )
-            with fw2:
-                rec_vals = sorted({r for r in show["_rec_str"].dropna().unique().tolist() if r and r != "nan"})
-                # Prefer standard order first
-                preferred = ["Home ATS", "Away ATS", "Over", "Under", "No strong lean"]
-                rec_opts = [r for r in preferred if r in rec_vals] + [r for r in rec_vals if r not in preferred]
-                rec_pick = st.multiselect(
-                    "Recommendation",
-                    options=rec_opts,
-                    default=[],
-                    key="sig_hist_rec_filter",
-                    help="e.g. Under only",
-                )
-            with fw3:
-                conf_opts = [c for c in conf_order if c in set(show["_conf_letter"].dropna().tolist())]
-                # Include any odd values
-                extra_c = sorted({c for c in show["_conf_letter"].dropna().unique().tolist() if c not in conf_opts and c})
-                conf_pick = st.multiselect(
-                    "Confidence",
-                    options=conf_opts + extra_c,
-                    default=[],
-                    key="sig_hist_conf_filter",
-                    help="e.g. A only",
-                )
-            with fw4:
-                result_vals = sorted({str(r) for r in show["result"].dropna().unique().tolist() if str(r) and str(r) != "nan"})
-                result_pick = st.multiselect(
-                    "Result",
-                    options=result_vals,
-                    default=[],
-                    key="sig_hist_result_filter",
-                    help="Optional: Correct, Incorrect, Pending…",
-                )
+                st.markdown("**All signals**")
+                st.caption("Filter by week, recommendation, and/or confidence (e.g. Week 1 + Under + A).")
+                fw1, fw2, fw3, fw4 = st.columns([1.1, 1.4, 1.0, 1.0])
+                with fw1:
+                    week_vals = sorted(
+                        {int(w) for w in show["_week_num"].dropna().unique().tolist()}
+                    )
+                    week_opts = ["All weeks"] + [f"Week {w}" for w in week_vals]
+                    week_pick = st.multiselect(
+                        "Week",
+                        options=week_opts,
+                        default=[],
+                        key="sig_hist_week_filter",
+                        help="Leave empty for all weeks. Select one or more weeks.",
+                    )
+                with fw2:
+                    rec_vals = sorted({r for r in show["_rec_str"].dropna().unique().tolist() if r and r != "nan"})
+                    preferred = ["Home ATS", "Away ATS", "Over", "Under", "No strong lean"]
+                    rec_opts = [r for r in preferred if r in rec_vals] + [r for r in rec_vals if r not in preferred]
+                    rec_pick = st.multiselect(
+                        "Recommendation",
+                        options=rec_opts,
+                        default=[],
+                        key="sig_hist_rec_filter",
+                        help="e.g. Under only",
+                    )
+                with fw3:
+                    conf_opts = [c for c in conf_order if c in set(show["_conf_letter"].dropna().tolist())]
+                    extra_c = sorted({c for c in show["_conf_letter"].dropna().unique().tolist() if c not in conf_opts and c})
+                    conf_pick = st.multiselect(
+                        "Confidence",
+                        options=conf_opts + extra_c,
+                        default=[],
+                        key="sig_hist_conf_filter",
+                        help="e.g. A only",
+                    )
+                with fw4:
+                    result_vals = sorted({str(r) for r in show["result"].dropna().unique().tolist() if str(r) and str(r) != "nan"})
+                    result_pick = st.multiselect(
+                        "Result",
+                        options=result_vals,
+                        default=[],
+                        key="sig_hist_result_filter",
+                        help="Optional: Correct, Incorrect, Pending…",
+                    )
 
-            filtered = show
-            if week_pick:
-                want_weeks = set()
-                for w in week_pick:
-                    if w == "All weeks":
-                        want_weeks = set(week_vals)
-                        break
-                    try:
-                        want_weeks.add(int(str(w).replace("Week ", "").strip()))
-                    except Exception:
-                        pass
-                if want_weeks:
-                    filtered = filtered[filtered["_week_num"].isin(want_weeks)]
-            if rec_pick:
-                filtered = filtered[filtered["_rec_str"].isin(rec_pick)]
-            if conf_pick:
-                filtered = filtered[filtered["_conf_letter"].isin([str(c).upper()[:1] for c in conf_pick])]
-            if result_pick:
-                filtered = filtered[filtered["result"].astype(str).isin(result_pick)]
+                filtered = show
+                if week_pick:
+                    want_weeks = set()
+                    for w in week_pick:
+                        if w == "All weeks":
+                            want_weeks = set(week_vals)
+                            break
+                        try:
+                            want_weeks.add(int(str(w).replace("Week ", "").strip()))
+                        except Exception:
+                            pass
+                    if want_weeks:
+                        filtered = filtered[filtered["_week_num"].isin(want_weeks)]
+                if rec_pick:
+                    filtered = filtered[filtered["_rec_str"].isin(rec_pick)]
+                if conf_pick:
+                    filtered = filtered[filtered["_conf_letter"].isin([str(c).upper()[:1] for c in conf_pick])]
+                if result_pick:
+                    filtered = filtered[filtered["result"].astype(str).isin(result_pick)]
 
-            display_cols = [
-                c for c in [
-                    "confidence", "recommendation", "result", "week", "game", "kickoff",
-                    "score", "spread", "total", "logged_at", "graded_at",
-                ] if c in filtered.columns
-            ]
-            st.dataframe(
-                filtered[display_cols].rename(columns={
-                    "confidence": "Confidence",
-                    "recommendation": "Recommendation",
-                    "result": "Result",
-                    "week": "Week",
-                    "game": "Game",
-                    "kickoff": "Kickoff",
-                    "score": "Score",
-                    "spread": "Spread",
-                    "total": "Total",
-                    "logged_at": "Logged",
-                    "graded_at": "Graded",
-                }),
-                use_container_width=True,
-                hide_index=True,
-            )
-            st.caption(
-                f"Showing **{len(filtered)}** of **{len(show)}** signals · "
-                "Pending rows grade automatically when final scores are available."
-            )
-            st.download_button(
-                "Download filtered CSV" if len(filtered) != len(show) else "Download signal history CSV",
-                data=filtered.drop(columns=[c for c in filtered.columns if str(c).startswith("_")], errors="ignore").to_csv(index=False),
-                file_name="signal_history_filtered.csv" if len(filtered) != len(show) else "signal_history.csv",
-                mime="text/csv",
-                key="signal_hist_dl",
-            )
-            if st.button("Clear signal history", key="signal_hist_clear"):
-                _save_signal_history(pd.DataFrame(columns=hist.columns))
-                st.rerun()
+                display_cols = [
+                    c for c in [
+                        "confidence", "recommendation", "result", "week", "game", "kickoff",
+                        "score", "spread", "total", "logged_at", "graded_at",
+                    ] if c in filtered.columns
+                ]
+                st.dataframe(
+                    filtered[display_cols].rename(columns={
+                        "confidence": "Confidence",
+                        "recommendation": "Recommendation",
+                        "result": "Result",
+                        "week": "Week",
+                        "game": "Game",
+                        "kickoff": "Kickoff",
+                        "score": "Score",
+                        "spread": "Spread",
+                        "total": "Total",
+                        "logged_at": "Logged",
+                        "graded_at": "Graded",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(
+                    f"Showing **{len(filtered)}** of **{len(show)}** signals · "
+                    "Pending rows grade automatically when final scores are available."
+                )
+                st.download_button(
+                    "Download filtered CSV" if len(filtered) != len(show) else "Download signal history CSV",
+                    data=filtered.drop(
+                        columns=[c for c in filtered.columns if str(c).startswith("_")],
+                        errors="ignore",
+                    ).to_csv(index=False),
+                    file_name="signal_history_filtered.csv" if len(filtered) != len(show) else "signal_history.csv",
+                    mime="text/csv",
+                    key="signal_hist_dl",
+                )
+                if st.button("Clear signal history", key="signal_hist_clear"):
+                    _save_signal_history(pd.DataFrame(columns=hist.columns))
+                    st.rerun()
 
     elif adv == "Bankroll & CLV":
         if require_pro("require_pro_for_bankroll"):
