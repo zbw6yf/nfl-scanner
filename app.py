@@ -4850,30 +4850,43 @@ with tab4:
             unsafe_allow_html=True,
         )
 
-        # ---- Game-day ticket cards (top of filtered slate) ----
-        st.markdown("##### Game tickets")
-        ticket_n = min(6, len(display))
-        for i in range(ticket_n):
-            r = display.iloc[i]
-            away, home = r.get("Away", ""), r.get("Home", "")
-            ko = r.get("Kickoff", "—")
-            os_, cs = r.get("Open Spread", "—"), r.get("Curr Spread", "—")
-            ot, ct = r.get("Open Total", "—"), r.get("Curr Total", "—")
-            sm, tm = r.get("Spread Move", "—"), r.get("Total Move", "—")
-            move_color = "#94a3b8"
-            try:
-                smv = float(str(sm).replace("+", ""))
-                if abs(smv) >= 1.5:
+        # ---- Top Steam Plays (3 games with largest |spread move|) ----
+        st.markdown("##### Top Steam Plays")
+        st.caption("The 3 games with the most spread steam (largest |Open → Curr| move) in the filtered week.")
+        steam_df = display.copy()
+        steam_df["_steam_abs"] = steam_df["Spread Move"].map(
+            lambda x: abs(v) if (v := _parse_move(x)) is not None else -1.0
+        )
+        steam_df["_tot_abs"] = steam_df["Total Move"].map(
+            lambda x: abs(v) if (v := _parse_move(x)) is not None else 0.0
+        )
+        steam_top = (
+            steam_df[steam_df["_steam_abs"] >= 0]
+            .sort_values(["_steam_abs", "_tot_abs"], ascending=False)
+            .head(3)
+        )
+        if steam_top.empty:
+            st.info("No line movement data yet for this filter — opens/currents still loading.")
+        else:
+            for rank, (_, r) in enumerate(steam_top.iterrows(), start=1):
+                away, home = r.get("Away", ""), r.get("Home", "")
+                ko = r.get("Kickoff", "—")
+                os_, cs = r.get("Open Spread", "—"), r.get("Curr Spread", "—")
+                ot, ct = r.get("Open Total", "—"), r.get("Curr Total", "—")
+                sm, tm = r.get("Spread Move", "—"), r.get("Total Move", "—")
+                move_color = "#94a3b8"
+                smv = _parse_move(sm)
+                if smv is not None and abs(smv) >= 1.5:
                     move_color = "#fbbf24"
-                elif abs(smv) >= 0.5:
+                elif smv is not None and abs(smv) >= 0.5:
                     move_color = "#38bdf8"
-            except Exception:
-                pass
-            st.markdown(
-                f"""
+                steam_pts = f"{abs(smv):.1f}" if smv is not None else "—"
+                st.markdown(
+                    f"""
 <div style="background:#111827;border:1px solid #1f2937;border-radius:12px;padding:12px 14px;margin-bottom:8px;">
   <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
     <div>
+      <div style="color:#fbbf24;font-size:0.75rem;font-weight:700;letter-spacing:0.04em;">#{rank} STEAM · {steam_pts} pts</div>
       <div style="color:#f8fafc;font-weight:700;font-size:1.05rem;">{away} <span style="color:#64748b;">@</span> {home}</div>
       <div style="color:#94a3b8;font-size:0.82rem;">Kickoff {ko} · Week {r.get("Week","")}</div>
     </div>
@@ -4885,9 +4898,9 @@ with tab4:
     </div>
   </div>
 </div>
-                """,
-                unsafe_allow_html=True,
-            )
+                    """,
+                    unsafe_allow_html=True,
+                )
 
         st.markdown("##### Full slate table")
         st.dataframe(display, use_container_width=True, hide_index=True)
