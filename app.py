@@ -183,7 +183,7 @@ st.markdown(
       <span class="nsc-badge">EPA · ML · Monte Carlo</span>
       <span class="nsc-badge">AI-powered NFL betting</span>
     </div>
-    <p class="tailme-sub">Schedule, weather, injuries, depth charts, and model signals — not betting advice.</p>
+    <p class="tailme-sub">Schedule, weather, injuries, and model signals — not betting advice.</p>
   </div>
 </div>
 """,
@@ -250,8 +250,8 @@ if st.sidebar.button("Clear all caches"):
         if (
             "weather" in kl
             or str(k).startswith("updated_")
-            or str(k).startswith(("bb_", "byoa_", "injuries_", "depth_", "history_", "potd_"))
-            or str(k) in ("odds_data", "team_history_df", "injuries_df", "depth_df")
+            or str(k).startswith(("bb_", "byoa_", "injuries_", "history_", "potd_"))
+            or str(k) in ("odds_data", "team_history_df", "injuries_df")
         ):
             try:
                 del st.session_state[k]
@@ -265,7 +265,6 @@ st.sidebar.caption(stamp_text("odds", "Odds"))
 st.sidebar.caption(stamp_text("schedule", "Schedule"))
 st.sidebar.caption(stamp_text("weather", "Weather"))
 st.sidebar.caption(stamp_text("injuries", "Injuries"))
-st.sidebar.caption(stamp_text("depth", "Depth charts"))
 st.sidebar.caption("Weather is unique per stadium + kickoff.")
 # -----------------------------
 # DATA FUNCTIONS
@@ -2293,88 +2292,15 @@ def load_nfl_injury_report() -> pd.DataFrame:
     return pd.DataFrame(columns=cols)
 
 
-def _parse_ourlads_player(cell: str) -> str:
-    """'Coleman, Keon 24/2' -> 'Keon Coleman' when possible."""
-    cell = _strip_html(cell)
-    if not cell:
-        return ""
-    # Drop draft suffix like 24/2 or U/LAC or CF16
-    cell = re.sub(r"\s+\d{2}/\d.*$", "", cell)
-    cell = re.sub(r"\s+[A-Z]{1,3}/[A-Z]{2,3}$", "", cell)
-    cell = re.sub(r"\s+CF\d+.*$", "", cell)
-    cell = re.sub(r"\s+U/[A-Za-z]+$", "", cell)
-    if "," in cell:
-        parts = [p.strip() for p in cell.split(",", 1)]
-        if len(parts) == 2:
-            return f"{parts[1]} {parts[0]}".strip()
-    return cell.strip()
 
 
-# ESPN numeric team IDs (injury scrapers) + Ourlads depth-chart abbreviations
+# ESPN numeric team IDs (injury scrapers)
 ESPN_TEAM_IDS = {
     "ARI": 22, "ATL": 1, "BAL": 33, "BUF": 2, "CAR": 29, "CHI": 3, "CIN": 4, "CLE": 5,
     "DAL": 6, "DEN": 7, "DET": 8, "GB": 9, "HOU": 34, "IND": 11, "JAX": 30, "KC": 12,
     "LAC": 24, "LA": 14, "LV": 13, "MIA": 15, "MIN": 16, "NE": 17, "NO": 18, "NYG": 19,
     "NYJ": 20, "PHI": 21, "PIT": 23, "SF": 25, "SEA": 26, "TB": 27, "TEN": 10, "WAS": 28,
 }
-OURLADS_ABBR = {**{a: a for a in ESPN_TEAM_IDS}, "LA": "LAR", "WAS": "WAS"}
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_depth_charts() -> pd.DataFrame:
-    """
-    Load depth charts from Ourlads (https://www.ourlads.com/nfldepthcharts/).
-    Returns Team, Team Abbr, Side, Position, Rank, Player
-    """
-    cols = ["Team", "Team Abbr", "Unit", "Position", "Rank", "Player"]
-    rows = []
-    for abbr in ESPN_TEAM_IDS.keys():
-        ol = OURLADS_ABBR.get(abbr, abbr)
-        url = f"https://www.ourlads.com/nfldepthcharts/depthchart/{ol}"
-        try:
-            r = _http_get(url, timeout=25)
-            if r is None or r.status_code != 200 or not r.text:
-                continue
-            tables = re.findall(r"<table[^>]*>(.*?)</table>", r.text, flags=re.S | re.I)
-            try:
-                team_name = full_name(abbr)
-            except Exception:
-                team_name = abbr
-            # Heuristic unit labels by table order: Offense, Defense, Special Teams
-            unit_names = ["Offense", "Defense", "Special Teams", "Other"]
-            for ti, table in enumerate(tables):
-                unit = unit_names[ti] if ti < len(unit_names) else "Other"
-                trs = re.findall(r"<tr[^>]*>(.*?)</tr>", table, flags=re.S | re.I)
-                if not trs:
-                    continue
-                for tr in trs[1:]:
-                    cells = [_strip_html(c) for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, flags=re.S | re.I)]
-                    if len(cells) < 3:
-                        continue
-                    pos = cells[0]
-                    if not pos or pos.lower() in ("pos", "position"):
-                        continue
-                    # Pattern: Pos, No, Player1, No, Player2, ...
-                    rank = 0
-                    for i in range(2, len(cells), 2):
-                        raw = cells[i] if i < len(cells) else ""
-                        player = _parse_ourlads_player(raw)
-                        if not player:
-                            continue
-                        rank += 1
-                        rows.append({
-                            "Team": team_name,
-                            "Team Abbr": abbr,
-                            "Unit": unit,
-                            "Position": pos,
-                            "Rank": rank,
-                            "Player": player,
-                        })
-        except Exception:
-            continue
-    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
-
-
 
 def _normalize_team_abbr(t: str) -> str:
     t = str(t or "").strip().upper()
@@ -3676,7 +3602,6 @@ _PAGES = [
     "📅 Games & Odds",
     "🌤️ Weather",
     "🏥 Injury Report",
-    "📋 Depth Charts",
     "📊 Team History",
     "📘 Methodology",
     "⚙️ Advanced",
@@ -4073,8 +3998,8 @@ if _page == "🏠 Homepage":
     <p>Stadium forecasts near kickoff for outdoor totals context.</p>
   </div>
   <div class="tm-more-card">
-    <h4>🏥 Injuries &amp; depth</h4>
-    <p>Official injury report and Ourlads depth charts when you need them.</p>
+    <h4>🏥 Injury Report</h4>
+    <p>Official injury report when you need roster context next to a lean.</p>
   </div>
   <div class="tm-more-card">
     <h4>📊 Team history</h4>
@@ -5308,62 +5233,6 @@ if _page == "🏥 Injury Report":
             )
 
 
-if _page == "📋 Depth Charts":
-    st.subheader("Depth Charts")
-    st.caption(
-        "Current team depth charts from [Ourlads](https://www.ourlads.com/nfldepthcharts/). "
-        "Pick a team to view starters first, then full depth."
-    )
-    do_load_dc = st.button("Load / refresh depth charts", key="btn_load_depth", use_container_width=True)
-    if do_load_dc or st.session_state.get("depth_ready"):
-        if do_load_dc or "depth_df" not in st.session_state:
-            with st.spinner("Loading depth charts..."):
-                st.session_state["depth_df"] = load_depth_charts()
-                st.session_state["depth_ready"] = True
-                if st.session_state["depth_df"] is not None and not st.session_state["depth_df"].empty:
-                    stamp_now("depth")
-        dc_df = st.session_state.get("depth_df")
-    else:
-        st.info("Click **Load / refresh depth charts** when you need them (32 team pages — loaded on demand).")
-        dc_df = None
-    if st.session_state.get("depth_ready") and (dc_df is None or (isinstance(dc_df, pd.DataFrame) and dc_df.empty)):
-        st.warning("Could not load depth charts right now. Try clearing caches and reloading.")
-    elif dc_df is not None and not dc_df.empty:
-        teams = sorted(dc_df["Team"].dropna().unique().tolist())
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            team_sel = st.selectbox("Team", options=teams, key="dc_team")
-        with c2:
-            units = ["All"] + sorted(dc_df["Unit"].dropna().unique().tolist())
-            unit_sel = st.selectbox("Unit", options=units, key="dc_unit")
-
-        view = dc_df[dc_df["Team"] == team_sel].copy()
-        if unit_sel != "All":
-            view = view[view["Unit"] == unit_sel]
-
-        if view.empty:
-            st.info("No depth chart rows for this selection.")
-        else:
-            # ---- Starters at top ----
-            st.markdown(f"##### Starters — {team_sel}")
-            starters = (
-                view[view["Rank"] == 1][["Unit", "Position", "Player"]]
-                .sort_values(["Unit", "Position"])
-                .reset_index(drop=True)
-            )
-            st.dataframe(starters, use_container_width=True, hide_index=True)
-            st.caption(f"{len(starters)} starters")
-
-            st.markdown("---")
-            st.markdown(f"##### Full depth chart — {team_sel}")
-            show = (
-                view[["Unit", "Position", "Rank", "Player"]]
-                .sort_values(["Unit", "Position", "Rank"])
-                .reset_index(drop=True)
-            )
-            st.dataframe(show, use_container_width=True, hide_index=True)
-            st.caption(f"{len(show)} entries · source: Ourlads")
-
 
 
 if _page == "📊 Team History":
@@ -5558,7 +5427,6 @@ Over/under probabilities are taken from simulated totals vs the market line (wit
 - EPA / pace / form: nflreadpy play-by-play (form = current season only)  
 - Weather: Open-Meteo by stadium + kickoff  
 - Injuries: NFL.com (ESPN fallback)  
-- Depth charts: Ourlads  
         """
     )
 
@@ -6040,7 +5908,7 @@ if _page == "⚙️ Advanced":
 st.markdown(
     """
 <div class="nsc-footer">
-  Research only — not betting advice. Data sources: nflverse / nflreadpy, The Odds API, Open-Meteo, NFL.com injuries, Ourlads depth charts, ESPN schedule.
+  Research only — not betting advice. Data sources: nflverse / nflreadpy, The Odds API, Open-Meteo, NFL.com injuries, ESPN schedule.
 </div>
     """,
     unsafe_allow_html=True,
