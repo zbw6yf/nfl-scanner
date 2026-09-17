@@ -3286,16 +3286,16 @@ def weather_adjustments(roof: str, weather: Dict) -> Dict[str, Any]:
     total_adj = noise_extra = under_bias = rule_pts = 0.0
     labels = []
     if wind >= 20:
-        total_adj -= 3.5; noise_extra += 2.5; under_bias += 0.04; rule_pts += 1.4
+        total_adj -= 1.5; noise_extra += 1.5; under_bias += 0.015; rule_pts += 0.8
         labels.append(f"High wind {wind:.0f} mph")
     elif wind >= 15:
-        total_adj -= 2.0; noise_extra += 1.5; under_bias += 0.025; rule_pts += 0.9
+        total_adj -= 1.0; noise_extra += 1.0; under_bias += 0.01; rule_pts += 0.5
         labels.append(f"Wind {wind:.0f} mph")
     if precip >= 60:
-        total_adj -= 2.5; noise_extra += 2.0; under_bias += 0.03; rule_pts += 1.1
+        total_adj -= 1.2; noise_extra += 1.2; under_bias += 0.012; rule_pts += 0.6
         labels.append(f"Precip {precip:.0f}%")
     elif precip >= 40:
-        total_adj -= 1.2; noise_extra += 1.0; under_bias += 0.015; rule_pts += 0.6
+        total_adj -= 0.6; noise_extra += 0.6; under_bias += 0.008; rule_pts += 0.3
         labels.append(f"Precip {precip:.0f}%")
     if temp <= 25:
         total_adj -= 2.0; noise_extra += 1.5; rule_pts += 0.7
@@ -3380,24 +3380,35 @@ def monte_carlo_game(
     total_adj=0.0, noise_extra=0.0, under_bias=0.0,
     pace_adj=0.0, form_margin_adj=0.0
 ):
-    expected_margin = (home_off - away_def - (away_off - home_def)) * 35.0 + 1.2 + form_margin_adj
-    sim_margins = np.random.normal(expected_margin, 11.5 + noise_extra, n_sims)
-    # Model total from efficiency + pace + weather adj
-    model_total = 45.0 + (home_off + away_off - home_def - away_def) * 22.0 + total_adj + pace_adj
-    # Anchor to the market line so we are not systematically under every week
-    # (pure model totals often sit below posted NFL totals)
+    """
+    Neutral ATS/totals simulator.
+    - No extra home-field points: the market spread already prices HFA.
+    - Totals are centered on the posted line; only residual model edge moves O/U.
+    """
+    try:
+        spr = float(spread) if spread is not None else 0.0
+    except Exception:
+        spr = 0.0
     try:
         line = float(total_line) if total_line is not None else 45.0
     except Exception:
         line = 45.0
-    expected_total = 0.65 * line + 0.35 * model_total
-    # Mild weather under only once here (half of prior under_bias)
-    expected_total -= float(under_bias or 0.0) * 8.0  # under_bias 0.04 → ~0.3 pts
-    sim_totals = np.random.normal(expected_total, 13.0 + noise_extra * 0.6, n_sims)
-    home_cover = float(np.mean(sim_margins > spread))
-    over_p = float(np.mean(sim_totals > line)) if line else 0.5
-    # Do NOT subtract under_bias again from probability (was double-counting weather)
+
+    # Skill margin only (NO +HFA). Spread already embeds home field.
+    skill_margin = (home_off - away_def - (away_off - home_def)) * 35.0 + float(form_margin_adj or 0.0)
+    sim_margins = np.random.normal(skill_margin, 13.5 + float(noise_extra or 0.0), n_sims)
+    # Home spread convention: negative = home favored. Cover when margin > spread.
+    home_cover = float(np.mean(sim_margins > spr))
+
+    # Totals: start at market line; residual from efficiency / pace / weather only
+    residual = (home_off + away_off - home_def - away_def) * 12.0 + float(total_adj or 0.0) + float(pace_adj or 0.0)
+    # Cap residual so early-season noise cannot push every game under
+    residual = max(-4.0, min(4.0, residual))
+    expected_total = line + residual
+    sim_totals = np.random.normal(expected_total, 13.5 + float(noise_extra or 0.0) * 0.5, n_sims)
+    over_p = float(np.mean(sim_totals > line))
     over_p = max(0.05, min(0.95, over_p))
+
     home_ev = home_cover * 100 / 110 - (1 - home_cover)
     away_ev = (1 - home_cover) * 100 / 110 - home_cover
     return {
@@ -4834,20 +4845,21 @@ with tab2:
                     pw = {"power_edge": 0.0, "home_total": 0.0, "away_total": 0.0, "home_qb": 0.0, "away_qb": 0.0}
                 power_edge = float(pw.get("power_edge") or 0.0)
                 # Map power edge → probability tilt (≈ ±8 pts for a large mismatch)
-                power_tilt = max(-0.08, min(0.08, power_edge / 120.0))
+                power_tilt = max(-0.04, min(0.04, power_edge / 180.0))
 
                 # Form tilt from recent margin differential
-                form_tilt = max(-0.04, min(0.04, float(form_margin_diff) / 50.0))
+                form_tilt = max(-0.03, min(0.03, float(form_margin_diff) / 70.0))
 
                 # EPA tilt
-                epa_tilt = max(-0.05, min(0.05, float(epa_edge) * 0.35))
+                epa_tilt = max(-0.03, min(0.03, float(epa_edge) * 0.25))
 
                 # ---- Probability-first lean (cover + total) ----
                 # Blend: position power + form + EPA + historical model + Monte Carlo
+                # Blend model + MC + small context tilts (tilts centered at 0 — no home bump)
                 p_home_cover = float(
-                    0.22 * ml_home
-                    + 0.28 * mc["home_cover_prob"]
-                    + 0.50 * (0.5 + power_tilt + form_tilt + epa_tilt)
+                    0.40 * float(ml_home)
+                    + 0.45 * float(mc["home_cover_prob"])
+                    + 0.15 * (0.5 + power_tilt + form_tilt + epa_tilt)
                 )
                 p_home_cover = max(0.05, min(0.95, p_home_cover))
                 p_away_cover = 1.0 - p_home_cover
@@ -4891,8 +4903,9 @@ with tab2:
                         "away_profile": 0.0,
                     }
                 try:
-                    p_over = float(mc["over_prob"]) + float(tot_env.get("tilt") or 0.0)
-                    p_over = max(0.05, min(0.95, p_over))
+                    # Half-weight environment tilt so MC (market-centered) stays primary
+                    p_over = float(mc["over_prob"]) + 0.5 * float(tot_env.get("tilt") or 0.0)
+                    p_over = max(0.08, min(0.92, p_over))
                     p_under = 1.0 - p_over
                     totals_agree = float(tot_env.get("agreement") or 0.45)
                     for _s in (tot_env.get("signals") or []):
