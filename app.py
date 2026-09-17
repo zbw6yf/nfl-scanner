@@ -41,6 +41,7 @@ import base64
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
+import time as _time
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -289,6 +290,14 @@ def _load_pbp_cached(seasons: Tuple[int, ...]) -> pd.DataFrame:
             pbp = pbp.to_pandas()
         if pbp is None or getattr(pbp, "empty", True):
             return pd.DataFrame()
+        # Keep only columns needed for EPA / pace / success / RZ to cut memory
+        keep = [c for c in [
+            "play_type", "epa", "posteam", "defteam", "game_id", "season",
+            "down", "ydstogo", "yardline_100", "touchdown", "pass", "rush",
+            "success", "yards_gained", "air_yards", "incomplete_pass",
+        ] if c in getattr(pbp, "columns", [])]
+        if keep:
+            pbp = pbp[keep].copy()
         return pbp
     except Exception:
         return pd.DataFrame()
@@ -455,7 +464,7 @@ def shrink_to_mean(value: float, n: float, league_mean: float, prior_n: float = 
         return float(league_mean)
 
 
-LINE_OPEN_PATH = Path("/home/workdir/artifacts/line_opens.csv")
+LINE_OPEN_PATH = Path(__file__).resolve().parent / "line_opens.csv"
 
 
 def _load_line_opens() -> Dict[str, Dict]:
@@ -3659,7 +3668,8 @@ def _pick_top_play(opportunities: list) -> Optional[Dict]:
 
 
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+# Page router (NOT st.tabs) — only the active page runs, so initial load stays light.
+_PAGES = [
     "🏠 Homepage",
     "🏈 The Big Board",
     "🧪 BYOA",
@@ -3670,10 +3680,16 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "📊 Team History",
     "📘 Methodology",
     "⚙️ Advanced",
-])
+]
+_page = st.radio(
+    "Navigate",
+    options=_PAGES,
+    horizontal=True,
+    label_visibility="collapsed",
+    key="nav_page",
+)
 
 # ---- Performance helpers: session-cached board + lazy heavy tabs ----
-import time as _time
 BB_CACHE_TTL_SEC = 15 * 60  # rebuild Big Board at most every 15 minutes unless Refresh
 
 def _bb_cache_age_sec() -> float:
@@ -3696,7 +3712,7 @@ opportunities = list(st.session_state.get("bb_opportunities") or [])
 skipped: list = []
 
 # ========== TAB 1: Homepage ==========
-with tab1:
+if _page == "🏠 Homepage":
     st.markdown(
         """
 <style>
@@ -3793,11 +3809,14 @@ with tab1:
                     pass
         except Exception:
             potd = None
-        if potd is None:
+        if potd is None and st.session_state.get("bb_opportunities"):
+            # Only attempt full POTD build when board cache exists (avoids cold-start OOM)
             with st.spinner("Selecting Play Of The Day..."):
                 potd = build_play_of_the_day(
                     int(cur_wk), api_key or "", n_simulations=n_simulations, form_window=form_window
                 )
+        elif potd is None:
+            potd = None  # show empty state below without heavy rebuild
         locked = bool(potd and potd.get("_locked"))
         lock_note = " · Locked for the week" if locked else " · Updates until the first kickoff of the week"
         st.markdown(
@@ -4077,7 +4096,7 @@ with tab1:
     )
 
 # ========== TAB 2: The Big Board ==========
-with tab2:
+if _page == "🏈 The Big Board":
     st.subheader("The Big Board")
     _bb_top = st.columns([1.1, 1.1, 2])
     with _bb_top[0]:
@@ -4092,35 +4111,69 @@ with tab2:
     with _bb_top[2]:
         st.caption(f"Board auto-refreshes every {BB_CACHE_TTL_SEC // 60} min, or when you click Refresh.")
 
-    rebuild_bb = bool(refresh_bb) or not _bb_cache_valid()
+    # IMPORTANT: do NOT auto-rebuild on every cold start — that can OOM Streamlit Cloud.
+    # Rebuild only when user clicks Refresh (or cache is warm and still valid for display path).
+    has_cache = bool(st.session_state.get("bb_opportunities"))
+    rebuild_bb = bool(refresh_bb) or (not has_cache and st.session_state.get("bb_autoload_once") is True)
+    # First visit: require explicit Refresh so Homepage / other tabs stay light
+    if not has_cache and not refresh_bb:
+        rebuild_bb = False
     odds_status = st.session_state.get("bb_odds_status") or ("No API key entered" if not api_key else "")
 
+    if not has_cache and not rebuild_bb:
+        st.info(
+            "Big Board is not built yet in this session. Click **🔄 Refresh board** once to load "
+            "EPA, lines, and weather. After that, results stay cached for ~15 minutes so the app stays fast."
+        )
+
     if rebuild_bb:
-        with st.spinner("Loading EPA, Pace, Form, Schedule, Odds and unique weather..."):
-            team_epa = get_team_epa()
-            team_pace = get_team_pace()
-            team_success = get_team_success_metrics()
-            team_ou_rate = get_team_ou_tendency()
-            recent_form = get_recent_form(n_games=form_window)
-            schedules = load_schedules()
-            odds_data, odds_status = fetch_nfl_odds(api_key) if api_key else (None, "No API key entered")
-            st.session_state["bb_odds_status"] = odds_status
-            if odds_data:
-                st.session_state["odds_data"] = odds_data
-            try:
-                current_season = int(nfl.get_current_season())
-            except Exception:
-                current_season = datetime.now().year if datetime.now().month >= 8 else datetime.now().year - 1
-            model_bundle = train_ats_model(list(range(current_season - 4, current_season)))
-            # Source of truth: schedule-driven game list (includes every week 1–18 game)
-            upcoming = build_upcoming_games(schedules, odds_data, days_ahead=90)
-            stamp_now("schedule")
-            if odds_data:
-                stamp_now("odds")
-            weather_cache = build_weather_cache_from_games(upcoming)
-            stamp_now("weather")
-            st.session_state["bb_upcoming"] = list(upcoming or [])
-            st.session_state["bb_weather_cache"] = weather_cache or {}
+        st.session_state["bb_autoload_once"] = False
+        try:
+            with st.spinner("Loading EPA, Pace, Form, Schedule, Odds, ML model and weather..."):
+                import gc
+                team_epa = get_team_epa()
+                team_pace = get_team_pace()
+                team_success = get_team_success_metrics()
+                team_ou_rate = get_team_ou_tendency()
+                recent_form = get_recent_form(n_games=form_window)
+                schedules = load_schedules()
+                odds_data, odds_status = fetch_nfl_odds(api_key) if api_key else (None, "No API key entered")
+                st.session_state["bb_odds_status"] = odds_status
+                if odds_data:
+                    st.session_state["odds_data"] = odds_data
+                try:
+                    current_season = int(nfl.get_current_season())
+                except Exception:
+                    current_season = datetime.now().year if datetime.now().month >= 8 else datetime.now().year - 1
+                # Full formula: multi-season ATS model (same as original board)
+                model_bundle = train_ats_model(list(range(current_season - 4, current_season)))
+                st.session_state["bb_model_bundle"] = model_bundle
+                upcoming = build_upcoming_games(schedules, odds_data, days_ahead=90)
+                stamp_now("schedule")
+                if odds_data:
+                    stamp_now("odds")
+                weather_cache = build_weather_cache_from_games(upcoming)
+                stamp_now("weather")
+                st.session_state["bb_upcoming"] = list(upcoming or [])
+                st.session_state["bb_weather_cache"] = weather_cache or {}
+                gc.collect()
+        except Exception as _bb_load_err:
+            st.error(
+                "Big Board data load failed (often memory limits on Streamlit Cloud). "
+                "Lower Monte Carlo simulations in the sidebar and try Refresh again.\n\n"
+                f"`{_bb_load_err}`"
+            )
+            rebuild_bb = False
+            team_epa = pd.DataFrame()
+            team_pace = pd.DataFrame()
+            team_success = pd.DataFrame()
+            team_ou_rate = {}
+            recent_form = {}
+            schedules = pd.DataFrame()
+            upcoming = st.session_state.get("bb_upcoming") or []
+            weather_cache = st.session_state.get("bb_weather_cache") or {}
+            odds_data = st.session_state.get("odds_data")
+            model_bundle = None
     else:
         # Fast path: reuse session cache (homepage + other widgets won't wait on full rebuild)
         opportunities = list(st.session_state.get("bb_opportunities") or [])
@@ -4696,7 +4749,7 @@ with tab2:
             st.info("No cached Big Board yet. Click **Refresh board** to build it.")
 
 # ========== TAB 3: BYOA ==========
-with tab3:
+if _page == "🧪 BYOA":
     def _byoa_load_odds(key: str):
         try:
             if not key:
@@ -4739,364 +4792,369 @@ with tab3:
 
 
 # ========== TAB 4: Games & Odds ==========
-with tab4:
+if _page == "📅 Games & Odds":
     st.subheader("Upcoming Games (full schedule)")
     st.caption(
         "Official slate with open / current lines. "
         "Open = earliest historical line (Odds API) when available; otherwise first live line seen. "
         "Curr = live Odds API. Move = Curr − Open."
     )
-
-    # ---- Odds (always try to load on this tab) ----
-    local_odds = None
-    local_odds_status = "No API key"
-    try:
-        if api_key:
-            local_odds, local_odds_status = fetch_nfl_odds(api_key)
-            if local_odds:
-                stamp_now("odds")
-    except Exception as e:
-        local_odds_status = f"Odds fetch error: {e}"
-    if not local_odds:
+    load_go = st.button("Load Games & Odds", key="btn_load_games_odds", use_container_width=True)
+    if load_go:
+        st.session_state["games_odds_ready"] = True
+    if not st.session_state.get("games_odds_ready"):
+        st.info("Click **Load Games & Odds** to fetch lines and steam (keeps other tabs fast on first load).")
+    else:
+        # ---- Odds (always try to load on this tab) ----
+        local_odds = None
+        local_odds_status = "No API key"
         try:
-            local_odds = odds_data  # from The Big Board load if present
-        except Exception:
-            local_odds = None
-
-    # Action Network: true open (earliest book insert) vs current (latest)
-    an_lines = {}
-    try:
-        an_lines = fetch_action_network_lines()
-    except Exception:
-        an_lines = {}
-
-    # Bulk historical opens as secondary source
-    upcoming_keys = []
-    _today = pd.Timestamp.now().normalize()
-    for _row in EMBEDDED_2026_SCHEDULE:
-        try:
-            _gd = pd.to_datetime(_row.get("gameday"), errors="coerce")
-            if pd.isna(_gd) or _gd < _today - pd.Timedelta(days=3):
-                continue
-            upcoming_keys.append((str(_row["home"]).upper(), str(_row["away"]).upper(), str(_row["gameday"])[:10]))
-        except Exception:
-            continue
-    bulk_opens = {}
-    try:
-        if api_key and upcoming_keys:
-            bulk_opens = bulk_opening_lines(api_key, tuple(upcoming_keys))
-    except Exception:
-        bulk_opens = {}
-
-    def _lines_for_game(home: str, away: str, gameday: str):
-        """Open = first available market line; Curr = most recent market line."""
-        home = _normalize_team_abbr(home) or str(home).upper()
-        away = _normalize_team_abbr(away) or str(away).upper()
-        open_s = open_t = cur_s = cur_t = None
-        source = "none"
-
-        # 1) Action Network (best open vs current separation)
-        an = an_lines.get(f"{away}_{home}") or an_lines.get(f"{away}_{home}".replace("JAX", "JAC"))
-        if an:
-            open_s = an.get("open_spread")
-            open_t = an.get("open_total")
-            cur_s = an.get("cur_spread")
-            cur_t = an.get("cur_total")
-            source = "action_network"
-
-        # 2) Live Odds API for current if still missing
-        try:
-            if local_odds and (cur_s is None or cur_t is None):
-                ev = find_odds_event(local_odds, home, away)
-                if ev:
-                    s, t = _extract_odds_lines(ev, home)
-                    if cur_s is None:
-                        cur_s = s
-                    if cur_t is None:
-                        cur_t = t
-                    if source == "none":
-                        source = "odds_api_live"
-        except Exception:
-            pass
-
-        # 3) Historical bulk for open if still missing
-        bkey = f"{away}_{home}_{str(gameday)[:10]}"
-        if (open_s is None or open_t is None) and bkey in bulk_opens:
-            bo = bulk_opens[bkey]
-            if open_s is None:
-                open_s = bo.get("open_spread")
-            if open_t is None:
-                open_t = bo.get("open_total")
-            if source == "none":
-                source = bo.get("source") or "historical"
-
-        # 4) Persist + merge with tracker (never overwrite a real open with current)
-        try:
-            info = resolve_open_lines(api_key or "", home, away, gameday, cur_s, cur_t)
-            # If AN/historical gave open, force-persist it
-            if open_s is not None or open_t is not None:
-                opens = _load_line_opens()
-                prev = dict(opens.get(bkey) or {})
-                if open_s is not None:
-                    prev["open_spread"] = open_s
-                if open_t is not None:
-                    prev["open_total"] = open_t
-                if cur_s is not None:
-                    prev["last_spread"] = cur_s
-                if cur_t is not None:
-                    prev["last_total"] = cur_t
-                prev["source"] = source
-                opens[bkey] = prev
-                _save_line_opens(opens)
-            else:
-                if open_s is None:
-                    open_s = info.get("open_spread")
-                if open_t is None:
-                    open_t = info.get("open_total")
-                if cur_s is None:
-                    cur_s = info.get("cur_spread")
-                if cur_t is None:
-                    cur_t = info.get("cur_total")
-        except Exception:
-            pass
-
-        # Last resort only
-        if open_s is None and cur_s is not None:
-            open_s = cur_s
-            source = "first_live_as_open"
-        if open_t is None and cur_t is not None:
-            open_t = cur_t
-        if cur_s is None and open_s is not None:
-            cur_s = open_s
-        if cur_t is None and open_t is not None:
-            cur_t = open_t
-
-        s_move = round(float(cur_s) - float(open_s), 1) if (cur_s is not None and open_s is not None) else None
-        t_move = round(float(cur_t) - float(open_t), 1) if (cur_t is not None and open_t is not None) else None
-        return open_s, open_t, cur_s, cur_t, s_move, t_move
-
-    today = pd.Timestamp.now().normalize()
-    rows = []
-    for row in EMBEDDED_2026_SCHEDULE:
-        try:
-            gameday = row.get("gameday")
-            gd = pd.to_datetime(gameday, errors="coerce")
-            if pd.isna(gd):
-                continue
-            # Keep recent + future games (hide older than 3 days)
-            if gd < today - pd.Timedelta(days=3):
-                continue
-            home = str(row.get("home") or "").upper()
-            away = str(row.get("away") or "").upper()
-            week = int(row.get("week") or 0)
-            gametime = row.get("gametime") or "13:00"
-            kickoff = format_schedule_kickoff(gameday, gametime)
-            open_s, open_t, cur_s, cur_t, s_move, t_move = _lines_for_game(home, away, gameday)
-
-            imp_h = imp_a = "—"
-            if cur_s is not None and cur_t is not None:
-                try:
-                    ih, ia = implied_team_totals(float(cur_s), float(cur_t))
-                    imp_h, imp_a = f"{ih:.1f}", f"{ia:.1f}"
-                except Exception:
-                    pass
-
-            rows.append({
-                "Week": week,
-                "Away": full_name(away),
-                "Home": full_name(home),
-                "Kickoff": kickoff,
-                "Open Spread": f"{open_s:+.1f}" if open_s is not None else "—",
-                "Curr Spread": f"{cur_s:+.1f}" if cur_s is not None else "—",
-                "Spread Move": f"{s_move:+.1f}" if s_move is not None else "—",
-                "Open Total": f"{open_t:.1f}" if open_t is not None else "—",
-                "Curr Total": f"{cur_t:.1f}" if cur_t is not None else "—",
-                "Total Move": f"{t_move:+.1f}" if t_move is not None else "—",
-                "Home Imp": imp_h,
-                "Away Imp": imp_a,
-                "Divisional": "Yes" if is_divisional(home, away) else "No",
-                "Roof": str(row.get("roof") or "outdoors").title(),
-            })
-        except Exception:
-            # Still try to show the game shell without lines
+            if api_key:
+                local_odds, local_odds_status = fetch_nfl_odds(api_key)
+                if local_odds:
+                    stamp_now("odds")
+        except Exception as e:
+            local_odds_status = f"Odds fetch error: {e}"
+        if not local_odds:
             try:
-                rows.append({
-                    "Week": int(row.get("week") or 0),
-                    "Away": full_name(str(row.get("away") or "")),
-                    "Home": full_name(str(row.get("home") or "")),
-                    "Kickoff": format_schedule_kickoff(row.get("gameday"), row.get("gametime") or "13:00"),
-                    "Open Spread": "—",
-                    "Curr Spread": "—",
-                    "Spread Move": "—",
-                    "Open Total": "—",
-                    "Curr Total": "—",
-                    "Total Move": "—",
-                    "Home Imp": "—",
-                    "Away Imp": "—",
-                    "Divisional": "Yes" if is_divisional(str(row.get("home")), str(row.get("away"))) else "No",
-                    "Roof": str(row.get("roof") or "outdoors").title(),
-                })
+                local_odds = odds_data  # from The Big Board load if present
+            except Exception:
+                local_odds = None
+
+        # Action Network: true open (earliest book insert) vs current (latest)
+        an_lines = {}
+        try:
+            an_lines = fetch_action_network_lines()
+        except Exception:
+            an_lines = {}
+
+        # Bulk historical opens as secondary source
+        upcoming_keys = []
+        _today = pd.Timestamp.now().normalize()
+        for _row in EMBEDDED_2026_SCHEDULE:
+            try:
+                _gd = pd.to_datetime(_row.get("gameday"), errors="coerce")
+                if pd.isna(_gd) or _gd < _today - pd.Timedelta(days=3):
+                    continue
+                upcoming_keys.append((str(_row["home"]).upper(), str(_row["away"]).upper(), str(_row["gameday"])[:10]))
             except Exception:
                 continue
+        bulk_opens = {}
+        try:
+            if api_key and upcoming_keys:
+                bulk_opens = bulk_opening_lines(api_key, tuple(upcoming_keys))
+        except Exception:
+            bulk_opens = {}
 
-    # Absolute fallback: full slate with no date filter
-    if not rows:
+        def _lines_for_game(home: str, away: str, gameday: str):
+            """Open = first available market line; Curr = most recent market line."""
+            home = _normalize_team_abbr(home) or str(home).upper()
+            away = _normalize_team_abbr(away) or str(away).upper()
+            open_s = open_t = cur_s = cur_t = None
+            source = "none"
+
+            # 1) Action Network (best open vs current separation)
+            an = an_lines.get(f"{away}_{home}") or an_lines.get(f"{away}_{home}".replace("JAX", "JAC"))
+            if an:
+                open_s = an.get("open_spread")
+                open_t = an.get("open_total")
+                cur_s = an.get("cur_spread")
+                cur_t = an.get("cur_total")
+                source = "action_network"
+
+            # 2) Live Odds API for current if still missing
+            try:
+                if local_odds and (cur_s is None or cur_t is None):
+                    ev = find_odds_event(local_odds, home, away)
+                    if ev:
+                        s, t = _extract_odds_lines(ev, home)
+                        if cur_s is None:
+                            cur_s = s
+                        if cur_t is None:
+                            cur_t = t
+                        if source == "none":
+                            source = "odds_api_live"
+            except Exception:
+                pass
+
+            # 3) Historical bulk for open if still missing
+            bkey = f"{away}_{home}_{str(gameday)[:10]}"
+            if (open_s is None or open_t is None) and bkey in bulk_opens:
+                bo = bulk_opens[bkey]
+                if open_s is None:
+                    open_s = bo.get("open_spread")
+                if open_t is None:
+                    open_t = bo.get("open_total")
+                if source == "none":
+                    source = bo.get("source") or "historical"
+
+            # 4) Persist + merge with tracker (never overwrite a real open with current)
+            try:
+                info = resolve_open_lines(api_key or "", home, away, gameday, cur_s, cur_t)
+                # If AN/historical gave open, force-persist it
+                if open_s is not None or open_t is not None:
+                    opens = _load_line_opens()
+                    prev = dict(opens.get(bkey) or {})
+                    if open_s is not None:
+                        prev["open_spread"] = open_s
+                    if open_t is not None:
+                        prev["open_total"] = open_t
+                    if cur_s is not None:
+                        prev["last_spread"] = cur_s
+                    if cur_t is not None:
+                        prev["last_total"] = cur_t
+                    prev["source"] = source
+                    opens[bkey] = prev
+                    _save_line_opens(opens)
+                else:
+                    if open_s is None:
+                        open_s = info.get("open_spread")
+                    if open_t is None:
+                        open_t = info.get("open_total")
+                    if cur_s is None:
+                        cur_s = info.get("cur_spread")
+                    if cur_t is None:
+                        cur_t = info.get("cur_total")
+            except Exception:
+                pass
+
+            # Last resort only
+            if open_s is None and cur_s is not None:
+                open_s = cur_s
+                source = "first_live_as_open"
+            if open_t is None and cur_t is not None:
+                open_t = cur_t
+            if cur_s is None and open_s is not None:
+                cur_s = open_s
+            if cur_t is None and open_t is not None:
+                cur_t = open_t
+
+            s_move = round(float(cur_s) - float(open_s), 1) if (cur_s is not None and open_s is not None) else None
+            t_move = round(float(cur_t) - float(open_t), 1) if (cur_t is not None and open_t is not None) else None
+            return open_s, open_t, cur_s, cur_t, s_move, t_move
+
+        today = pd.Timestamp.now().normalize()
+        rows = []
         for row in EMBEDDED_2026_SCHEDULE:
             try:
+                gameday = row.get("gameday")
+                gd = pd.to_datetime(gameday, errors="coerce")
+                if pd.isna(gd):
+                    continue
+                # Keep recent + future games (hide older than 3 days)
+                if gd < today - pd.Timedelta(days=3):
+                    continue
                 home = str(row.get("home") or "").upper()
                 away = str(row.get("away") or "").upper()
-                gameday = row.get("gameday")
+                week = int(row.get("week") or 0)
+                gametime = row.get("gametime") or "13:00"
+                kickoff = format_schedule_kickoff(gameday, gametime)
                 open_s, open_t, cur_s, cur_t, s_move, t_move = _lines_for_game(home, away, gameday)
+
+                imp_h = imp_a = "—"
+                if cur_s is not None and cur_t is not None:
+                    try:
+                        ih, ia = implied_team_totals(float(cur_s), float(cur_t))
+                        imp_h, imp_a = f"{ih:.1f}", f"{ia:.1f}"
+                    except Exception:
+                        pass
+
                 rows.append({
-                    "Week": int(row.get("week") or 0),
+                    "Week": week,
                     "Away": full_name(away),
                     "Home": full_name(home),
-                    "Kickoff": format_schedule_kickoff(gameday, row.get("gametime") or "13:00"),
+                    "Kickoff": kickoff,
                     "Open Spread": f"{open_s:+.1f}" if open_s is not None else "—",
                     "Curr Spread": f"{cur_s:+.1f}" if cur_s is not None else "—",
                     "Spread Move": f"{s_move:+.1f}" if s_move is not None else "—",
                     "Open Total": f"{open_t:.1f}" if open_t is not None else "—",
                     "Curr Total": f"{cur_t:.1f}" if cur_t is not None else "—",
                     "Total Move": f"{t_move:+.1f}" if t_move is not None else "—",
-                    "Home Imp": "—",
-                    "Away Imp": "—",
+                    "Home Imp": imp_h,
+                    "Away Imp": imp_a,
                     "Divisional": "Yes" if is_divisional(home, away) else "No",
                     "Roof": str(row.get("roof") or "outdoors").title(),
                 })
             except Exception:
-                continue
+                # Still try to show the game shell without lines
+                try:
+                    rows.append({
+                        "Week": int(row.get("week") or 0),
+                        "Away": full_name(str(row.get("away") or "")),
+                        "Home": full_name(str(row.get("home") or "")),
+                        "Kickoff": format_schedule_kickoff(row.get("gameday"), row.get("gametime") or "13:00"),
+                        "Open Spread": "—",
+                        "Curr Spread": "—",
+                        "Spread Move": "—",
+                        "Open Total": "—",
+                        "Curr Total": "—",
+                        "Total Move": "—",
+                        "Home Imp": "—",
+                        "Away Imp": "—",
+                        "Divisional": "Yes" if is_divisional(str(row.get("home")), str(row.get("away"))) else "No",
+                        "Roof": str(row.get("roof") or "outdoors").title(),
+                    })
+                except Exception:
+                    continue
 
-    st.caption(
-        f"Odds API: {local_odds_status} · Events: {0 if not local_odds else len(local_odds)} · "
-        f"Action Network lines: {len(an_lines)}"
-    )
+        # Absolute fallback: full slate with no date filter
+        if not rows:
+            for row in EMBEDDED_2026_SCHEDULE:
+                try:
+                    home = str(row.get("home") or "").upper()
+                    away = str(row.get("away") or "").upper()
+                    gameday = row.get("gameday")
+                    open_s, open_t, cur_s, cur_t, s_move, t_move = _lines_for_game(home, away, gameday)
+                    rows.append({
+                        "Week": int(row.get("week") or 0),
+                        "Away": full_name(away),
+                        "Home": full_name(home),
+                        "Kickoff": format_schedule_kickoff(gameday, row.get("gametime") or "13:00"),
+                        "Open Spread": f"{open_s:+.1f}" if open_s is not None else "—",
+                        "Curr Spread": f"{cur_s:+.1f}" if cur_s is not None else "—",
+                        "Spread Move": f"{s_move:+.1f}" if s_move is not None else "—",
+                        "Open Total": f"{open_t:.1f}" if open_t is not None else "—",
+                        "Curr Total": f"{cur_t:.1f}" if cur_t is not None else "—",
+                        "Total Move": f"{t_move:+.1f}" if t_move is not None else "—",
+                        "Home Imp": "—",
+                        "Away Imp": "—",
+                        "Divisional": "Yes" if is_divisional(home, away) else "No",
+                        "Roof": str(row.get("roof") or "outdoors").title(),
+                    })
+                except Exception:
+                    continue
 
-    if rows:
-        games_df = pd.DataFrame(rows)
-        all_weeks = sorted({int(r["week"]) for r in EMBEDDED_2026_SCHEDULE})
-        cur_wk = current_nfl_week() or 1
-        week_filter = st.selectbox(
-            "Filter by week",
-            options=["All weeks"] + [f"Week {int(w)}" for w in all_weeks],
-            index=(["All weeks"] + [f"Week {int(w)}" for w in all_weeks]).index(f"Week {int(cur_wk)}")
-            if f"Week {int(cur_wk)}" in [f"Week {int(w)}" for w in all_weeks] else 0,
-            key="games_odds_week_filter",
+        st.caption(
+            f"Odds API: {local_odds_status} · Events: {0 if not local_odds else len(local_odds)} · "
+            f"Action Network lines: {len(an_lines)}"
         )
-        display = games_df
-        if week_filter != "All weeks":
+
+        if rows:
+            games_df = pd.DataFrame(rows)
+            all_weeks = sorted({int(r["week"]) for r in EMBEDDED_2026_SCHEDULE})
+            cur_wk = current_nfl_week() or 1
+            week_filter = st.selectbox(
+                "Filter by week",
+                options=["All weeks"] + [f"Week {int(w)}" for w in all_weeks],
+                index=(["All weeks"] + [f"Week {int(w)}" for w in all_weeks]).index(f"Week {int(cur_wk)}")
+                if f"Week {int(cur_wk)}" in [f"Week {int(w)}" for w in all_weeks] else 0,
+                key="games_odds_week_filter",
+            )
+            display = games_df
+            if week_filter != "All weeks":
+                try:
+                    wk = int(week_filter.replace("Week ", ""))
+                    display = games_df[games_df["Week"] == wk].copy()
+                except Exception:
+                    pass
+
+            # ---- Live board header ----
+            n_games = len(display)
+            def _parse_move(x):
+                try:
+                    if x in (None, "—", ""):
+                        return None
+                    return float(str(x).replace("+", ""))
+                except Exception:
+                    return None
+            moves = [m for m in (_parse_move(x) for x in display.get("Spread Move", pd.Series(dtype=str)).tolist()) if m is not None]
+            n_steam = sum(1 for m in moves if abs(m) >= 1.5)
+            n_lined = int(((display["Curr Spread"].astype(str) != "—") | (display["Curr Total"].astype(str) != "—")).sum()) if n_games else 0
+            # Next kickoff
+            next_ko = "—"
             try:
-                wk = int(week_filter.replace("Week ", ""))
-                display = games_df[games_df["Week"] == wk].copy()
+                kos = sorted([k for k in display["Kickoff"].astype(str).tolist() if k and k != "—"])
+                now_s = datetime.now().strftime("%Y-%m-%d %H:%M")
+                future = [k for k in kos if k >= now_s[:16]]
+                next_ko = (future[0] if future else (kos[0] if kos else "—"))
             except Exception:
                 pass
+            week_label = week_filter if week_filter != "All weeks" else f"Week {cur_wk}"
+            st.markdown(
+                f"""
+        <div style="background:linear-gradient(90deg,#0f172a,#1e3a5f);border-radius:12px;padding:14px 18px;margin:8px 0 14px 0;border:1px solid rgba(255,255,255,0.08);">
+          <div style="color:#94a3b8;font-size:0.8rem;letter-spacing:0.06em;text-transform:uppercase;">Live board</div>
+          <div style="color:#f8fafc;font-size:1.25rem;font-weight:700;margin-top:2px;">{week_label} · {n_games} games · {n_lined} with lines</div>
+          <div style="color:#cbd5e1;font-size:0.9rem;margin-top:4px;">
+        Steam (≥1.5 pts): <b style="color:#fbbf24;">{n_steam}</b>
+        &nbsp;·&nbsp; Next kickoff: <b style="color:#38bdf8;">{next_ko}</b>
+          </div>
+        </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        # ---- Live board header ----
-        n_games = len(display)
-        def _parse_move(x):
+            # ---- Top Steam Plays (3 games with largest |spread move|) ----
+            st.markdown("##### Top Steam Plays")
+            st.caption("The 3 games with the most spread steam (largest |Open → Curr| move) in the filtered week.")
+            steam_df = display.copy()
+            steam_df["_steam_abs"] = steam_df["Spread Move"].map(
+                lambda x: abs(v) if (v := _parse_move(x)) is not None else -1.0
+            )
+            steam_df["_tot_abs"] = steam_df["Total Move"].map(
+                lambda x: abs(v) if (v := _parse_move(x)) is not None else 0.0
+            )
+            steam_top = (
+                steam_df[steam_df["_steam_abs"] >= 0]
+                .sort_values(["_steam_abs", "_tot_abs"], ascending=False)
+                .head(3)
+            )
+            if steam_top.empty:
+                st.info("No line movement data yet for this filter — opens/currents still loading.")
+            else:
+                for rank, (_, r) in enumerate(steam_top.iterrows(), start=1):
+                    away, home = r.get("Away", ""), r.get("Home", "")
+                    ko = r.get("Kickoff", "—")
+                    os_, cs = r.get("Open Spread", "—"), r.get("Curr Spread", "—")
+                    ot, ct = r.get("Open Total", "—"), r.get("Curr Total", "—")
+                    sm, tm = r.get("Spread Move", "—"), r.get("Total Move", "—")
+                    move_color = "#94a3b8"
+                    smv = _parse_move(sm)
+                    if smv is not None and abs(smv) >= 1.5:
+                        move_color = "#fbbf24"
+                    elif smv is not None and abs(smv) >= 0.5:
+                        move_color = "#38bdf8"
+                    steam_pts = f"{abs(smv):.1f}" if smv is not None else "—"
+                    st.markdown(
+                        f"""
+        <div style="background:#111827;border:1px solid #1f2937;border-radius:12px;padding:12px 14px;margin-bottom:8px;">
+          <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+        <div>
+          <div style="color:#fbbf24;font-size:0.75rem;font-weight:700;letter-spacing:0.04em;">#{rank} STEAM · {steam_pts} pts</div>
+          <div style="color:#f8fafc;font-weight:700;font-size:1.05rem;">{away} <span style="color:#64748b;">@</span> {home}</div>
+          <div style="color:#94a3b8;font-size:0.82rem;">Kickoff {ko} · Week {r.get("Week","")}</div>
+        </div>
+        <div style="text-align:right;">
+          <div style="color:#94a3b8;font-size:0.75rem;">SPREAD open → curr</div>
+          <div style="color:#e2e8f0;font-weight:600;">{os_} → {cs} <span style="color:{move_color};">({sm})</span></div>
+          <div style="color:#94a3b8;font-size:0.75rem;margin-top:4px;">TOTAL open → curr</div>
+          <div style="color:#e2e8f0;font-weight:600;">{ot} → {ct} <span style="color:#94a3b8;">({tm})</span></div>
+        </div>
+          </div>
+        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+            st.markdown("##### Full slate table")
+            st.dataframe(display, use_container_width=True, hide_index=True)
+            st.caption(
+                f"{len(display)} games · Open from earliest Action Network book line when available; "
+                "Curr from latest book line / Odds API."
+            )
             try:
-                if x in (None, "—", ""):
-                    return None
-                return float(str(x).replace("+", ""))
+                stamp_now("odds")
             except Exception:
-                return None
-        moves = [m for m in (_parse_move(x) for x in display.get("Spread Move", pd.Series(dtype=str)).tolist()) if m is not None]
-        n_steam = sum(1 for m in moves if abs(m) >= 1.5)
-        n_lined = int(((display["Curr Spread"].astype(str) != "—") | (display["Curr Total"].astype(str) != "—")).sum()) if n_games else 0
-        # Next kickoff
-        next_ko = "—"
-        try:
-            kos = sorted([k for k in display["Kickoff"].astype(str).tolist() if k and k != "—"])
-            now_s = datetime.now().strftime("%Y-%m-%d %H:%M")
-            future = [k for k in kos if k >= now_s[:16]]
-            next_ko = (future[0] if future else (kos[0] if kos else "—"))
-        except Exception:
-            pass
-        week_label = week_filter if week_filter != "All weeks" else f"Week {cur_wk}"
-        st.markdown(
-            f"""
-<div style="background:linear-gradient(90deg,#0f172a,#1e3a5f);border-radius:12px;padding:14px 18px;margin:8px 0 14px 0;border:1px solid rgba(255,255,255,0.08);">
-  <div style="color:#94a3b8;font-size:0.8rem;letter-spacing:0.06em;text-transform:uppercase;">Live board</div>
-  <div style="color:#f8fafc;font-size:1.25rem;font-weight:700;margin-top:2px;">{week_label} · {n_games} games · {n_lined} with lines</div>
-  <div style="color:#cbd5e1;font-size:0.9rem;margin-top:4px;">
-    Steam (≥1.5 pts): <b style="color:#fbbf24;">{n_steam}</b>
-    &nbsp;·&nbsp; Next kickoff: <b style="color:#38bdf8;">{next_ko}</b>
-  </div>
-</div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        # ---- Top Steam Plays (3 games with largest |spread move|) ----
-        st.markdown("##### Top Steam Plays")
-        st.caption("The 3 games with the most spread steam (largest |Open → Curr| move) in the filtered week.")
-        steam_df = display.copy()
-        steam_df["_steam_abs"] = steam_df["Spread Move"].map(
-            lambda x: abs(v) if (v := _parse_move(x)) is not None else -1.0
-        )
-        steam_df["_tot_abs"] = steam_df["Total Move"].map(
-            lambda x: abs(v) if (v := _parse_move(x)) is not None else 0.0
-        )
-        steam_top = (
-            steam_df[steam_df["_steam_abs"] >= 0]
-            .sort_values(["_steam_abs", "_tot_abs"], ascending=False)
-            .head(3)
-        )
-        if steam_top.empty:
-            st.info("No line movement data yet for this filter — opens/currents still loading.")
+                pass
+            st.caption(last_update_caption("odds", "schedule", label="Last update (Games & Odds)"))
         else:
-            for rank, (_, r) in enumerate(steam_top.iterrows(), start=1):
-                away, home = r.get("Away", ""), r.get("Home", "")
-                ko = r.get("Kickoff", "—")
-                os_, cs = r.get("Open Spread", "—"), r.get("Curr Spread", "—")
-                ot, ct = r.get("Open Total", "—"), r.get("Curr Total", "—")
-                sm, tm = r.get("Spread Move", "—"), r.get("Total Move", "—")
-                move_color = "#94a3b8"
-                smv = _parse_move(sm)
-                if smv is not None and abs(smv) >= 1.5:
-                    move_color = "#fbbf24"
-                elif smv is not None and abs(smv) >= 0.5:
-                    move_color = "#38bdf8"
-                steam_pts = f"{abs(smv):.1f}" if smv is not None else "—"
-                st.markdown(
-                    f"""
-<div style="background:#111827;border:1px solid #1f2937;border-radius:12px;padding:12px 14px;margin-bottom:8px;">
-  <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
-    <div>
-      <div style="color:#fbbf24;font-size:0.75rem;font-weight:700;letter-spacing:0.04em;">#{rank} STEAM · {steam_pts} pts</div>
-      <div style="color:#f8fafc;font-weight:700;font-size:1.05rem;">{away} <span style="color:#64748b;">@</span> {home}</div>
-      <div style="color:#94a3b8;font-size:0.82rem;">Kickoff {ko} · Week {r.get("Week","")}</div>
-    </div>
-    <div style="text-align:right;">
-      <div style="color:#94a3b8;font-size:0.75rem;">SPREAD open → curr</div>
-      <div style="color:#e2e8f0;font-weight:600;">{os_} → {cs} <span style="color:{move_color};">({sm})</span></div>
-      <div style="color:#94a3b8;font-size:0.75rem;margin-top:4px;">TOTAL open → curr</div>
-      <div style="color:#e2e8f0;font-weight:600;">{ot} → {ct} <span style="color:#94a3b8;">({tm})</span></div>
-    </div>
-  </div>
-</div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-        st.markdown("##### Full slate table")
-        st.dataframe(display, use_container_width=True, hide_index=True)
-        st.caption(
-            f"{len(display)} games · Open from earliest Action Network book line when available; "
-            "Curr from latest book line / Odds API."
-        )
-        try:
-            stamp_now("odds")
-        except Exception:
-            pass
-        st.caption(last_update_caption("odds", "schedule", label="Last update (Games & Odds)"))
-    else:
-        st.error(
-            f"No games could be built from the embedded schedule "
-            f"(len={len(EMBEDDED_2026_SCHEDULE)}). Redeploy app.py with EMBEDDED_2026_SCHEDULE intact."
-        )
+            st.error(
+                f"No games could be built from the embedded schedule "
+                f"(len={len(EMBEDDED_2026_SCHEDULE)}). Redeploy app.py with EMBEDDED_2026_SCHEDULE intact."
+            )
 
 
-with tab5:
+if _page == "🌤️ Weather":
     st.subheader("Game Weather")
     st.caption(
         "Forecast at each outdoor stadium near kickoff (Open-Meteo). "
@@ -5170,7 +5228,7 @@ with tab5:
         st.caption(last_update_caption("weather", "schedule", label="Last update (Weather)"))
 
 
-with tab6:
+if _page == "🏥 Injury Report":
     st.subheader("NFL Injury Report")
     st.caption(
         "Official report from [NFL.com/injuries](https://www.nfl.com/injuries/). "
@@ -5250,7 +5308,7 @@ with tab6:
             )
 
 
-with tab7:
+if _page == "📋 Depth Charts":
     st.subheader("Depth Charts")
     st.caption(
         "Current team depth charts from [Ourlads](https://www.ourlads.com/nfldepthcharts/). "
@@ -5308,7 +5366,7 @@ with tab7:
 
 
 
-with tab8:
+if _page == "📊 Team History":
     st.subheader("Team History")
     st.caption(
         "ATS (against the spread) and Over/Under records by team — last 5 seasons of completed games. "
@@ -5409,7 +5467,7 @@ with tab8:
         st.caption(f"{len(show)} team-games · spreads/totals from historical schedule lines when available")
 
 
-with tab9:
+if _page == "📘 Methodology":
     st.subheader("Methodology")
     st.caption("How Score, Confidence, and Lean recommendations are produced. Research tool only — not betting advice.")
 
@@ -5504,7 +5562,7 @@ Over/under probabilities are taken from simulated totals vs the market line (wit
         """
     )
 
-with tab10:
+if _page == "⚙️ Advanced":
     st.subheader("Advanced")
     st.caption("Less frequently used tools — props, bankroll tracking, and historical backtests.")
     adv = st.radio(
@@ -5987,6 +6045,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
 
 
