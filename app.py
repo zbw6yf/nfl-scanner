@@ -599,6 +599,8 @@ BOARD_LOCK_PATH = Path(__file__).resolve().parent / "board_locks.json"
 # Fields that freeze at kickoff and must not keep changing in-game
 _BOARD_LOCK_FIELDS = (
     "Recommendation", "Confidence", "Score", "Signals",
+    "Spread Rec", "Spread Conf", "Spread Score", "P Home Cover", "P Away Cover",
+    "Total Rec", "Total Conf", "Total Score", "P Over", "P Under",
     "Spread", "Total", "Home Imp", "Away Imp",
     "EPA Edge", "Form Δ", "Model %", "Market %", "Edge %",
     "ML Home %", "MC Home %", "MC Over %",
@@ -4653,6 +4655,54 @@ with tab2:
 
         display_df = filtered.copy()
 
+        # Backfill dual-market columns if board was built before this feature
+        def _backfill_dual_cols(frame: pd.DataFrame) -> pd.DataFrame:
+            f = frame.copy()
+            if "Spread Rec" not in f.columns:
+                def _sr(r):
+                    rec = str(r.get("Recommendation") or "")
+                    if rec in ("Home ATS", "Away ATS"):
+                        return rec
+                    return "No strong lean"
+                f["Spread Rec"] = f.apply(_sr, axis=1)
+            if "Spread Conf" not in f.columns:
+                f["Spread Conf"] = f["Confidence"] if "Confidence" in f.columns else "F"
+            if "Spread Score" not in f.columns:
+                f["Spread Score"] = f["Score"] if "Score" in f.columns else 0.0
+            if "Total Rec" not in f.columns:
+                def _tr(r):
+                    rec = str(r.get("Recommendation") or "")
+                    if rec in ("Over", "Under"):
+                        return rec
+                    return "No strong lean"
+                f["Total Rec"] = f.apply(_tr, axis=1)
+            if "Total Conf" not in f.columns:
+                f["Total Conf"] = f["Confidence"] if "Confidence" in f.columns else "F"
+            if "Total Score" not in f.columns:
+                f["Total Score"] = f["Score"] if "Score" in f.columns else 0.0
+            for c, alt in [
+                ("P Home Cover", "Model %"),
+                ("P Away Cover", None),
+                ("P Over", "MC Over %"),
+                ("P Under", None),
+            ]:
+                if c not in f.columns:
+                    f[c] = f[alt] if alt and alt in f.columns else "—"
+            return f
+
+        display_df = _backfill_dual_cols(display_df)
+        df = _backfill_dual_cols(df)
+
+        # Shared column list for Top Plays
+        cols = [
+            "Week", "Game", "Kickoff", "Recommendation", "Confidence", "Score",
+            "Spread Rec", "Spread Conf", "Spread Score",
+            "Total Rec", "Total Conf", "Total Score",
+            "Spread", "Total", "P Home Cover", "P Away Cover", "P Over", "P Under",
+            "EPA Edge", "Form Δ", "Signals",
+        ]
+        cols = [c for c in cols if c in display_df.columns]
+
         st.markdown("#### Spread recommendations")
         st.caption("Every game: estimated cover probabilities and ATS lean (Home/Away ATS).")
         spread_cols = [
@@ -4661,13 +4711,14 @@ with tab2:
             "EPA Edge", "Form Δ", "TZ Diff", "Signals",
         ]
         spread_cols = [c for c in spread_cols if c in display_df.columns]
-        if spread_cols:
-            spread_view = display_df.copy()
-            if "Spread Score" in spread_view.columns:
-                spread_view = spread_view.sort_values("Spread Score", ascending=False)
-            st.dataframe(spread_view[spread_cols], use_container_width=True, hide_index=True)
-        else:
-            st.info("Spread columns not available — refresh the board.")
+        spread_view = display_df.copy()
+        if "Spread Score" in spread_view.columns:
+            try:
+                spread_view["_ss"] = pd.to_numeric(spread_view["Spread Score"], errors="coerce")
+                spread_view = spread_view.sort_values("_ss", ascending=False)
+            except Exception:
+                pass
+        st.dataframe(spread_view[spread_cols], use_container_width=True, hide_index=True)
 
         st.markdown("#### Total recommendations")
         st.caption("Every game: estimated over/under probabilities and total lean.")
@@ -4676,13 +4727,14 @@ with tab2:
             "Total", "P Over", "P Under", "MC Over %", "Pace", "Weather", "Signals",
         ]
         total_cols = [c for c in total_cols if c in display_df.columns]
-        if total_cols:
-            total_view = display_df.copy()
-            if "Total Score" in total_view.columns:
-                total_view = total_view.sort_values("Total Score", ascending=False)
-            st.dataframe(total_view[total_cols], use_container_width=True, hide_index=True)
-        else:
-            st.info("Total columns not available — refresh the board.")
+        total_view = display_df.copy()
+        if "Total Score" in total_view.columns:
+            try:
+                total_view["_ts"] = pd.to_numeric(total_view["Total Score"], errors="coerce")
+                total_view = total_view.sort_values("_ts", ascending=False)
+            except Exception:
+                pass
+        st.dataframe(total_view[total_cols], use_container_width=True, hide_index=True)
 
         st.markdown("#### Top Plays of The Week")
         st.caption("Top 5 by highest Score, then highest Confidence (A → F).")
