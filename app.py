@@ -1709,26 +1709,27 @@ def confidence_grade(
     Confidence from estimated side probability and model/sim agreement.
     A = clear probability edge with agreement; F = no lean / near coin-flip.
     """
-    if rec == "No strong lean":
+    rec_n = str(rec or "").strip()
+    if rec_n in ("No strong lean", "—", "-", "", "None", "nan"):
         return "F"
 
     if side_prob is None:
-        if rec in ("Home ATS", "Away ATS"):
-            side_prob = mc.get("home_cover_prob", 0.5) if rec == "Home ATS" else (1.0 - mc.get("home_cover_prob", 0.5))
+        if rec_n in ("Home ATS", "Away ATS"):
+            side_prob = mc.get("home_cover_prob", 0.5) if rec_n == "Home ATS" else (1.0 - mc.get("home_cover_prob", 0.5))
         else:
-            side_prob = mc.get("over_prob", 0.5) if rec == "Over" else mc.get("under_prob", 0.5)
+            side_prob = mc.get("over_prob", 0.5) if rec_n == "Over" else mc.get("under_prob", 0.5)
 
     edge = max(0.0, float(side_prob) - 0.5)
     edge_abs = abs(edge_pct) if edge_pct is not None else 0.0
 
-    # Probability-first bands
-    if edge >= 0.12 and agree > 0 and edge_abs >= 3:
+    # Probability-first bands (tied to how far past 50%)
+    if edge >= 0.10 and agree > 0:
         return "A"
-    if edge >= 0.08 and (agree > 0 or edge_abs >= 2):
+    if edge >= 0.07:
         return "B"
-    if edge >= 0.05:
+    if edge >= 0.04:
         return "C"
-    if edge >= 0.02:
+    if edge >= 0.015:
         return "D"
     return "F"
 
@@ -3040,7 +3041,8 @@ def monte_carlo_game(
     expected_margin = (home_off - away_def - (away_off - home_def)) * 35.0 + 1.2 + form_margin_adj
     sim_margins = np.random.normal(expected_margin, 11.5 + noise_extra, n_sims)
     expected_total = 44.0 + (home_off + away_off - home_def - away_def) * 22.0 + total_adj + pace_adj
-    sim_totals = np.random.normal(expected_total, 13.5 + noise_extra * 0.8, n_sims)
+    # Slightly tighter total dispersion so O/U leans are not almost always ~50/50
+    sim_totals = np.random.normal(expected_total, 11.0 + noise_extra * 0.7, n_sims)
     home_cover = float(np.mean(sim_margins > spread))
     over_p = float(np.mean(sim_totals > total_line)) if total_line else 0.5
     over_p = max(0.05, min(0.95, over_p - under_bias))
@@ -3513,10 +3515,12 @@ def build_play_of_the_day(
                 tot_side = "Over" if p_over >= p_under else "Under"
                 tot_prob = max(p_over, p_under)
                 ats_edge, tot_edge = ats_prob - 0.5, tot_prob - 0.5
-                MIN_EDGE = 0.02
-                if ats_edge >= MIN_EDGE and ats_edge >= tot_edge:
+                SPREAD_MIN, TOTAL_MIN = 0.015, 0.008
+                spread_ok = ats_edge >= SPREAD_MIN
+                total_ok = tot_edge >= TOTAL_MIN
+                if spread_ok and (not total_ok or ats_edge >= tot_edge):
                     rec, side_prob = ats_side, ats_prob
-                elif tot_edge >= MIN_EDGE:
+                elif total_ok:
                     rec, side_prob = tot_side, tot_prob
                 else:
                     rec, side_prob = "No strong lean", max(ats_prob, tot_prob)
@@ -4409,21 +4413,26 @@ with tab2:
                 tot_prob = max(p_over, p_under)
                 tot_edge = tot_prob - 0.5
 
-                # Both markets always scored; primary rec = stronger edge (for POTD / locks)
-                MIN_EDGE = 0.02
+                # Separate bars: spreads stay a bit stricter; totals post more often
+                # 51.5%+ for ATS, 50.8%+ for totals (simulation totals cluster near the line)
+                SPREAD_MIN = 0.015
+                TOTAL_MIN = 0.008
                 context_bonus = min(3.0, float(rule_score) * 0.18)
 
-                spread_rec = ats_side if ats_edge >= MIN_EDGE else "No strong lean"
-                total_rec = tot_side if tot_edge >= MIN_EDGE else "No strong lean"
+                spread_rec = ats_side if ats_edge >= SPREAD_MIN else "No strong lean"
+                total_rec = tot_side if tot_edge >= TOTAL_MIN else "No strong lean"
 
                 spread_score = (float(ats_prob) - 0.5) * 100.0 + context_bonus * 0.5
                 if agree > 0 and spread_rec in ("Home ATS", "Away ATS"):
                     spread_score += 1.0
                 total_mkt_score = (float(tot_prob) - 0.5) * 100.0 + context_bonus * 0.5
 
-                if ats_edge >= MIN_EDGE and ats_edge >= tot_edge:
+                # Primary (POTD / legacy columns) = stronger market with a real lean
+                if spread_rec != "No strong lean" and (
+                    total_rec == "No strong lean" or ats_edge >= tot_edge
+                ):
                     rec, side_prob, total_score = spread_rec, ats_prob, spread_score
-                elif tot_edge >= MIN_EDGE:
+                elif total_rec != "No strong lean":
                     rec, side_prob, total_score = total_rec, tot_prob, total_mkt_score
                 else:
                     rec, side_prob = "No strong lean", max(ats_prob, tot_prob)
@@ -4692,6 +4701,23 @@ with tab2:
 
         display_df = _backfill_dual_cols(display_df)
         df = _backfill_dual_cols(df)
+
+        def _force_conf_align(frame: pd.DataFrame) -> pd.DataFrame:
+            f = frame.copy()
+            for rec_c, conf_c in (
+                ("Recommendation", "Confidence"),
+                ("Spread Rec", "Spread Conf"),
+                ("Total Rec", "Total Conf"),
+            ):
+                if rec_c in f.columns and conf_c in f.columns:
+                    mask = f[rec_c].astype(str).str.strip().isin(
+                        ["No strong lean", "—", "-", "", "None", "nan"]
+                    )
+                    f.loc[mask, conf_c] = "F"
+            return f
+
+        display_df = _force_conf_align(display_df)
+        df = _force_conf_align(df)
 
         # Shared column list for Top Plays
         cols = [
