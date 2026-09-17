@@ -1701,64 +1701,32 @@ def confidence_grade(
     edge_pct: Optional[float],
     n_signals: int,
     agree: float,
+    side_prob: Optional[float] = None,
 ) -> str:
     """
-    A/B/C/D/F confidence for the lean (no E).
-    A = strongest alignment of score, model, Monte Carlo, and market edge.
-    F = no lean or very weak evidence.
+    Confidence from estimated side probability and model/sim agreement.
+    A = clear probability edge with agreement; F = no lean / near coin-flip.
     """
     if rec == "No strong lean":
-        if total_score >= 4.0 and n_signals >= 3:
-            return "D"  # some signals but no formal lean
         return "F"
 
-    # Strength of the lean itself
-    if rec in ("Home ATS", "Away ATS"):
-        side_prob = mc.get("home_cover_prob", 0.5) if rec == "Home ATS" else (1.0 - mc.get("home_cover_prob", 0.5))
-        model_side = ml_home if rec == "Home ATS" else (1.0 - ml_home)
-        side_ev = mc.get("home_ev", 0.0) if rec == "Home ATS" else mc.get("away_ev", 0.0)
-    else:
-        side_prob = mc.get("over_prob", 0.5) if rec == "Over" else mc.get("under_prob", 0.5)
-        model_side = side_prob
-        side_ev = max(0.0, side_prob - 0.5)
+    if side_prob is None:
+        if rec in ("Home ATS", "Away ATS"):
+            side_prob = mc.get("home_cover_prob", 0.5) if rec == "Home ATS" else (1.0 - mc.get("home_cover_prob", 0.5))
+        else:
+            side_prob = mc.get("over_prob", 0.5) if rec == "Over" else mc.get("under_prob", 0.5)
 
+    edge = max(0.0, float(side_prob) - 0.5)
     edge_abs = abs(edge_pct) if edge_pct is not None else 0.0
-    points = 0.0
-    # Score contribution (0–4)
-    points += min(4.0, total_score / 2.5)
-    # Probability margin past 50% (0–2)
-    points += min(2.0, max(0.0, (side_prob - 0.5) * 10.0))
-    # Model agreement (0–1.5)
-    if agree > 0:
-        points += 1.5
-    elif abs(model_side - 0.5) >= 0.05:
-        points += 0.75
-    # Market edge (0–1.5)
-    if edge_abs >= 8:
-        points += 1.5
-    elif edge_abs >= 4:
-        points += 1.0
-    elif edge_abs >= 2:
-        points += 0.5
-    # Signal count (0–1)
-    if n_signals >= 5:
-        points += 1.0
-    elif n_signals >= 3:
-        points += 0.5
-    # EV quality (0–1)
-    if side_ev >= 0.08:
-        points += 1.0
-    elif side_ev >= 0.04:
-        points += 0.5
 
-    # Map points to letter (A/B/C/D/F only — no E)
-    if points >= 8.5:
+    # Probability-first bands
+    if edge >= 0.12 and agree > 0 and edge_abs >= 3:
         return "A"
-    if points >= 7.0:
+    if edge >= 0.08 and (agree > 0 or edge_abs >= 2):
         return "B"
-    if points >= 5.5:
+    if edge >= 0.05:
         return "C"
-    if points >= 3.5:
+    if edge >= 0.02:
         return "D"
     return "F"
 
@@ -3529,34 +3497,48 @@ def build_play_of_the_day(
                     pace_adj=pace_adj,
                     form_margin_adj=form_margin_adj,
                 )
-                ml_edge = abs(ml_home - 0.5) * 4.0
-                mc_edge = max(mc["home_ev"], mc["away_ev"]) * 8.0
-                agree = 1.5 if ((ml_home > 0.5 and mc["home_cover_prob"] > 0.52) or
-                                (ml_home < 0.5 and mc["home_cover_prob"] < 0.48)) else 0.0
-                total_score = rule_score + ml_edge + mc_edge + agree
-                if mc["home_ev"] > 0.03 and ml_home > 0.53:
-                    rec = "Home ATS"
-                elif mc["away_ev"] > 0.03 and ml_home < 0.47:
-                    rec = "Away ATS"
-                elif mc["over_prob"] > 0.56:
-                    rec = "Over"
-                elif mc["under_prob"] > 0.56:
-                    rec = "Under"
+                p_home_cover = float(0.45 * ml_home + 0.55 * mc["home_cover_prob"])
+                p_home_cover = max(0.05, min(0.95, p_home_cover))
+                p_away_cover = 1.0 - p_home_cover
+                p_over = float(mc["over_prob"])
+                p_under = float(mc["under_prob"])
+                agree = 1.5 if (
+                    (ml_home >= 0.52 and mc["home_cover_prob"] >= 0.52)
+                    or (ml_home <= 0.48 and mc["home_cover_prob"] <= 0.48)
+                ) else 0.0
+                ats_side = "Home ATS" if p_home_cover >= p_away_cover else "Away ATS"
+                ats_prob = max(p_home_cover, p_away_cover)
+                tot_side = "Over" if p_over >= p_under else "Under"
+                tot_prob = max(p_over, p_under)
+                ats_edge, tot_edge = ats_prob - 0.5, tot_prob - 0.5
+                MIN_EDGE = 0.02
+                if ats_edge >= MIN_EDGE and ats_edge >= tot_edge:
+                    rec, side_prob = ats_side, ats_prob
+                elif tot_edge >= MIN_EDGE:
+                    rec, side_prob = tot_side, tot_prob
                 else:
-                    rec = "No strong lean"
+                    rec, side_prob = "No strong lean", max(ats_prob, tot_prob)
+                context_bonus = min(3.0, float(rule_score) * 0.18)
+                total_score = (float(side_prob) - 0.5) * 100.0 + context_bonus
+                if agree > 0 and rec in ("Home ATS", "Away ATS"):
+                    total_score += 1.0
                 odds_ev = g.get("odds_event")
-                model_home = 0.5 * ml_home + 0.5 * mc["home_cover_prob"]
+                model_home = p_home_cover
                 mkt_home = market_home_win_prob(odds_ev, home_full, away_full, avg_spread)
                 edge_home = compute_edge(model_home, mkt_home)
                 if rec == "Away ATS":
-                    edge_pct = compute_edge(1.0 - model_home, (1.0 - mkt_home) if mkt_home is not None else None)
+                    edge_pct = compute_edge(p_away_cover, (1.0 - mkt_home) if mkt_home is not None else None)
+                elif rec == "Home ATS":
+                    edge_pct = edge_home
                 elif rec == "Over":
-                    edge_pct = (mc["over_prob"] - 0.5) * 100.0
+                    edge_pct = (p_over - 0.5) * 100.0
                 elif rec == "Under":
-                    edge_pct = (mc["under_prob"] - 0.5) * 100.0
+                    edge_pct = (p_under - 0.5) * 100.0
                 else:
                     edge_pct = edge_home
-                conf = confidence_grade(rec, total_score, ml_home, mc, edge_pct, len(signals), agree)
+                conf = confidence_grade(
+                    rec, total_score, ml_home, mc, edge_pct, len(signals), agree, side_prob=side_prob
+                )
                 row_out = {
                     "Week": week,
                     "Game": f"{away_full} @ {home_full}",
@@ -4403,40 +4385,72 @@ with tab2:
                     pace_adj=pace_adj,
                     form_margin_adj=form_margin_adj
                 )
-                ml_edge = abs(ml_home - 0.5) * 4.0
-                mc_edge = max(mc["home_ev"], mc["away_ev"]) * 8.0
-                agree = 1.5 if ((ml_home > 0.5 and mc["home_cover_prob"] > 0.52) or
-                                (ml_home < 0.5 and mc["home_cover_prob"] < 0.48)) else 0.0
-                total_score = rule_score + ml_edge + mc_edge + agree
-                if mc["home_ev"] > 0.03 and ml_home > 0.53:
-                    rec = "Home ATS"
-                elif mc["away_ev"] > 0.03 and ml_home < 0.47:
-                    rec = "Away ATS"
-                elif mc["over_prob"] > 0.56:
-                    rec = "Over"
-                elif mc["under_prob"] > 0.56:
-                    rec = "Under"
-                else:
-                    rec = "No strong lean"
+                # ---- Probability-first lean (cover + total) ----
+                # Blend historical model + simulation for P(home covers the spread)
+                p_home_cover = float(0.45 * ml_home + 0.55 * mc["home_cover_prob"])
+                p_home_cover = max(0.05, min(0.95, p_home_cover))
+                p_away_cover = 1.0 - p_home_cover
+                p_over = float(mc["over_prob"])
+                p_under = float(mc["under_prob"])
 
-                # Market edge: blend ML + MC home cover/win vs market implied
+                # Model / sim agreement on ATS side
+                agree = 1.5 if (
+                    (ml_home >= 0.52 and mc["home_cover_prob"] >= 0.52)
+                    or (ml_home <= 0.48 and mc["home_cover_prob"] <= 0.48)
+                ) else 0.0
+
+                ats_side = "Home ATS" if p_home_cover >= p_away_cover else "Away ATS"
+                ats_prob = max(p_home_cover, p_away_cover)
+                ats_edge = ats_prob - 0.5
+
+                tot_side = "Over" if p_over >= p_under else "Under"
+                tot_prob = max(p_over, p_under)
+                tot_edge = tot_prob - 0.5
+
+                # Both markets always scored; primary rec = stronger edge (for POTD / locks)
+                MIN_EDGE = 0.02
+                context_bonus = min(3.0, float(rule_score) * 0.18)
+
+                spread_rec = ats_side if ats_edge >= MIN_EDGE else "No strong lean"
+                total_rec = tot_side if tot_edge >= MIN_EDGE else "No strong lean"
+
+                spread_score = (float(ats_prob) - 0.5) * 100.0 + context_bonus * 0.5
+                if agree > 0 and spread_rec in ("Home ATS", "Away ATS"):
+                    spread_score += 1.0
+                total_mkt_score = (float(tot_prob) - 0.5) * 100.0 + context_bonus * 0.5
+
+                if ats_edge >= MIN_EDGE and ats_edge >= tot_edge:
+                    rec, side_prob, total_score = spread_rec, ats_prob, spread_score
+                elif tot_edge >= MIN_EDGE:
+                    rec, side_prob, total_score = total_rec, tot_prob, total_mkt_score
+                else:
+                    rec, side_prob = "No strong lean", max(ats_prob, tot_prob)
+                    total_score = (float(side_prob) - 0.5) * 100.0 + context_bonus * 0.5
+
+                signals.append(
+                    f"P(cover): Home {p_home_cover*100:.0f}% / Away {p_away_cover*100:.0f}%"
+                )
+                signals.append(
+                    f"P(total): Over {p_over*100:.0f}% / Under {p_under*100:.0f}%"
+                )
+
+                # Market edge: blend vs market implied (ATS) or vs 50% (totals)
                 odds_ev = g.get("odds_event")
-                model_home = 0.5 * ml_home + 0.5 * mc["home_cover_prob"]
+                model_home = p_home_cover
                 mkt_home = market_home_win_prob(odds_ev, home_full, away_full, avg_spread)
                 edge_home = compute_edge(model_home, mkt_home)
-                # Side edge aligned to recommendation
                 if rec == "Away ATS":
-                    model_side = 1.0 - model_home
+                    model_side = p_away_cover
                     mkt_side = (1.0 - mkt_home) if mkt_home is not None else None
                     edge_pct = compute_edge(model_side, mkt_side)
-                elif rec in ("Over", "Under"):
-                    # totals edge vs 50/50 market baseline adjusted by under bias already in MC
-                    if rec == "Over":
-                        edge_pct = (mc["over_prob"] - 0.5) * 100.0
-                    else:
-                        edge_pct = (mc["under_prob"] - 0.5) * 100.0
-                else:
+                elif rec == "Home ATS":
                     edge_pct = edge_home
+                elif rec == "Over":
+                    edge_pct = (p_over - 0.5) * 100.0
+                elif rec == "Under":
+                    edge_pct = (p_under - 0.5) * 100.0
+                else:
+                    edge_pct = edge_home if ats_edge >= tot_edge else (tot_edge * 100.0)
 
                 if roof in ("dome", "closed"):
                     wx_str = "Dome"
@@ -4491,8 +4505,26 @@ with tab2:
                     "MC Over %": f"{mc['over_prob']*100:.1f}%",
                     "Recommendation": rec,
                     "Confidence": confidence_grade(
-                        rec, total_score, ml_home, mc, edge_pct, len(signals), agree
+                        rec, total_score, ml_home, mc, edge_pct, len(signals), agree,
+                        side_prob=side_prob,
                     ),
+                    "Spread Rec": spread_rec,
+                    "Spread Conf": confidence_grade(
+                        spread_rec, spread_score, ml_home, mc, edge_pct, len(signals), agree,
+                        side_prob=ats_prob,
+                    ),
+                    "Spread Score": round(float(spread_score), 2),
+                    "P Home Cover": f"{p_home_cover*100:.1f}%",
+                    "P Away Cover": f"{p_away_cover*100:.1f}%",
+                    "Total Rec": total_rec,
+                    "Total Conf": confidence_grade(
+                        total_rec, total_mkt_score, ml_home, mc,
+                        (tot_prob - 0.5) * 100.0, len(signals), 0.0,
+                        side_prob=tot_prob,
+                    ),
+                    "Total Score": round(float(total_mkt_score), 2),
+                    "P Over": f"{p_over*100:.1f}%",
+                    "P Under": f"{p_under*100:.1f}%",
                     "Signals": " • ".join(signals) if signals else "—",
                     "Score": round(total_score, 2),
                     # hidden numeric helpers for tracker
@@ -4620,18 +4652,37 @@ with tab2:
         )
 
         display_df = filtered.copy()
-        if "Recommendation" in display_df.columns:
-            display_df["Recommendation"] = (
-                display_df["Recommendation"].astype(str)
-            )
-        display_cols = [
-            "Week", "Game", "Kickoff", "Recommendation", "Confidence",
-            "Score", "Spread", "Total", "Home Imp", "Away Imp",
-            "EPA Edge", "Form Δ", "Pace", "TZ Diff", "Div",
-            "Model %", "Market %", "Edge %", "Signals",
+
+        st.markdown("#### Spread recommendations")
+        st.caption("Every game: estimated cover probabilities and ATS lean (Home/Away ATS).")
+        spread_cols = [
+            "Week", "Game", "Kickoff", "Spread Rec", "Spread Conf", "Spread Score",
+            "Spread", "P Home Cover", "P Away Cover", "Model %", "Market %", "Edge %",
+            "EPA Edge", "Form Δ", "TZ Diff", "Signals",
         ]
-        cols = [c for c in display_cols if c in display_df.columns]
-        st.dataframe(display_df[cols], use_container_width=True, hide_index=True)
+        spread_cols = [c for c in spread_cols if c in display_df.columns]
+        if spread_cols:
+            spread_view = display_df.copy()
+            if "Spread Score" in spread_view.columns:
+                spread_view = spread_view.sort_values("Spread Score", ascending=False)
+            st.dataframe(spread_view[spread_cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("Spread columns not available — refresh the board.")
+
+        st.markdown("#### Total recommendations")
+        st.caption("Every game: estimated over/under probabilities and total lean.")
+        total_cols = [
+            "Week", "Game", "Kickoff", "Total Rec", "Total Conf", "Total Score",
+            "Total", "P Over", "P Under", "MC Over %", "Pace", "Weather", "Signals",
+        ]
+        total_cols = [c for c in total_cols if c in display_df.columns]
+        if total_cols:
+            total_view = display_df.copy()
+            if "Total Score" in total_view.columns:
+                total_view = total_view.sort_values("Total Score", ascending=False)
+            st.dataframe(total_view[total_cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("Total columns not available — refresh the board.")
 
         st.markdown("#### Top Plays of The Week")
         st.caption("Top 5 by highest Score, then highest Confidence (A → F).")
@@ -5366,31 +5417,32 @@ with tab8:
     st.markdown("### Lean (recommendation)")
     st.markdown(
         """
-Leans are assigned in this order (first match wins):
+The board estimates **probabilities**, then posts the stronger lean:
 
-1. **Home ATS** — Monte Carlo home EV > 0.03 **and** logistic model P(home covers) > 0.53
-2. **Away ATS** — away EV > 0.03 **and** model P(home covers) < 0.47
-3. **Over** — simulated over probability > 0.56
-4. **Under** — simulated under probability > 0.56
-5. **No strong lean** — none of the above
+1. **P(home covers)** = 45% historical model + 55% Monte Carlo simulation
+2. **P(away covers)** = 1 − P(home covers)
+3. **P(over) / P(under)** from the same simulation (weather and pace already applied)
 
-ATS leans require **both** positive simulated EV at −110 **and** model confidence past those thresholds. Totals only require the Monte Carlo probability gate.
+**Primary recommendation** = whichever market (spread or total) has the larger edge past 50%, if that edge is at least **2 percentage points** (about 52%+):
+
+- Stronger ATS edge → **Home ATS** or **Away ATS**
+- Stronger totals edge → **Over** or **Under**
+- Both near coin-flip → **No strong lean**
+
+Each row also lists both cover and total probabilities in **Signals**. Heuristic signals (EPA, form, travel, etc.) are context only — they no longer decide the lean by themselves.
         """
     )
 
     st.markdown("### Score")
     st.markdown(
-        r"""
-\[
-\textbf{Score} = \text{rule\_score} + \text{ml\_edge} + \text{mc\_edge} + \text{agree}
-\]
+        """
+**Score ≈ 100 × (P_side − 0.5) + small context bonus**
 
-- **rule_score** — sum of heuristic signal points (EPA edge, rest, form, weather, implied totals, pace, travel, divisional, **success/explosive rates**, **team O/U tendency vs market total**, **rest×travel×primetime**). Form and rest use **current season only** (Week 1 rest advantage is forced to 0). EPA/form are **shrunk toward league mean** early season (small samples).
-- **ml_edge** — \(|P_{\text{model}}(\text{home covers}) - 0.5| \times 4\)
-- **mc_edge** — \(\max(\text{home EV},\ \text{away EV}) \times 8\) from Monte Carlo at −110 prices
-- **agree** — +1.5 when the logistic model and Monte Carlo lean the same side
+- **P_side** — estimated probability of the recommended side (cover or over/under)
+- **Context bonus** — small uplift from supporting signals (capped)
+- Optional **+1** when model and simulation agree on an ATS lean
 
-Higher Score means more independent support and stronger model/MC agreement — it is **not** a calibrated win probability.
+Example: ~58% side probability → Score near **8**; ~65% → near **15** before bonuses. Score ranks probability edge; it is not a guarantee.
         """
     )
 
