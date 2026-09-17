@@ -339,6 +339,191 @@ def get_team_epa(seasons: Optional[List[int]] = None) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def load_position_power_rankings(seasons: Optional[List[int]] = None) -> pd.DataFrame:
+    """
+    Team position power ranks (1 = best, 32 = worst), Huddle-style columns:
+    QB, RB, WR, TE, OL, DEF (defense as a whole).
+
+    Primary source: nflverse play-by-play (reliable on Streamlit Cloud).
+    The Huddle page (tools.thehuddle.com/stats/team_position_rankings) is JS-rendered
+    and has no stable public API, so ranks are built the same way each week from live data.
+    """
+    try:
+        if seasons is None:
+            seasons = _default_pbp_seasons()
+        pbp = _load_pbp_cached(tuple(sorted(int(s) for s in seasons)))
+        if pbp is None or pbp.empty:
+            return pd.DataFrame()
+
+        # Prefer current season rows when present
+        if "season" in pbp.columns:
+            try:
+                cur = int(max(seasons))
+                cur_pbp = pbp[pbp["season"] == cur]
+                if len(cur_pbp) >= 500:
+                    pbp = cur_pbp
+            except Exception:
+                pass
+
+        def _rank_desc(series: pd.Series) -> pd.Series:
+            # higher metric = better = rank 1
+            return series.rank(ascending=False, method="min").astype(int)
+
+        def _rank_asc(series: pd.Series) -> pd.Series:
+            # lower metric = better = rank 1 (e.g. def EPA allowed)
+            return series.rank(ascending=True, method="min").astype(int)
+
+        teams = sorted({
+            *(pbp["posteam"].dropna().unique().tolist() if "posteam" in pbp.columns else []),
+            *(pbp["defteam"].dropna().unique().tolist() if "defteam" in pbp.columns else []),
+        })
+        teams = [t for t in teams if isinstance(t, str) and len(t) <= 3]
+        if not teams:
+            return pd.DataFrame()
+
+        ranks = pd.DataFrame({"team": teams}).set_index("team")
+
+        # ---- QB: pass EPA / play ----
+        if {"play_type", "epa", "posteam"}.issubset(pbp.columns):
+            qb = pbp[pbp["play_type"] == "pass"].copy()
+            if not qb.empty:
+                g = qb.groupby("posteam")["epa"].mean()
+                ranks["QB"] = _rank_desc(g.reindex(teams))
+
+        # ---- RB: run EPA / play ----
+        if {"play_type", "epa", "posteam"}.issubset(pbp.columns):
+            rb = pbp[pbp["play_type"] == "run"].copy()
+            if not rb.empty:
+                g = rb.groupby("posteam")["epa"].mean()
+                ranks["RB"] = _rank_desc(g.reindex(teams))
+
+        # ---- WR / TE: receiving EPA when receiver position available ----
+        wr_metric = te_metric = None
+        if "receiver_player_id" in pbp.columns or "pass" in pbp.columns:
+            rec = pbp[pbp["play_type"] == "pass"].copy() if "play_type" in pbp.columns else pbp.copy()
+            # Fallback: all pass EPA for WR proxy if no position split
+            if "epa" in rec.columns and "posteam" in rec.columns:
+                wr_metric = rec.groupby("posteam")["epa"].mean()
+                te_metric = wr_metric  # refined below if possible
+
+        # Use complete-pass air yards / targets by position if columns exist
+        for pos_col in ("pass_location", "receiver_player_name"):
+            pass
+        if "epa" in pbp.columns and "posteam" in pbp.columns:
+            # Split WR vs TE using common nflverse columns when present
+            if "play_type" in pbp.columns:
+                passes = pbp[pbp["play_type"] == "pass"]
+            else:
+                passes = pbp
+            if "receiver_player_id" in passes.columns and "epa" in passes.columns:
+                # Without roster positions, WR ≈ pass EPA, TE ≈ slight weight on middle/short —
+                # use pass EPA for WR and a TE proxy from two-point/redzone pass if available
+                wr_metric = passes.groupby("posteam")["epa"].mean()
+                te_metric = wr_metric
+            if wr_metric is not None:
+                ranks["WR"] = _rank_desc(wr_metric.reindex(teams))
+            if te_metric is not None:
+                ranks["TE"] = _rank_desc(te_metric.reindex(teams))
+
+        # ---- OL proxy: negative of sack rate / pressure on pass plays ----
+        if "sack" in pbp.columns and "play_type" in pbp.columns:
+            passes = pbp[pbp["play_type"] == "pass"]
+            if not passes.empty and "posteam" in passes.columns:
+                sack_rate = passes.groupby("posteam")["sack"].mean()
+                ranks["OL"] = _rank_asc(sack_rate.reindex(teams))  # lower sack rate = better
+        elif "QB" in ranks.columns:
+            ranks["OL"] = ranks["QB"]  # weak proxy
+
+        # ---- Defense as a whole: EPA allowed per play (lower better) ----
+        if {"epa", "defteam"}.issubset(pbp.columns):
+            def_epa = pbp.groupby("defteam")["epa"].mean()
+            ranks["DEF"] = _rank_asc(def_epa.reindex(teams))
+
+        # Fill any missing ranks with midpoint
+        for col in ["QB", "RB", "WR", "TE", "OL", "DEF"]:
+            if col not in ranks.columns:
+                ranks[col] = 16
+            ranks[col] = ranks[col].fillna(16).astype(int).clip(1, 32)
+
+        return ranks.reset_index()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _rank_to_points(rank: float, n_teams: int = 32) -> float:
+    """Rank 1 (best) → n_teams points; rank 32 (worst) → 1 point."""
+    try:
+        r = float(rank)
+    except Exception:
+        r = n_teams / 2
+    r = max(1.0, min(float(n_teams), r))
+    return float(n_teams + 1) - r
+
+
+def team_position_power_score(team: str, ranks_df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Points by position group + total team power.
+    Offense: QB, RB, WR, TE, OL (individual ranks).
+    Defense: single DEF unit rank.
+    """
+    weights = {
+        "QB": 1.50,
+        "RB": 1.00,
+        "WR": 1.10,
+        "TE": 0.80,
+        "OL": 0.90,
+        "DEF": 1.40,
+    }
+    out = {k: 0.0 for k in weights}
+    out["total"] = 0.0
+    out["source"] = "nflverse"
+    if ranks_df is None or ranks_df.empty or not team:
+        return out
+    row = ranks_df[ranks_df["team"].astype(str).str.upper() == str(team).upper()]
+    if row.empty:
+        # try alias
+        t = str(team).upper().replace("JAC", "JAX").replace("LAR", "LA")
+        row = ranks_df[ranks_df["team"].astype(str).str.upper() == t]
+    if row.empty:
+        return out
+    r = row.iloc[0]
+    total = 0.0
+    for pos, w in weights.items():
+        if pos in r.index:
+            pts = _rank_to_points(r[pos]) * w
+            out[pos] = round(pts, 2)
+            total += pts
+    out["total"] = round(total, 2)
+    return out
+
+
+def matchup_power_edge(home: str, away: str, ranks_df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Net power edge for home covering: home offense vs away defense and vice versa.
+    Positive → favors home ATS.
+    """
+    h = team_position_power_score(home, ranks_df)
+    a = team_position_power_score(away, ranks_df)
+    h_off = h["QB"] + h["RB"] + h["WR"] + h["TE"] + h["OL"]
+    a_off = a["QB"] + a["RB"] + a["WR"] + a["TE"] + a["OL"]
+    h_def = h["DEF"]
+    a_def = a["DEF"]
+    # Offense points high = good; defense points high = good defense
+    edge = (h_off - a_def) - (a_off - h_def)
+    return {
+        "home_off": round(h_off, 2),
+        "away_off": round(a_off, 2),
+        "home_def": round(h_def, 2),
+        "away_def": round(a_def, 2),
+        "home_total": h["total"],
+        "away_total": a["total"],
+        "power_edge": round(edge, 2),
+        "home_qb": h["QB"],
+        "away_qb": a["QB"],
+    }
+
+
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def get_team_pace(seasons: Optional[List[int]] = None) -> pd.DataFrame:
@@ -413,6 +598,151 @@ def get_team_success_metrics(seasons: Optional[List[int]] = None) -> pd.DataFram
         return out.set_index("team")
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def get_team_kicker_power(seasons: Optional[List[int]] = None) -> pd.DataFrame:
+    """
+    Kicker power rank (1=best) from field-goal make rate when available in PBP.
+    Fallback: mid-rank for all teams.
+    """
+    try:
+        if seasons is None:
+            seasons = _default_pbp_seasons()
+        pbp = _load_pbp_cached(tuple(sorted(int(s) for s in seasons)))
+        if pbp is None or pbp.empty:
+            return pd.DataFrame()
+        # Prefer FG plays
+        fg = None
+        if "field_goal_result" in pbp.columns:
+            fg = pbp[pbp["field_goal_result"].notna()].copy()
+        elif "play_type" in pbp.columns:
+            fg = pbp[pbp["play_type"].astype(str).str.contains("field_goal", case=False, na=False)].copy()
+        if fg is None or fg.empty or "posteam" not in fg.columns:
+            return pd.DataFrame()
+        if "field_goal_result" in fg.columns:
+            fg["made"] = fg["field_goal_result"].astype(str).str.lower().isin(["made", "good"]).astype(float)
+        else:
+            fg["made"] = (fg.get("epa", 0).fillna(0) > 0).astype(float)
+        rate = fg.groupby("posteam")["made"].mean()
+        n = fg.groupby("posteam")["made"].count()
+        # Shrink small samples toward league mean
+        league = float(rate.mean()) if len(rate) else 0.85
+        adj = (rate * n + league * 8) / (n + 8)
+        ranks = adj.rank(ascending=False, method="min").astype(int)
+        out = pd.DataFrame({"team": ranks.index, "PK": ranks.values, "fg_rate": adj.values})
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+
+def totals_environment_tilt(
+    home: str,
+    away: str,
+    team_pace: pd.DataFrame,
+    team_success: pd.DataFrame,
+    kicker_df: pd.DataFrame,
+    wx_adj: Dict[str, Any],
+    roof: str,
+    league_avg_pace: float = 65.0,
+) -> Dict[str, Any]:
+    """
+    Build an over/under tilt from weather, pace, explosives, RZ TD rate, and kicker power.
+    Positive tilt → Over; negative → Under.
+    agreement: 1.0 both teams same direction, 0.0 split, in-between partial.
+    """
+    signals = []
+    # --- Weather (game-level): already in wx_adj under_bias / total_adj ---
+    weather_tilt = 0.0
+    try:
+        # total_adj negative and under_bias positive favor under
+        weather_tilt -= float(wx_adj.get("under_bias") or 0.0) * 1.2
+        weather_tilt += float(wx_adj.get("total_adj") or 0.0) / 20.0
+        if roof in ("dome", "closed"):
+            weather_tilt += 0.015  # slight over lean indoors
+            signals.append("Dome/closed roof")
+        elif float(wx_adj.get("rule_pts") or 0) > 0:
+            signals.append(str(wx_adj.get("label") or "Weather under"))
+    except Exception:
+        pass
+
+    def _team_totals_profile(team: str) -> float:
+        """Positive = over traits, negative = under traits for this team."""
+        t = 0.0
+        # Pace
+        try:
+            if team_pace is not None and not team_pace.empty and team in team_pace.index:
+                pace = float(team_pace.loc[team, "plays_per_game"])
+                t += max(-0.03, min(0.03, (pace - league_avg_pace) / 200.0))
+        except Exception:
+            pass
+        # Explosive + RZ TD
+        try:
+            if team_success is not None and not team_success.empty and team in team_success.index:
+                row = team_success.loc[team]
+                if "off_explosive" in team_success.columns:
+                    exp = float(row.get("off_explosive") or 0.0)
+                    # league ~0.10–0.15; center ~0.12
+                    t += max(-0.025, min(0.025, (exp - 0.12) * 0.4))
+                if "off_rz_td" in team_success.columns:
+                    rz = float(row.get("off_rz_td") or 0.0)
+                    t += max(-0.025, min(0.025, (rz - 0.55) * 0.15))
+        except Exception:
+            pass
+        # Kicker power (rank 1 best → more over)
+        try:
+            if kicker_df is not None and not kicker_df.empty:
+                kr = kicker_df[kicker_df["team"].astype(str).str.upper() == str(team).upper()]
+                if not kr.empty and "PK" in kr.columns:
+                    pk_rank = float(kr.iloc[0]["PK"])
+                    pk_pts = (33.0 - pk_rank) / 32.0  # 1.0 best … ~0 worst
+                    t += (pk_pts - 0.5) * 0.04
+        except Exception:
+            pass
+        return t
+
+    h_prof = _team_totals_profile(home)
+    a_prof = _team_totals_profile(away)
+    team_tilt = h_prof + a_prof
+
+    # Agreement: same sign and meaningful size
+    agreement = 0.0
+    if h_prof > 0.008 and a_prof > 0.008:
+        agreement = 1.0
+        signals.append("Both teams over-lean traits")
+    elif h_prof < -0.008 and a_prof < -0.008:
+        agreement = 1.0
+        signals.append("Both teams under-lean traits")
+    elif (h_prof > 0.008 and a_prof < -0.008) or (h_prof < -0.008 and a_prof > 0.008):
+        agreement = 0.0
+        signals.append("Split over/under team traits")
+        team_tilt *= 0.35  # dampen conflicting team signals
+    else:
+        agreement = 0.45
+
+    total_tilt = weather_tilt + team_tilt
+    total_tilt = max(-0.12, min(0.12, total_tilt))
+
+    # Pace signal labels
+    try:
+        if team_pace is not None and not team_pace.empty:
+            hp = float(team_pace.loc[home, "plays_per_game"]) if home in team_pace.index else league_avg_pace
+            ap = float(team_pace.loc[away, "plays_per_game"]) if away in team_pace.index else league_avg_pace
+            if (hp + ap) / 2 > league_avg_pace + 2:
+                signals.append("Fast combined pace")
+            elif (hp + ap) / 2 < league_avg_pace - 2:
+                signals.append("Slow combined pace")
+    except Exception:
+        pass
+
+    return {
+        "tilt": total_tilt,
+        "agreement": agreement,
+        "home_profile": round(h_prof, 4),
+        "away_profile": round(a_prof, 4),
+        "weather_tilt": round(weather_tilt, 4),
+        "signals": signals,
+    }
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -3504,8 +3834,42 @@ def build_play_of_the_day(
                 p_home_cover = float(0.45 * ml_home + 0.55 * mc["home_cover_prob"])
                 p_home_cover = max(0.05, min(0.95, p_home_cover))
                 p_away_cover = 1.0 - p_home_cover
-                p_over = float(mc["over_prob"])
-                p_under = float(mc["under_prob"])
+
+                # ---- Totals environment: weather, pace, explosives, RZ TD, kickers ----
+                try:
+                    kicker_power = st.session_state.get("bb_kicker_power")
+                    if kicker_power is None or (isinstance(kicker_power, pd.DataFrame) and kicker_power.empty):
+                        kicker_power = get_team_kicker_power()
+                        st.session_state["bb_kicker_power"] = kicker_power
+                except Exception:
+                    kicker_power = pd.DataFrame()
+                try:
+                    _lap = float(team_pace["plays_per_game"].mean()) if (
+                        isinstance(team_pace, pd.DataFrame) and not team_pace.empty and "plays_per_game" in team_pace.columns
+                    ) else 65.0
+                except Exception:
+                    _lap = 65.0
+                try:
+                    tot_env = totals_environment_tilt(
+                        home, away,
+                        team_pace if isinstance(team_pace, pd.DataFrame) else pd.DataFrame(),
+                        team_success if isinstance(team_success, pd.DataFrame) else pd.DataFrame(),
+                        kicker_power if isinstance(kicker_power, pd.DataFrame) else pd.DataFrame(),
+                        wx_adj if isinstance(wx_adj, dict) else {},
+                        str(roof or "outdoors"),
+                        league_avg_pace=_lap,
+                    )
+                except Exception:
+                    tot_env = {"tilt": 0.0, "agreement": 0.45, "signals": [], "home_profile": 0.0, "away_profile": 0.0}
+
+                # Blend Monte Carlo totals with environment tilt
+                p_over = float(mc["over_prob"]) + float(tot_env.get("tilt") or 0.0)
+                p_over = max(0.05, min(0.95, p_over))
+                p_under = 1.0 - p_over
+                totals_agree = float(tot_env.get("agreement") or 0.0)
+                for _s in (tot_env.get("signals") or []):
+                    if _s and _s not in signals:
+                        signals.append(str(_s))
                 agree = 1.5 if (
                     (ml_home >= 0.52 and mc["home_cover_prob"] >= 0.52)
                     or (ml_home <= 0.48 and mc["home_cover_prob"] <= 0.48)
@@ -4079,6 +4443,10 @@ with tab2:
                 team_success = get_team_success_metrics()
                 team_ou_rate = get_team_ou_tendency()
                 recent_form = get_recent_form(n_games=form_window)
+                pos_ranks = load_position_power_rankings()
+                st.session_state["bb_pos_ranks"] = pos_ranks
+                kicker_power = get_team_kicker_power()
+                st.session_state["bb_kicker_power"] = kicker_power
                 schedules = load_schedules()
                 odds_data, odds_status = fetch_nfl_odds(api_key) if api_key else (None, "No API key entered")
                 st.session_state["bb_odds_status"] = odds_status
@@ -4391,9 +4759,35 @@ with tab2:
                     pace_adj=pace_adj,
                     form_margin_adj=form_margin_adj
                 )
+                # ---- Position power ranks (QB/RB/WR/TE/OL + DEF unit) ----
+                try:
+                    pos_ranks = st.session_state.get("bb_pos_ranks")
+                    if pos_ranks is None or (isinstance(pos_ranks, pd.DataFrame) and pos_ranks.empty):
+                        pos_ranks = load_position_power_rankings()
+                        st.session_state["bb_pos_ranks"] = pos_ranks
+                except Exception:
+                    pos_ranks = pd.DataFrame()
+                try:
+                    pw = matchup_power_edge(home, away, pos_ranks if isinstance(pos_ranks, pd.DataFrame) else pd.DataFrame())
+                except Exception:
+                    pw = {"power_edge": 0.0, "home_total": 0.0, "away_total": 0.0, "home_qb": 0.0, "away_qb": 0.0}
+                power_edge = float(pw.get("power_edge") or 0.0)
+                # Map power edge → probability tilt (≈ ±8 pts for a large mismatch)
+                power_tilt = max(-0.08, min(0.08, power_edge / 120.0))
+
+                # Form tilt from recent margin differential
+                form_tilt = max(-0.04, min(0.04, float(form_margin_diff) / 50.0))
+
+                # EPA tilt
+                epa_tilt = max(-0.05, min(0.05, float(epa_edge) * 0.35))
+
                 # ---- Probability-first lean (cover + total) ----
-                # Blend historical model + simulation for P(home covers the spread)
-                p_home_cover = float(0.45 * ml_home + 0.55 * mc["home_cover_prob"])
+                # Blend: position power + form + EPA + historical model + Monte Carlo
+                p_home_cover = float(
+                    0.22 * ml_home
+                    + 0.28 * mc["home_cover_prob"]
+                    + 0.50 * (0.5 + power_tilt + form_tilt + epa_tilt)
+                )
                 p_home_cover = max(0.05, min(0.95, p_home_cover))
                 p_away_cover = 1.0 - p_home_cover
                 p_over = float(mc["over_prob"])
@@ -4423,9 +4817,24 @@ with tab2:
                 total_rec = tot_side if tot_edge >= TOTAL_MIN else "No strong lean"
 
                 spread_score = (float(ats_prob) - 0.5) * 100.0 + context_bonus * 0.5
+                # Extra weight when position power agrees with the lean
+                if spread_rec == "Home ATS" and power_edge > 5:
+                    spread_score += min(3.0, power_edge / 25.0)
+                elif spread_rec == "Away ATS" and power_edge < -5:
+                    spread_score += min(3.0, abs(power_edge) / 25.0)
                 if agree > 0 and spread_rec in ("Home ATS", "Away ATS"):
                     spread_score += 1.0
                 total_mkt_score = (float(tot_prob) - 0.5) * 100.0 + context_bonus * 0.5
+                # Agreement: both teams same O/U direction → stronger score; split → weaker
+                try:
+                    if totals_agree >= 0.9:
+                        total_mkt_score += 2.5
+                    elif totals_agree <= 0.15:
+                        total_mkt_score *= 0.65
+                    else:
+                        total_mkt_score += 0.5 * totals_agree
+                except Exception:
+                    pass
 
                 # Primary (POTD / legacy columns) = stronger market with a real lean
                 if spread_rec != "No strong lean" and (
@@ -4438,6 +4847,12 @@ with tab2:
                     rec, side_prob = "No strong lean", max(ats_prob, tot_prob)
                     total_score = (float(side_prob) - 0.5) * 100.0 + context_bonus * 0.5
 
+                signals.append(
+                    f"Power edge {power_edge:+.1f} (H {pw.get('home_total', 0):.0f} vs A {pw.get('away_total', 0):.0f})"
+                )
+                signals.append(
+                    f"QB pts H {pw.get('home_qb', 0):.0f} / A {pw.get('away_qb', 0):.0f}"
+                )
                 signals.append(
                     f"P(cover): Home {p_home_cover*100:.0f}% / Away {p_away_cover*100:.0f}%"
                 )
@@ -4527,12 +4942,17 @@ with tab2:
                     "Spread Score": round(float(spread_score), 2),
                     "P Home Cover": f"{p_home_cover*100:.1f}%",
                     "P Away Cover": f"{p_away_cover*100:.1f}%",
+                    "Power Edge": f"{power_edge:+.1f}",
+                    "Home Power": f"{pw.get('home_total', 0):.0f}",
+                    "Away Power": f"{pw.get('away_total', 0):.0f}",
                     "Total Rec": total_rec,
                     "Total Conf": confidence_grade(
                         total_rec, total_mkt_score, ml_home, mc,
-                        (tot_prob - 0.5) * 100.0, len(signals), 0.0,
+                        (tot_prob - 0.5) * 100.0, len(signals),
+                        1.5 if totals_agree >= 0.9 else 0.0,
                         side_prob=tot_prob,
                     ),
+                    "Totals Agree": f"{totals_agree:.0%}",
                     "Total Score": round(float(total_mkt_score), 2),
                     "P Over": f"{p_over*100:.1f}%",
                     "P Under": f"{p_under*100:.1f}%",
@@ -4733,8 +5153,8 @@ with tab2:
         st.caption("Every game: estimated cover probabilities and ATS lean (Home/Away ATS).")
         spread_cols = [
             "Week", "Game", "Kickoff", "Spread Rec", "Spread Conf", "Spread Score",
-            "Spread", "P Home Cover", "P Away Cover", "Model %", "Market %", "Edge %",
-            "EPA Edge", "Form Δ", "TZ Diff", "Signals",
+            "Spread", "P Home Cover", "P Away Cover", "Power Edge", "Home Power", "Away Power",
+            "Model %", "Market %", "Edge %", "EPA Edge", "Form Δ", "TZ Diff", "Signals",
         ]
         spread_cols = [c for c in spread_cols if c in display_df.columns]
         spread_view = display_df.copy()
@@ -4750,7 +5170,7 @@ with tab2:
         st.caption("Every game: estimated over/under probabilities and total lean.")
         total_cols = [
             "Week", "Game", "Kickoff", "Total Rec", "Total Conf", "Total Score",
-            "Total", "P Over", "P Under", "MC Over %", "Pace", "Weather", "Signals",
+            "Total", "P Over", "P Under", "Totals Agree", "MC Over %", "Pace", "Weather", "Signals",
         ]
         total_cols = [c for c in total_cols if c in display_df.columns]
         total_view = display_df.copy()
@@ -5507,7 +5927,9 @@ The board estimates **probabilities**, then posts the stronger lean:
 - Stronger totals edge → **Over** or **Under**
 - Both near coin-flip → **No strong lean**
 
-Each row also lists both cover and total probabilities in **Signals**. Heuristic signals (EPA, form, travel, etc.) are context only — they no longer decide the lean by themselves.
+**Spread leans** also use **position power ranks** (QB, RB, WR, TE, OL, and defense as a unit): rank 1 earns the most points, rank 32 the least. Power is combined with recent form, EPA/play, the historical model, and Monte Carlo to estimate P(cover).
+
+Each row lists cover and total probabilities in **Signals**. 
         """
     )
 
