@@ -4829,8 +4829,57 @@ with tab2:
                 )
                 p_home_cover = max(0.05, min(0.95, p_home_cover))
                 p_away_cover = 1.0 - p_home_cover
-                p_over = float(mc["over_prob"])
-                p_under = float(mc["under_prob"])
+
+                # Totals environment (weather, pace, explosives, RZ TD, kickers)
+                totals_agree = 0.45
+                try:
+                    kicker_power = st.session_state.get("bb_kicker_power")
+                    if kicker_power is None or (
+                        isinstance(kicker_power, pd.DataFrame) and kicker_power.empty
+                    ):
+                        kicker_power = get_team_kicker_power()
+                        st.session_state["bb_kicker_power"] = kicker_power
+                except Exception:
+                    kicker_power = pd.DataFrame()
+                try:
+                    _lap = float(team_pace["plays_per_game"].mean()) if (
+                        isinstance(team_pace, pd.DataFrame)
+                        and not team_pace.empty
+                        and "plays_per_game" in team_pace.columns
+                    ) else 65.0
+                except Exception:
+                    _lap = 65.0
+                try:
+                    tot_env = totals_environment_tilt(
+                        home,
+                        away,
+                        team_pace if isinstance(team_pace, pd.DataFrame) else pd.DataFrame(),
+                        team_success if isinstance(team_success, pd.DataFrame) else pd.DataFrame(),
+                        kicker_power if isinstance(kicker_power, pd.DataFrame) else pd.DataFrame(),
+                        wx_adj if isinstance(wx_adj, dict) else {},
+                        str(roof or "outdoors"),
+                        league_avg_pace=_lap,
+                    )
+                except Exception:
+                    tot_env = {
+                        "tilt": 0.0,
+                        "agreement": 0.45,
+                        "signals": [],
+                        "home_profile": 0.0,
+                        "away_profile": 0.0,
+                    }
+                try:
+                    p_over = float(mc["over_prob"]) + float(tot_env.get("tilt") or 0.0)
+                    p_over = max(0.05, min(0.95, p_over))
+                    p_under = 1.0 - p_over
+                    totals_agree = float(tot_env.get("agreement") or 0.45)
+                    for _s in (tot_env.get("signals") or []):
+                        if _s and _s not in signals:
+                            signals.append(str(_s))
+                except Exception:
+                    p_over = float(mc.get("over_prob") or 0.5)
+                    p_under = 1.0 - p_over
+                    totals_agree = 0.45
 
                 # Model / sim agreement on ATS side
                 agree = 1.5 if (
@@ -4846,8 +4895,6 @@ with tab2:
                 tot_prob = max(p_over, p_under)
                 tot_edge = tot_prob - 0.5
 
-                # Separate bars: spreads stay a bit stricter; totals post more often
-                # 51.5%+ for ATS, 50.8%+ for totals (simulation totals cluster near the line)
                 SPREAD_MIN = 0.015
                 TOTAL_MIN = 0.008
                 context_bonus = min(3.0, float(rule_score) * 0.18)
@@ -4856,7 +4903,6 @@ with tab2:
                 total_rec = tot_side if tot_edge >= TOTAL_MIN else "No strong lean"
 
                 spread_score = (float(ats_prob) - 0.5) * 100.0 + context_bonus * 0.5
-                # Extra weight when position power agrees with the lean
                 if spread_rec == "Home ATS" and power_edge > 5:
                     spread_score += min(3.0, power_edge / 25.0)
                 elif spread_rec == "Away ATS" and power_edge < -5:
@@ -4864,7 +4910,6 @@ with tab2:
                 if agree > 0 and spread_rec in ("Home ATS", "Away ATS"):
                     spread_score += 1.0
                 total_mkt_score = (float(tot_prob) - 0.5) * 100.0 + context_bonus * 0.5
-                # Agreement: both teams same O/U direction → stronger score; split → weaker
                 try:
                     if totals_agree >= 0.9:
                         total_mkt_score += 2.5
