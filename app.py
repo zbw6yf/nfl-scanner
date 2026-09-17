@@ -2885,15 +2885,40 @@ def make_weather_key(home: str, commence_raw: str) -> str:
     return f"{home}_{datetime.now().strftime('%Y-%m-%d')}"
 
 def build_weather_cache_from_games(games: List[Dict]) -> Dict[str, Dict]:
+    """Fetch weather only for current NFL week and the following week (saves API calls / time)."""
     cache = {}
     real_count = 0
     fallback_count = 0
     samples = []
     if not games:
         return cache
-    progress = st.progress(0, text="Fetching unique weather for each outdoor stadium...")
-    total = len(games)
-    for idx, g in enumerate(games):
+    try:
+        cur_wk = current_nfl_week()
+        cur_wk = int(cur_wk) if cur_wk is not None else None
+    except Exception:
+        cur_wk = None
+    allowed_weeks = None
+    if cur_wk is not None:
+        allowed_weeks = {cur_wk, cur_wk + 1}
+    games_wx = []
+    for g in games:
+        if allowed_weeks is None:
+            games_wx.append(g)
+            continue
+        try:
+            gw = g.get("week")
+            if gw is None:
+                games_wx.append(g)
+            elif int(gw) in allowed_weeks:
+                games_wx.append(g)
+        except Exception:
+            games_wx.append(g)
+    progress = st.progress(
+        0,
+        text=f"Fetching weather for week {cur_wk}–{cur_wk + 1 if cur_wk else '?'} outdoor stadiums...",
+    )
+    total = max(len(games_wx), 1)
+    for idx, g in enumerate(games_wx):
         try:
             home = g["home"]
             if not home or home not in STADIUM_COORDS:
@@ -4608,9 +4633,9 @@ with tab2:
         cols = [c for c in display_cols if c in display_df.columns]
         st.dataframe(display_df[cols], use_container_width=True, hide_index=True)
 
-        st.markdown("#### Top by week")
+        st.markdown("#### Top Plays of The Week")
+        st.caption("Top 5 by highest Score, then highest Confidence (A → F).")
         if available_weeks:
-            # default select current week
             cur_wk = current_nfl_week()
             default_lab = week_choices[1] if len(week_choices) > 1 else week_choices[0]
             if cur_wk is not None:
@@ -4618,7 +4643,7 @@ with tab2:
                 if lab in week_choices:
                     default_lab = lab
             selected_label = st.selectbox(
-                "Highlight week",
+                "Week",
                 options=[c for c in week_choices if c != "All weeks"] or week_choices,
                 index=max(0, ([c for c in week_choices if c != "All weeks"] or week_choices).index(default_lab)
                          if default_lab in ([c for c in week_choices if c != "All weeks"] or week_choices) else 0),
@@ -4626,8 +4651,17 @@ with tab2:
             )
             try:
                 wk = int(selected_label.replace("Week ", ""))
-                week_df = df[df["_Week_num"] == wk].sort_values("Score", ascending=False).head(10)
-                st.markdown(f"**{selected_label}** — top {len(week_df)} by Score")
+                _conf_rank = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
+                week_df = df[df["_Week_num"] == wk].copy()
+                week_df["_cr"] = (
+                    week_df["Confidence"].astype(str).str.upper().str[:1]
+                    .map(lambda x: _conf_rank.get(x, 9))
+                )
+                week_df = (
+                    week_df.sort_values(["Score", "_cr"], ascending=[False, True])
+                    .head(5)
+                )
+                st.markdown(f"**{selected_label}** — top {len(week_df)} plays")
                 st.dataframe(week_df[cols], use_container_width=True, hide_index=True)
             except Exception:
                 top5 = df.head(5)
