@@ -3397,8 +3397,10 @@ def monte_carlo_game(
     # Skill margin only (NO +HFA). Spread already embeds home field.
     skill_margin = (home_off - away_def - (away_off - home_def)) * 35.0 + float(form_margin_adj or 0.0)
     sim_margins = np.random.normal(skill_margin, 13.5 + float(noise_extra or 0.0), n_sims)
-    # Home spread convention: negative = home favored. Cover when margin > spread.
-    home_cover = float(np.mean(sim_margins > spr))
+    # Home line from books: negative = home favorite (e.g. -6.5), positive = home dog (+3.5).
+    # Home covers ATS when (home_margin + home_line) > 0  ⇒  margin > -home_line.
+    # Examples: home -3 → need margin > 3; home +6.5 → need margin > -6.5.
+    home_cover = float(np.mean(sim_margins > (-spr)))
 
     # Totals: start at market line; residual from efficiency / pace / weather only
     residual = (home_off + away_off - home_def - away_def) * 12.0 + float(total_adj or 0.0) + float(pace_adj or 0.0)
