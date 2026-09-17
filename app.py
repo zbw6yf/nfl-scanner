@@ -3740,8 +3740,17 @@ def build_play_of_the_day(
                 form_epa_diff = home_form["form_epa"] - away_form["form_epa"]
                 form_margin_diff = shrink_to_mean(form_margin_diff, min(n_home, n_away), 0.0, prior_n=6.0)
                 form_epa_diff = shrink_to_mean(form_epa_diff, min(n_home, n_away), 0.0, prior_n=6.0)
-                home_pace = float(team_pace.loc[home, "plays_per_game"]) if (not team_pace.empty and home in team_pace.index) else league_avg_pace
-                away_pace = float(team_pace.loc[away, "plays_per_game"]) if (not team_pace.empty and away in team_pace.index) else league_avg_pace
+                try:
+                    home_pace = float(team_pace.loc[home, "plays_per_game"]) if (
+                        isinstance(team_pace, pd.DataFrame) and not team_pace.empty
+                        and "plays_per_game" in team_pace.columns and home in team_pace.index
+                    ) else league_avg_pace
+                    away_pace = float(team_pace.loc[away, "plays_per_game"]) if (
+                        isinstance(team_pace, pd.DataFrame) and not team_pace.empty
+                        and "plays_per_game" in team_pace.columns and away in team_pace.index
+                    ) else league_avg_pace
+                except Exception:
+                    home_pace = away_pace = league_avg_pace
                 combined_pace = (home_pace + away_pace) / 2.0
                 pace_vs_avg = combined_pace - league_avg_pace
                 pace_adj = pace_vs_avg * 0.35
@@ -4470,7 +4479,10 @@ with tab2:
                 st.session_state["bb_upcoming"] = list(upcoming or [])
                 st.session_state["bb_weather_cache"] = weather_cache or {}
                 gc.collect()
-                st.caption(f"Loaded {len(upcoming or [])} upcoming games · odds: {odds_status}")
+                st.caption(
+                    f"Loaded {len(upcoming or [])} upcoming games · odds: {odds_status} · "
+                    f"EPA rows: {0 if not isinstance(team_epa, pd.DataFrame) else len(team_epa)}"
+                )
         except Exception as _bb_load_err:
             st.error(
                 "Big Board data load failed. Try Clear all caches, then Refresh again.\n\n"
@@ -4507,9 +4519,27 @@ with tab2:
         st.session_state["bb_force_rebuild"] = False
         st.warning("No upcoming games found to score. Check schedule sources / Odds API key.")
     if rebuild_bb and upcoming:
-        model = model_bundle[0] if model_bundle else None
-        feature_cols = model_bundle[1] if model_bundle else None
-        league_avg_pace = float(team_pace["plays_per_game"].mean()) if not team_pace.empty else 65.0
+        model = None
+        feature_cols = None
+        try:
+            if model_bundle and isinstance(model_bundle, (tuple, list)) and len(model_bundle) >= 1:
+                model = model_bundle[0]
+            if model_bundle and isinstance(model_bundle, (tuple, list)) and len(model_bundle) >= 2:
+                feature_cols = model_bundle[1]
+        except Exception:
+            model, feature_cols = None, None
+        league_avg_pace = 65.0
+        try:
+            if isinstance(team_pace, pd.DataFrame) and not team_pace.empty and "plays_per_game" in team_pace.columns:
+                league_avg_pace = float(team_pace["plays_per_game"].mean())
+        except Exception:
+            league_avg_pace = 65.0
+        # Ensure success metrics exist
+        try:
+            if not isinstance(team_success, pd.DataFrame):
+                team_success = pd.DataFrame()
+        except Exception:
+            team_success = pd.DataFrame()
         for g in upcoming:
             try:
                 home = g["home"]
@@ -4609,8 +4639,17 @@ with tab2:
                 # Shrink form diffs when sample is thin
                 form_margin_diff = shrink_to_mean(form_margin_diff, min(n_home, n_away), 0.0, prior_n=6.0)
                 form_epa_diff = shrink_to_mean(form_epa_diff, min(n_home, n_away), 0.0, prior_n=6.0)
-                home_pace = float(team_pace.loc[home, "plays_per_game"]) if (not team_pace.empty and home in team_pace.index) else league_avg_pace
-                away_pace = float(team_pace.loc[away, "plays_per_game"]) if (not team_pace.empty and away in team_pace.index) else league_avg_pace
+                try:
+                    home_pace = float(team_pace.loc[home, "plays_per_game"]) if (
+                        isinstance(team_pace, pd.DataFrame) and not team_pace.empty
+                        and "plays_per_game" in team_pace.columns and home in team_pace.index
+                    ) else league_avg_pace
+                    away_pace = float(team_pace.loc[away, "plays_per_game"]) if (
+                        isinstance(team_pace, pd.DataFrame) and not team_pace.empty
+                        and "plays_per_game" in team_pace.columns and away in team_pace.index
+                    ) else league_avg_pace
+                except Exception:
+                    home_pace = away_pace = league_avg_pace
                 combined_pace = (home_pace + away_pace) / 2.0
                 pace_vs_avg = combined_pace - league_avg_pace
                 pace_adj = pace_vs_avg * 0.35
@@ -4633,8 +4672,8 @@ with tab2:
                     signals.append(f"Home rest +{rest_diff}d"); rule_score += 1.1
                 elif rest_diff <= -3:
                     signals.append(f"Away rest {rest_diff}d"); rule_score += 1.0
-                if wx_adj["rule_pts"] > 0:
-                    signals.append(wx_adj["label"]); rule_score += wx_adj["rule_pts"]
+                if float(wx_adj.get("rule_pts") or 0) > 0:
+                    signals.append(wx_adj.get("label") or "Weather"); rule_score += float(wx_adj.get("rule_pts") or 0)
                 if home_imp >= 27.5:
                     signals.append(f"High Home Imp {home_imp:.1f}"); rule_score += 1.5
                 elif home_imp <= 17.5:
@@ -4888,7 +4927,8 @@ with tab2:
                 if week_num is None:
                     week_num = get_week(schedules, home, away, game_date)
                 # Structured features for BYOA (and any downstream consumers)
-                _byoa_feats = features_dict_for_board_row(
+                try:
+                    _byoa_feats = features_dict_for_board_row(
                     epa_edge=float(epa_edge),
                     form_margin_diff=float(form_margin_diff),
                     form_epa_diff=float(form_epa_diff),
@@ -4907,6 +4947,8 @@ with tab2:
                     model_home_prob=float(model_home) if model_home is not None else 0.5,
                     edge_pct=float(edge_pct) if edge_pct is not None else 0.0,
                 )
+                except Exception:
+                    _byoa_feats = {}
                 # Always include every scheduled game so weekly filters show the full slate
                 opportunities.append({
                     "Week": week_num if week_num is not None else "—",
@@ -4976,11 +5018,15 @@ with tab2:
                     gametime=str(g.get("gametime") or ""),
                     commence_raw=str(commence_raw or ""),
                 )
-                row_final = freeze_or_update_board_row(opportunities[-1], started)
-                opportunities[-1] = row_final
-                opportunities[-1]["_locked"] = bool(started or row_final.get("_locked"))
+                try:
+                    row_final = freeze_or_update_board_row(opportunities[-1], started)
+                    opportunities[-1] = row_final
+                    opportunities[-1]["_locked"] = bool(started or row_final.get("_locked"))
+                except Exception as _lock_err:
+                    opportunities[-1]["_locked"] = bool(started)
+                    skipped.append(f"Lock warn {home}@{away}: {_lock_err}")
             except Exception as e:
-                skipped.append(f"Error: {e}")
+                skipped.append(f"Error {g.get('away','?')}@{g.get('home','?')}: {type(e).__name__}: {e}")
                 continue
         if opportunities:
             try:
@@ -5241,7 +5287,17 @@ with tab2:
                 "nflreadpy has the current season schedule (try Clear all caches)."
             )
         elif rebuild_bb:
-            st.warning("No opportunities to display.")
+            st.warning("No opportunities to display — scoring produced 0 rows.")
+            if skipped:
+                with st.expander(f"Show {len(skipped)} scoring errors", expanded=True):
+                    for s in skipped[:40]:
+                        st.text(str(s))
+            else:
+                st.caption(
+                    "Upcoming games were loaded but every row failed before append, "
+                    "or the game list was empty after filters. Try Clear all caches, then Refresh again."
+                )
+            st.session_state["bb_force_rebuild"] = False
         else:
             st.info("No cached Big Board yet. Click **Refresh board** to build it.")
 
