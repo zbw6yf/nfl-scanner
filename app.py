@@ -3594,8 +3594,7 @@ def _pick_top_play(opportunities: list) -> Optional[Dict]:
 
 
 
-# Page router (NOT st.tabs) — only the active page runs, so initial load stays light.
-_PAGES = [
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "🏠 Homepage",
     "🏈 The Big Board",
     "🧪 BYOA",
@@ -3605,14 +3604,7 @@ _PAGES = [
     "📊 Team History",
     "📘 Methodology",
     "⚙️ Advanced",
-]
-_page = st.radio(
-    "Navigate",
-    options=_PAGES,
-    horizontal=True,
-    label_visibility="collapsed",
-    key="nav_page",
-)
+])
 
 # ---- Performance helpers: session-cached board + lazy heavy tabs ----
 BB_CACHE_TTL_SEC = 15 * 60  # rebuild Big Board at most every 15 minutes unless Refresh
@@ -3637,7 +3629,7 @@ opportunities = list(st.session_state.get("bb_opportunities") or [])
 skipped: list = []
 
 # ========== TAB 1: Homepage ==========
-if _page == "🏠 Homepage":
+with tab1:
     st.markdown(
         """
 <style>
@@ -4021,7 +4013,7 @@ if _page == "🏠 Homepage":
     )
 
 # ========== TAB 2: The Big Board ==========
-if _page == "🏈 The Big Board":
+with tab2:
     st.subheader("The Big Board")
     _bb_top = st.columns([1.1, 1.1, 2])
     with _bb_top[0]:
@@ -4036,25 +4028,38 @@ if _page == "🏈 The Big Board":
     with _bb_top[2]:
         st.caption(f"Board auto-refreshes every {BB_CACHE_TTL_SEC // 60} min, or when you click Refresh.")
 
-    # IMPORTANT: do NOT auto-rebuild on every cold start — that can OOM Streamlit Cloud.
-    # Rebuild only when user clicks Refresh (or cache is warm and still valid for display path).
+    # Rebuild only when user clicks Refresh (flag survives the button's single-run True pulse)
+    if refresh_bb:
+        st.session_state["bb_force_rebuild"] = True
     has_cache = bool(st.session_state.get("bb_opportunities"))
-    rebuild_bb = bool(refresh_bb) or (not has_cache and st.session_state.get("bb_autoload_once") is True)
-    # First visit: require explicit Refresh so Homepage / other tabs stay light
-    if not has_cache and not refresh_bb:
-        rebuild_bb = False
-    odds_status = st.session_state.get("bb_odds_status") or ("No API key entered" if not api_key else "")
-
+    rebuild_bb = bool(st.session_state.get("bb_force_rebuild"))
     if not has_cache and not rebuild_bb:
         st.info(
-            "Big Board is not built yet in this session. Click **🔄 Refresh board** once to load "
-            "EPA, lines, and weather. After that, results stay cached for ~15 minutes so the app stays fast."
+            "Big Board is not built yet. Click **🔄 Refresh board** to score the slate "
+            "(uses the full recommendation formula). Results stay cached afterward."
         )
+    odds_status = st.session_state.get("bb_odds_status") or ("No API key entered" if not api_key else "")
+
+    # Defaults for this run
+    team_epa = pd.DataFrame()
+    team_pace = pd.DataFrame()
+    team_success = pd.DataFrame()
+    team_ou_rate = {}
+    recent_form = {}
+    schedules = None
+    upcoming = list(st.session_state.get("bb_upcoming") or [])
+    weather_cache = dict(st.session_state.get("bb_weather_cache") or {})
+    odds_data = st.session_state.get("odds_data")
+    model_bundle = st.session_state.get("bb_model_bundle")
+    opportunities = list(st.session_state.get("bb_opportunities") or [])
+    try:
+        current_season = int(nfl.get_current_season())
+    except Exception:
+        current_season = datetime.now().year if datetime.now().month >= 8 else datetime.now().year - 1
 
     if rebuild_bb:
-        st.session_state["bb_autoload_once"] = False
         try:
-            with st.spinner("Loading EPA, Pace, Form, Schedule, Odds, ML model and weather..."):
+            with st.spinner("Building Big Board (EPA, form, odds, model, weather)..."):
                 import gc
                 team_epa = get_team_epa()
                 team_pace = get_team_pace()
@@ -4070,10 +4075,12 @@ if _page == "🏈 The Big Board":
                     current_season = int(nfl.get_current_season())
                 except Exception:
                     current_season = datetime.now().year if datetime.now().month >= 8 else datetime.now().year - 1
-                # Full formula: multi-season ATS model (same as original board)
                 model_bundle = train_ats_model(list(range(current_season - 4, current_season)))
                 st.session_state["bb_model_bundle"] = model_bundle
                 upcoming = build_upcoming_games(schedules, odds_data, days_ahead=90)
+                if not upcoming:
+                    # Fallback: embedded schedule only
+                    upcoming = build_upcoming_games(pd.DataFrame(), odds_data, days_ahead=90)
                 stamp_now("schedule")
                 if odds_data:
                     stamp_now("odds")
@@ -4082,38 +4089,14 @@ if _page == "🏈 The Big Board":
                 st.session_state["bb_upcoming"] = list(upcoming or [])
                 st.session_state["bb_weather_cache"] = weather_cache or {}
                 gc.collect()
+                st.caption(f"Loaded {len(upcoming or [])} upcoming games · odds: {odds_status}")
         except Exception as _bb_load_err:
             st.error(
-                "Big Board data load failed (often memory limits on Streamlit Cloud). "
-                "Lower Monte Carlo simulations in the sidebar and try Refresh again.\n\n"
-                f"`{_bb_load_err}`"
+                "Big Board data load failed. Try Clear all caches, then Refresh again.\n\n"
+                f"`{type(_bb_load_err).__name__}: {_bb_load_err}`"
             )
             rebuild_bb = False
-            team_epa = pd.DataFrame()
-            team_pace = pd.DataFrame()
-            team_success = pd.DataFrame()
-            team_ou_rate = {}
-            recent_form = {}
-            schedules = pd.DataFrame()
-            upcoming = st.session_state.get("bb_upcoming") or []
-            weather_cache = st.session_state.get("bb_weather_cache") or {}
-            odds_data = st.session_state.get("odds_data")
-            model_bundle = None
-    else:
-        # Fast path: reuse session cache (homepage + other widgets won't wait on full rebuild)
-        opportunities = list(st.session_state.get("bb_opportunities") or [])
-        upcoming = st.session_state.get("bb_upcoming") or []
-        weather_cache = st.session_state.get("bb_weather_cache") or {}
-        odds_data = st.session_state.get("odds_data")
-        model_bundle = None
-        team_pace = pd.DataFrame()
-        team_success = pd.DataFrame()
-        team_ou_rate = {}
-        recent_form = {}
-        try:
-            current_season = int(nfl.get_current_season())
-        except Exception:
-            current_season = datetime.now().year if datetime.now().month >= 8 else datetime.now().year - 1
+            st.session_state["bb_force_rebuild"] = False
 
     # Helpful diagnostics when the game list is empty
     if rebuild_bb and not upcoming:
@@ -4139,6 +4122,9 @@ if _page == "🏈 The Big Board":
         opportunities = list(st.session_state.get("bb_opportunities") or [])
     else:
         opportunities = []
+    if rebuild_bb and not upcoming:
+        st.session_state["bb_force_rebuild"] = False
+        st.warning("No upcoming games found to score. Check schedule sources / Odds API key.")
     if rebuild_bb and upcoming:
         model = model_bundle[0] if model_bundle else None
         feature_cols = model_bundle[1] if model_bundle else None
@@ -4516,6 +4502,9 @@ if _page == "🏈 The Big Board":
             # Session cache — homepage / BYOA / reruns reuse without full rebuild
             try:
                 st.session_state["bb_opportunities"] = list(opportunities)
+                st.session_state["bb_built_at"] = _time.time()
+                st.session_state["bb_force_rebuild"] = False
+                st.success(f"Big Board ready — {len(opportunities)} games scored.")
                 st.session_state["bb_play_of_day"] = _pick_top_play(list(opportunities))
                 st.session_state["bb_built_at"] = _time.time()
                 st.session_state["bb_upcoming"] = list(upcoming or [])
@@ -4674,7 +4663,7 @@ if _page == "🏈 The Big Board":
             st.info("No cached Big Board yet. Click **Refresh board** to build it.")
 
 # ========== TAB 3: BYOA ==========
-if _page == "🧪 BYOA":
+with tab3:
     def _byoa_load_odds(key: str):
         try:
             if not key:
@@ -4717,7 +4706,7 @@ if _page == "🧪 BYOA":
 
 
 # ========== TAB 4: Games & Odds ==========
-if _page == "📅 Games & Odds":
+with tab4:
     st.subheader("Upcoming Games (full schedule)")
     st.caption(
         "Official slate with open / current lines. "
@@ -5079,7 +5068,7 @@ if _page == "📅 Games & Odds":
             )
 
 
-if _page == "🌤️ Weather":
+with tab5:
     st.subheader("Game Weather")
     st.caption(
         "Forecast at each outdoor stadium near kickoff (Open-Meteo). "
@@ -5153,7 +5142,7 @@ if _page == "🌤️ Weather":
         st.caption(last_update_caption("weather", "schedule", label="Last update (Weather)"))
 
 
-if _page == "🏥 Injury Report":
+with tab6:
     st.subheader("NFL Injury Report")
     st.caption(
         "Official report from [NFL.com/injuries](https://www.nfl.com/injuries/). "
@@ -5235,7 +5224,7 @@ if _page == "🏥 Injury Report":
 
 
 
-if _page == "📊 Team History":
+with tab7:
     st.subheader("Team History")
     st.caption(
         "ATS (against the spread) and Over/Under records by team — last 5 seasons of completed games. "
@@ -5336,7 +5325,7 @@ if _page == "📊 Team History":
         st.caption(f"{len(show)} team-games · spreads/totals from historical schedule lines when available")
 
 
-if _page == "📘 Methodology":
+with tab8:
     st.subheader("Methodology")
     st.caption("How Score, Confidence, and Lean recommendations are produced. Research tool only — not betting advice.")
 
@@ -5430,7 +5419,7 @@ Over/under probabilities are taken from simulated totals vs the market line (wit
         """
     )
 
-if _page == "⚙️ Advanced":
+with tab9:
     st.subheader("Advanced")
     st.caption("Less frequently used tools — props, bankroll tracking, and historical backtests.")
     adv = st.radio(
