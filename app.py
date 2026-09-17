@@ -652,17 +652,22 @@ def totals_environment_tilt(
     agreement: 1.0 both teams same direction, 0.0 split, in-between partial.
     """
     signals = []
-    # --- Weather (game-level): already in wx_adj under_bias / total_adj ---
+    # Weather: light tilt only (MC already applied total_adj to expected points)
     weather_tilt = 0.0
     try:
-        # total_adj negative and under_bias positive favor under
-        weather_tilt -= float(wx_adj.get("under_bias") or 0.0) * 1.2
-        weather_tilt += float(wx_adj.get("total_adj") or 0.0) / 20.0
-        if roof in ("dome", "closed"):
-            weather_tilt += 0.015  # slight over lean indoors
+        roof_l = str(roof or "").lower()
+        if roof_l in ("dome", "closed", "retractable"):
+            weather_tilt += 0.012
             signals.append("Dome/closed roof")
-        elif float(wx_adj.get("rule_pts") or 0) > 0:
-            signals.append(str(wx_adj.get("label") or "Weather under"))
+        else:
+            # Only strong weather moves the needle; mild conditions ≈ neutral
+            ub = float(wx_adj.get("under_bias") or 0.0)
+            if ub >= 0.03:
+                weather_tilt -= min(0.04, ub * 0.6)
+                signals.append(str(wx_adj.get("label") or "Harsh weather under"))
+            elif ub >= 0.015:
+                weather_tilt -= min(0.02, ub * 0.4)
+                signals.append(str(wx_adj.get("label") or "Weather under"))
     except Exception:
         pass
 
@@ -682,11 +687,18 @@ def totals_environment_tilt(
                 row = team_success.loc[team]
                 if "off_explosive" in team_success.columns:
                     exp = float(row.get("off_explosive") or 0.0)
-                    # league ~0.10–0.15; center ~0.12
-                    t += max(-0.025, min(0.025, (exp - 0.12) * 0.4))
+                    try:
+                        lg_exp = float(team_success["off_explosive"].mean())
+                    except Exception:
+                        lg_exp = 0.12
+                    t += max(-0.02, min(0.02, (exp - lg_exp) * 0.35))
                 if "off_rz_td" in team_success.columns:
                     rz = float(row.get("off_rz_td") or 0.0)
-                    t += max(-0.025, min(0.025, (rz - 0.55) * 0.15))
+                    try:
+                        lg_rz = float(team_success["off_rz_td"].mean())
+                    except Exception:
+                        lg_rz = 0.55
+                    t += max(-0.02, min(0.02, (rz - lg_rz) * 0.12))
         except Exception:
             pass
         # Kicker power (rank 1 best → more over)
@@ -721,7 +733,7 @@ def totals_environment_tilt(
         agreement = 0.45
 
     total_tilt = weather_tilt + team_tilt
-    total_tilt = max(-0.12, min(0.12, total_tilt))
+    total_tilt = max(-0.06, min(0.06, total_tilt))
 
     # Pace signal labels
     try:
@@ -3370,12 +3382,22 @@ def monte_carlo_game(
 ):
     expected_margin = (home_off - away_def - (away_off - home_def)) * 35.0 + 1.2 + form_margin_adj
     sim_margins = np.random.normal(expected_margin, 11.5 + noise_extra, n_sims)
-    expected_total = 44.0 + (home_off + away_off - home_def - away_def) * 22.0 + total_adj + pace_adj
-    # Slightly tighter total dispersion so O/U leans are not almost always ~50/50
-    sim_totals = np.random.normal(expected_total, 11.0 + noise_extra * 0.7, n_sims)
+    # Model total from efficiency + pace + weather adj
+    model_total = 45.0 + (home_off + away_off - home_def - away_def) * 22.0 + total_adj + pace_adj
+    # Anchor to the market line so we are not systematically under every week
+    # (pure model totals often sit below posted NFL totals)
+    try:
+        line = float(total_line) if total_line is not None else 45.0
+    except Exception:
+        line = 45.0
+    expected_total = 0.65 * line + 0.35 * model_total
+    # Mild weather under only once here (half of prior under_bias)
+    expected_total -= float(under_bias or 0.0) * 8.0  # under_bias 0.04 → ~0.3 pts
+    sim_totals = np.random.normal(expected_total, 13.0 + noise_extra * 0.6, n_sims)
     home_cover = float(np.mean(sim_margins > spread))
-    over_p = float(np.mean(sim_totals > total_line)) if total_line else 0.5
-    over_p = max(0.05, min(0.95, over_p - under_bias))
+    over_p = float(np.mean(sim_totals > line)) if line else 0.5
+    # Do NOT subtract under_bias again from probability (was double-counting weather)
+    over_p = max(0.05, min(0.95, over_p))
     home_ev = home_cover * 100 / 110 - (1 - home_cover)
     away_ev = (1 - home_cover) * 100 / 110 - home_cover
     return {
