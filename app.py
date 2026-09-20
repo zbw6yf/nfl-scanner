@@ -4050,9 +4050,10 @@ def _pick_top_play(opportunities: list) -> Optional[Dict]:
     return top
 
 
-def _potd_from_board_cache(week: Optional[int] = None) -> Optional[Dict]:
-    """Derive Play of the Day from session Big Board rows (no heavy rebuild)."""
-    opps = st.session_state.get("bb_opportunities")
+def _potd_from_board_cache(week: Optional[int] = None, opps: Optional[list] = None) -> Optional[Dict]:
+    """Derive Play of the Day from Big Board rows (session or explicit list)."""
+    if opps is None:
+        opps = st.session_state.get("bb_opportunities")
     if not isinstance(opps, list) or not opps:
         return None
     week_rows = []
@@ -4064,7 +4065,9 @@ def _potd_from_board_cache(week: Optional[int] = None) -> Optional[Dict]:
                     w = o.get("Week")
                     if w is None or str(w) in ("—", "nan", "None", ""):
                         continue
-                    if int(float(w)) == wk:
+                    # Accept 2, 2.0, "2", "Week 2"
+                    ws = str(w).replace("Week", "").replace("week", "").strip()
+                    if int(float(ws)) == wk:
                         week_rows.append(o)
                 except Exception:
                     continue
@@ -4072,8 +4075,28 @@ def _potd_from_board_cache(week: Optional[int] = None) -> Optional[Dict]:
             week_rows = []
     rows = week_rows if week_rows else list(opps)
     pick = _pick_top_play(rows)
-    if pick:
-        st.session_state["bb_play_of_day"] = dict(pick)
+    if not pick:
+        return None
+    pick = dict(pick)
+    st.session_state["bb_play_of_day"] = pick
+    # Persist unlocked snapshot so Homepage works after tab switch / light refresh
+    try:
+        if week is not None and not pick.get("_locked"):
+            locks = _load_potd_locks()
+            key = f"week_{int(week)}"
+            existing = locks.get(key) if isinstance(locks.get(key), dict) else None
+            if not (existing and existing.get("_locked")):
+                snap = {
+                    k: (v if isinstance(v, (str, int, float, bool, type(None))) else str(v))
+                    for k, v in pick.items()
+                    if not str(k).startswith("_features")
+                }
+                snap["_locked"] = False
+                snap["_week"] = int(week)
+                locks[key] = snap
+                _save_potd_locks(locks)
+    except Exception:
+        pass
     return pick
 
 
@@ -4204,10 +4227,24 @@ with tab1:
                     pass
         except Exception:
             potd = None
-        # 2) Always prefer highest confidence + score from loaded Big Board
+        # 2) Unlocked snapshot from last board build (disk + session)
         if potd is None:
             try:
-                potd = _potd_from_board_cache(int(cur_wk))
+                _locks = _load_potd_locks()
+                _lk = _locks.get(f"week_{int(cur_wk)}")
+                if isinstance(_lk, dict) and _lk.get("Game") and not _lk.get("_locked"):
+                    potd = dict(_lk)
+                    try:
+                        potd = _enrich_potd_lines(potd, api_key or "")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        # 3) Highest confidence + score from loaded Big Board (session)
+        if potd is None:
+            try:
+                _opps = st.session_state.get("bb_opportunities") or opportunities
+                potd = _potd_from_board_cache(int(cur_wk), opps=_opps if isinstance(_opps, list) else None)
                 if potd is not None:
                     try:
                         potd = _enrich_potd_lines(dict(potd), api_key or "")
@@ -4249,7 +4286,17 @@ with tab1:
             unsafe_allow_html=True,
         )
         if not potd:
-            st.info("Could not determine Play Of The Day yet. Try again after lines load, or open **The Big Board**.")
+            _n_board = len(st.session_state.get("bb_opportunities") or [])
+            if _n_board:
+                st.warning(
+                    f"Big Board has **{_n_board}** games in session, but Play of the Day still did not resolve. "
+                    "Click **Refresh board** once more on The Big Board tab."
+                )
+            else:
+                st.info(
+                    "Could not determine Play Of The Day yet. Open **The Big Board**, click "
+                    "**Refresh board**, wait until games appear, then return here."
+                )
         else:
             conf = potd.get("Confidence", "—")
             rec = potd.get("Recommendation", "—")
@@ -5205,19 +5252,19 @@ with tab2:
                 st.success(f"Big Board ready — {len(opportunities)} games scored.")
                 try:
                     _cw = current_nfl_week()
-                    _week_rows = []
-                    if _cw is not None:
-                        for _o in opportunities:
-                            try:
-                                if int(float(_o.get("Week"))) == int(_cw):
-                                    _week_rows.append(_o)
-                            except Exception:
-                                pass
-                    st.session_state["bb_play_of_day"] = _pick_top_play(
-                        _week_rows if _week_rows else list(opportunities)
+                    _potd = _potd_from_board_cache(
+                        int(_cw) if _cw is not None else None,
+                        opps=list(opportunities),
                     )
+                    if _potd is None:
+                        st.session_state["bb_play_of_day"] = _pick_top_play(list(opportunities))
+                    else:
+                        st.session_state["bb_play_of_day"] = _potd
                 except Exception:
                     st.session_state["bb_play_of_day"] = _pick_top_play(list(opportunities))
+                # Ensure Homepage picks this up on next paint
+                # Rerun so Homepage (runs before Big Board in the script) picks up POTD
+                st.rerun()
                 st.session_state["bb_built_at"] = _time.time()
                 st.session_state["bb_upcoming"] = list(upcoming or [])
                 st.session_state["bb_weather_cache"] = weather_cache or {}
