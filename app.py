@@ -3997,21 +3997,84 @@ def build_play_of_the_day(
 
 
 def _pick_top_play(opportunities: list) -> Optional[Dict]:
-    """Highest Confidence (A→F), then highest Score. Prefer real leans over 'No strong lean'."""
+    """
+    Play of the Day: highest Confidence (A→F), then highest Score.
+    Prefer real leans (ATS or totals) over 'No strong lean'.
+    """
     if not opportunities:
         return None
     conf_rank = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
-    def sort_key(o):
+    no_lean = {"No strong lean", "—", "-", "", "None", "nan"}
+
+    def _best_lean_fields(o: dict) -> tuple:
+        """Return (recommendation, confidence, score) using best available lean."""
         rec = str(o.get("Recommendation") or "")
-        lean_penalty = 0 if rec not in ("No strong lean", "—", "") else 1
-        conf = conf_rank.get(str(o.get("Confidence") or "F"), 9)
+        conf = str(o.get("Confidence") or "F")
         try:
-            score = -float(o.get("Score") or 0)
+            score = float(o.get("Score") or 0)
         except Exception:
-            score = 0
-        return (lean_penalty, conf, score)
+            score = 0.0
+        # If primary is empty lean, prefer stronger of spread vs total
+        if rec.strip() in no_lean:
+            sr = str(o.get("Spread Rec") or "")
+            tr = str(o.get("Total Rec") or "")
+            try:
+                ss = float(o.get("Spread Score") or 0)
+            except Exception:
+                ss = 0.0
+            try:
+                ts = float(o.get("Total Score") or 0)
+            except Exception:
+                ts = 0.0
+            sc = str(o.get("Spread Conf") or "F")
+            tc = str(o.get("Total Conf") or "F")
+            if sr.strip() not in no_lean and (tr.strip() in no_lean or ss >= ts):
+                rec, conf, score = sr, sc, ss
+            elif tr.strip() not in no_lean:
+                rec, conf, score = tr, tc, ts
+        return rec, conf, score
+
+    def sort_key(o):
+        rec, conf, score = _best_lean_fields(o)
+        lean_penalty = 0 if rec.strip() not in no_lean else 1
+        conf_n = conf_rank.get(str(conf).upper()[:1], 9)
+        return (lean_penalty, conf_n, -float(score or 0))
+
     ranked = sorted(opportunities, key=sort_key)
-    return ranked[0]
+    top = dict(ranked[0])
+    # Normalize display fields onto primary Recommendation/Confidence/Score for the card
+    rec, conf, score = _best_lean_fields(top)
+    top["Recommendation"] = rec
+    top["Confidence"] = conf
+    top["Score"] = round(float(score), 2) if score is not None else top.get("Score")
+    return top
+
+
+def _potd_from_board_cache(week: Optional[int] = None) -> Optional[Dict]:
+    """Derive Play of the Day from session Big Board rows (no heavy rebuild)."""
+    opps = st.session_state.get("bb_opportunities")
+    if not isinstance(opps, list) or not opps:
+        return None
+    week_rows = []
+    if week is not None:
+        try:
+            wk = int(week)
+            for o in opps:
+                try:
+                    w = o.get("Week")
+                    if w is None or str(w) in ("—", "nan", "None", ""):
+                        continue
+                    if int(float(w)) == wk:
+                        week_rows.append(o)
+                except Exception:
+                    continue
+        except Exception:
+            week_rows = []
+    rows = week_rows if week_rows else list(opps)
+    pick = _pick_top_play(rows)
+    if pick:
+        st.session_state["bb_play_of_day"] = dict(pick)
+    return pick
 
 
 
@@ -4128,33 +4191,52 @@ with tab1:
     if feature_enabled("today_card"):
         cur_wk = current_nfl_week() or 1
         potd = None
-        # Fast path: locked card or Big Board session cache (skip full rebuild when possible)
+        # 1) Locked Play of the Day for this week (after first kickoff)
         try:
             _locks = _load_potd_locks()
             _lk = _locks.get(f"week_{int(cur_wk)}")
-            if isinstance(_lk, dict) and _lk.get("_locked"):
+            if isinstance(_lk, dict) and _lk.get("_locked") and _lk.get("Game"):
                 potd = dict(_lk)
-                try:
-                    potd = _enrich_potd_lines(potd, api_key or "")
-                except Exception:
-                    pass
                 potd["_locked"] = True
-            elif st.session_state.get("bb_play_of_day"):
-                potd = dict(st.session_state.get("bb_play_of_day") or {})
                 try:
                     potd = _enrich_potd_lines(potd, api_key or "")
                 except Exception:
                     pass
         except Exception:
             potd = None
+        # 2) Always prefer highest confidence + score from loaded Big Board
+        if potd is None:
+            try:
+                potd = _potd_from_board_cache(int(cur_wk))
+                if potd is not None:
+                    try:
+                        potd = _enrich_potd_lines(dict(potd), api_key or "")
+                    except Exception:
+                        pass
+            except Exception:
+                potd = None
+        # 3) Session pick set when board refreshed
+        if potd is None and st.session_state.get("bb_play_of_day"):
+            try:
+                potd = dict(st.session_state.get("bb_play_of_day") or {})
+                if potd.get("Game"):
+                    try:
+                        potd = _enrich_potd_lines(potd, api_key or "")
+                    except Exception:
+                        pass
+                else:
+                    potd = None
+            except Exception:
+                potd = None
+        # 4) Last resort: full builder (only if board rows exist)
         if potd is None and st.session_state.get("bb_opportunities"):
-            # Only attempt full POTD build when board cache exists (avoids cold-start OOM)
-            with st.spinner("Selecting Play Of The Day..."):
-                potd = build_play_of_the_day(
-                    int(cur_wk), api_key or "", n_simulations=n_simulations, form_window=form_window
-                )
-        elif potd is None:
-            potd = None  # show empty state below without heavy rebuild
+            try:
+                with st.spinner("Selecting Play Of The Day..."):
+                    potd = build_play_of_the_day(
+                        int(cur_wk), api_key or "", n_simulations=n_simulations, form_window=form_window
+                    )
+            except Exception:
+                potd = _potd_from_board_cache(int(cur_wk))
         locked = bool(potd and potd.get("_locked"))
         lock_note = " · Locked for the week" if locked else " · Updates until the first kickoff of the week"
         st.markdown(
@@ -5121,7 +5203,21 @@ with tab2:
                 st.session_state["bb_built_at"] = _time.time()
                 st.session_state["bb_force_rebuild"] = False
                 st.success(f"Big Board ready — {len(opportunities)} games scored.")
-                st.session_state["bb_play_of_day"] = _pick_top_play(list(opportunities))
+                try:
+                    _cw = current_nfl_week()
+                    _week_rows = []
+                    if _cw is not None:
+                        for _o in opportunities:
+                            try:
+                                if int(float(_o.get("Week"))) == int(_cw):
+                                    _week_rows.append(_o)
+                            except Exception:
+                                pass
+                    st.session_state["bb_play_of_day"] = _pick_top_play(
+                        _week_rows if _week_rows else list(opportunities)
+                    )
+                except Exception:
+                    st.session_state["bb_play_of_day"] = _pick_top_play(list(opportunities))
                 st.session_state["bb_built_at"] = _time.time()
                 st.session_state["bb_upcoming"] = list(upcoming or [])
                 st.session_state["bb_weather_cache"] = weather_cache or {}
