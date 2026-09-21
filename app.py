@@ -940,14 +940,23 @@ def is_primetime_kickoff(kickoff: str, gametime: Optional[str] = None) -> bool:
 BOARD_LOCK_PATH = Path(__file__).resolve().parent / "board_locks.json"
 # Fields that freeze at kickoff and must not keep changing in-game
 _BOARD_LOCK_FIELDS = (
+    # Identity / schedule
+    "Week", "Game", "Kickoff", "Roof", "Weather",
+    # Primary lean
     "Recommendation", "Confidence", "Score", "Signals",
-    "Spread Rec", "Spread Conf", "Spread Score", "P Home Cover", "P Away Cover",
-    "Total Rec", "Total Conf", "Total Score", "P Over", "P Under",
+    # Spread market
+    "Spread Rec", "Spread Conf", "Spread Score",
+    "P Home Cover", "P Away Cover", "Power Edge", "Home Power", "Away Power",
+    # Totals market
+    "Total Rec", "Total Conf", "Total Score", "P Over", "P Under", "Totals Agree",
+    # Lines & diagnostics
     "Spread", "Total", "Home Imp", "Away Imp",
-    "EPA Edge", "Form Δ", "Model %", "Market %", "Edge %",
+    "EPA Edge", "Form Δ", "Pace", "TZ Diff", "Div",
+    "Model %", "Market %", "Edge %",
     "ML Home %", "MC Home %", "MC Over %",
+    # Internal
     "_model_prob", "_market_prob", "_edge_pct", "_spread", "_total",
-    "_features",
+    "_home", "_away", "_gameday", "_features",
 )
 
 
@@ -990,17 +999,35 @@ def game_has_started(kickoff: str = "", gameday: str = "", gametime: str = "", c
             ts = pd.to_datetime(commence_raw, utc=True, errors="coerce")
         if ts is None or pd.isna(ts):
             ts = _parse_kickoff_ts(kickoff, gameday, gametime)
-        if ts is None or pd.isna(ts):
-            return False
-        if getattr(ts, "tzinfo", None) is None:
-            # Assume Eastern if naive
+        if ts is not None and not pd.isna(ts):
+            if getattr(ts, "tzinfo", None) is None:
+                try:
+                    ts = ts.tz_localize("America/New_York", ambiguous="NaT", nonexistent="NaT")
+                    if pd.isna(ts):
+                        ts = _parse_kickoff_ts(kickoff, gameday, gametime)
+                except Exception:
+                    try:
+                        ts = pd.Timestamp(ts).tz_localize("UTC")
+                    except Exception:
+                        pass
+            if ts is not None and not pd.isna(ts):
+                try:
+                    if getattr(ts, "tzinfo", None) is not None:
+                        ts = ts.tz_convert("UTC")
+                    return bool(now >= ts)
+                except Exception:
+                    pass
+        # Fallback: if gameday is before today in US/Eastern, treat as started
+        if gameday:
             try:
-                ts = ts.tz_localize("America/New_York").tz_convert("UTC")
+                gd = pd.to_datetime(str(gameday)[:10], errors="coerce")
+                if pd.notna(gd):
+                    today_et = pd.Timestamp.now(tz="America/New_York").normalize().tz_localize(None)
+                    if gd.normalize() < today_et:
+                        return True
             except Exception:
-                ts = ts.tz_localize("UTC")
-        else:
-            ts = ts.tz_convert("UTC")
-        return now >= ts
+                pass
+        return False
     except Exception:
         return False
 
@@ -1029,47 +1056,263 @@ def _serialize_lock_row(row: Dict) -> Dict:
     return out
 
 
+
+def _gsheets_enabled() -> bool:
+    """True when Streamlit secrets include Google service account + spreadsheet id."""
+    try:
+        sec = st.secrets.get("google_sheets", None)
+        if sec is None:
+            return False
+        # support both nested and flat
+        has_id = bool(sec.get("spreadsheet_id") or sec.get("sheet_id") or sec.get("spreadsheet_url"))
+        has_json = bool(sec.get("service_account_json") or sec.get("credentials") or "type" in sec)
+        return bool(has_id and (has_json or sec.get("type") == "service_account"))
+    except Exception:
+        return False
+
+
+def _gsheets_client():
+    """Return (gspread client, spreadsheet) or (None, None)."""
+    try:
+        import json as _json
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        sec = st.secrets["google_sheets"]
+        # Credentials: full JSON string OR the whole [google_sheets] block is the SA dict
+        cred_info = None
+        if sec.get("service_account_json"):
+            raw = sec.get("service_account_json")
+            cred_info = _json.loads(raw) if isinstance(raw, str) else dict(raw)
+        elif sec.get("credentials"):
+            raw = sec.get("credentials")
+            cred_info = _json.loads(raw) if isinstance(raw, str) else dict(raw)
+        elif sec.get("type") == "service_account":
+            cred_info = dict(sec)
+            # remove non-credential keys
+            for k in ("spreadsheet_id", "sheet_id", "spreadsheet_url", "worksheet", "board_locks_sheet"):
+                cred_info.pop(k, None)
+        if not cred_info:
+            return None, None
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(cred_info, scopes=scopes)
+        client = gspread.authorize(creds)
+
+        sid = sec.get("spreadsheet_id") or sec.get("sheet_id")
+        if not sid and sec.get("spreadsheet_url"):
+            client_open = client.open_by_url(str(sec.get("spreadsheet_url")))
+            return client, client_open
+        if not sid:
+            return None, None
+        ss = client.open_by_key(str(sid))
+        return client, ss
+    except Exception:
+        return None, None
+
+
+def _gsheets_locks_worksheet():
+    """Open or create the board_locks worksheet."""
+    try:
+        _, ss = _gsheets_client()
+        if ss is None:
+            return None
+        sec = st.secrets.get("google_sheets", {})
+        title = str(sec.get("board_locks_sheet") or sec.get("worksheet") or "board_locks")
+        try:
+            ws = ss.worksheet(title)
+        except Exception:
+            ws = ss.add_worksheet(title=title, rows=500, cols=4)
+            ws.update("A1:D1", [["key", "locked", "updated_at", "payload_json"]])
+        # Ensure header
+        try:
+            row1 = ws.row_values(1)
+            if not row1 or str(row1[0]).lower() != "key":
+                ws.insert_row(["key", "locked", "updated_at", "payload_json"], 1)
+        except Exception:
+            pass
+        return ws
+    except Exception:
+        return None
+
+
+def _load_board_locks_from_sheets() -> Dict[str, Dict]:
+    """Load all board lock rows from Google Sheets."""
+    out: Dict[str, Dict] = {}
+    try:
+        import json as _json
+        ws = _gsheets_locks_worksheet()
+        if ws is None:
+            return out
+        records = ws.get_all_records()
+        for rec in records:
+            key = str(rec.get("key") or "").strip()
+            if not key:
+                continue
+            payload = rec.get("payload_json") or "{}"
+            try:
+                data = _json.loads(payload) if isinstance(payload, str) else dict(payload)
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data["key"] = key
+            if "locked" in rec and rec.get("locked") not in (None, ""):
+                val = rec.get("locked")
+                data["_locked"] = str(val).lower() in ("1", "true", "yes", "y")
+            out[key] = data
+    except Exception:
+        pass
+    return out
+
+
+def _save_board_locks_to_sheets(locks: Dict[str, Dict]) -> bool:
+    """Rewrite board_locks worksheet with current lock dict. Returns True on success."""
+    try:
+        import json as _json
+        ws = _gsheets_locks_worksheet()
+        if ws is None:
+            return False
+        rows = [["key", "locked", "updated_at", "payload_json"]]
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for key, val in (locks or {}).items():
+            if not isinstance(val, dict):
+                continue
+            snap = _serialize_lock_row(dict(val))
+            snap["key"] = str(key)
+            locked = bool(snap.get("_locked"))
+            rows.append([
+                str(key),
+                "TRUE" if locked else "FALSE",
+                str(snap.get("_locked_at") or now),
+                _json.dumps(snap, default=str),
+            ])
+        # Clear and write (batch)
+        ws.clear()
+        if len(rows) == 1:
+            ws.update("A1:D1", [rows[0]])
+        else:
+            # gspread update with full matrix
+            ws.update(f"A1:D{len(rows)}", rows, value_input_option="RAW")
+        return True
+    except Exception:
+        return False
+
+
 def _load_board_locks() -> Dict[str, Dict]:
-    if "board_locks" in st.session_state and isinstance(st.session_state.get("board_locks"), dict):
-        return st.session_state["board_locks"]
+    """
+    Priority: session → Google Sheets (permanent) → local JSON file.
+    Locked rows from Sheets always win over unlocked session copies.
+    """
     locks: Dict[str, Dict] = {}
+    if isinstance(st.session_state.get("board_locks"), dict):
+        locks = dict(st.session_state["board_locks"])
+
+    # Google Sheets (survives Streamlit Cloud reboots)
+    try:
+        if _gsheets_enabled():
+            sheet_locks = _load_board_locks_from_sheets()
+            for k, v in sheet_locks.items():
+                if k not in locks:
+                    locks[k] = v
+                elif v.get("_locked") and not locks[k].get("_locked"):
+                    locks[k] = v
+                elif v.get("_locked") and locks[k].get("_locked"):
+                    # both locked — keep session if newer, else sheet
+                    locks[k] = locks[k] if locks[k].get("_locked_at") else v
+    except Exception:
+        pass
+
+    # Local file fallback
     try:
         if BOARD_LOCK_PATH.exists():
             import json as _json
             raw = _json.loads(BOARD_LOCK_PATH.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
-                locks = raw
+                for k, v in raw.items():
+                    if not isinstance(v, dict):
+                        continue
+                    k = str(k)
+                    if k not in locks:
+                        locks[k] = v
+                    elif v.get("_locked") and not locks[k].get("_locked"):
+                        locks[k] = v
             elif isinstance(raw, list):
                 for item in raw:
                     if isinstance(item, dict) and item.get("key"):
-                        locks[str(item["key"])] = item
-        # legacy CSV fallback
-        csv_legacy = Path(__file__).resolve().parent / "board_locks.csv"
-        if not locks and csv_legacy.exists():
-            df = pd.read_csv(csv_legacy)
-            for _, r in df.iterrows():
-                key = str(r.get("key") or "")
-                if key:
-                    locks[key] = r.to_dict()
+                        k = str(item["key"])
+                        if k not in locks:
+                            locks[k] = item
     except Exception:
         pass
+
     st.session_state["board_locks"] = locks
     return locks
 
 
 def _save_board_locks(locks: Dict[str, Dict]) -> None:
     st.session_state["board_locks"] = locks
+    # Permanent: Google Sheets
+    try:
+        if _gsheets_enabled():
+            _save_board_locks_to_sheets(locks)
+    except Exception:
+        pass
+    # Best-effort local file (ephemeral on Streamlit Cloud)
     try:
         import json as _json
-        clean = {k: _serialize_lock_row(v) if isinstance(v, dict) else v for k, v in locks.items()}
+        clean = {str(k): _serialize_lock_row(v) if isinstance(v, dict) else v for k, v in locks.items()}
         BOARD_LOCK_PATH.write_text(_json.dumps(clean, default=str), encoding="utf-8")
     except Exception:
         pass
 
 
 def board_lock_key(week, away, home, gameday) -> str:
+    try:
+        a = _normalize_team_abbr(str(away or "")).upper()
+        h = _normalize_team_abbr(str(home or "")).upper()
+    except Exception:
+        a, h = str(away or "").upper(), str(home or "").upper()
     gd = str(gameday or "")[:10]
-    return f"{week}_{str(away).upper()}_{str(home).upper()}_{gd}"
+    try:
+        wk = int(float(week)) if week is not None and str(week) not in ("", "—", "nan", "None") else ""
+    except Exception:
+        wk = str(week or "").replace("Week", "").strip()
+    return f"{wk}_{a}_{h}_{gd}"
+
+
+def _find_lock_for_game(locks: Dict[str, Dict], week, away, home, gameday) -> Optional[Dict]:
+    if not locks:
+        return None
+    primary = board_lock_key(week, away, home, gameday)
+    if primary in locks and isinstance(locks[primary], dict):
+        return locks[primary]
+    try:
+        a = _normalize_team_abbr(str(away or "")).upper()
+        h = _normalize_team_abbr(str(home or "")).upper()
+    except Exception:
+        a, h = str(away or "").upper(), str(home or "").upper()
+    gd = str(gameday or "")[:10]
+    for k, v in locks.items():
+        if not isinstance(v, dict):
+            continue
+        va = str(v.get("_away") or "").upper()
+        vh = str(v.get("_home") or "").upper()
+        try:
+            va = _normalize_team_abbr(va).upper() or va
+            vh = _normalize_team_abbr(vh).upper() or vh
+        except Exception:
+            pass
+        if va == a and vh == h:
+            vgd = str(v.get("_gameday") or v.get("Kickoff") or "")[:10]
+            if not gd or not vgd or gd == vgd or gd in str(k):
+                return v
+        if f"_{a}_{h}_" in f"_{str(k).upper()}_":
+            return v
+    return None
 
 
 def clear_board_lock_for_game(away: str, home: str, gameday: str = "") -> int:
@@ -1140,57 +1383,81 @@ def _enrich_row_from_line_opens(row: Dict) -> Dict:
 
 
 def _apply_locked_lean_fields(live_row: Dict, locked: Dict) -> Dict:
-    """Keep live display row but force Recommendation / Confidence / Score (and related) from lock."""
-    out = dict(live_row)
-    for f in _BOARD_LOCK_FIELDS:
-        if f in locked and locked.get(f) is not None:
-            out[f] = locked[f]
+    """
+    After kickoff: return the frozen pre-game snapshot for ALL board fields.
+    Live recalculation must not change leans, scores, probs, or context columns.
+    """
+    # Prefer full locked snapshot so in-game EPA/odds churn cannot leak in
+    out = dict(locked) if isinstance(locked, dict) else {}
+    # Keep non-scored identity from live only if lock is missing them
+    if isinstance(live_row, dict):
+        for k in ("Week", "Game", "Kickoff", "_home", "_away", "_gameday", "key"):
+            if out.get(k) in (None, "", "—") and live_row.get(k) not in (None, ""):
+                out[k] = live_row.get(k)
+        for f in _BOARD_LOCK_FIELDS:
+            if f in locked and locked.get(f) is not None:
+                out[f] = locked[f]
     out["_locked"] = True
     return out
 
 
 def freeze_or_update_board_row(row: Dict, started: bool) -> Dict:
     """
-    Before kickoff: refresh stored snapshot (Recommendation / Score / Confidence).
-    After kickoff: force those fields from the frozen snapshot — never update them again.
+    Before kickoff: refresh the full pre-game snapshot on every board build.
+    After kickoff: return that snapshot unchanged — never rewrite locked rows.
     """
     gd = str(row.get("_gameday") or row.get("Kickoff") or "")[:10]
-    key = board_lock_key(row.get("Week"), row.get("_away"), row.get("_home"), gd)
+    away = row.get("_away")
+    home = row.get("_home")
+    week = row.get("Week")
+    key = board_lock_key(week, away, home, gd)
     locks = _load_board_locks()
-    existing = locks.get(key)
-    row = _enrich_row_from_line_opens(row)
+    existing = _find_lock_for_game(locks, week, away, home, gd)
+    if existing is None:
+        existing = locks.get(key)
 
     if started:
-        # Prefer already-locked snapshot; else lock the last pre-game snapshot; else lock current
+        # Already locked → always return frozen snapshot (no live merge)
         if existing and existing.get("_locked"):
-            return _apply_locked_lean_fields(row, existing)
-        if existing and not existing.get("_locked"):
-            snap = _serialize_lock_row({**existing, "key": key, "_locked": True})
-            snap["_locked"] = True
-            locks[key] = snap
-            _save_board_locks(locks)
-            return _apply_locked_lean_fields(row, snap)
-        snap = _serialize_lock_row({**row, "key": key, "_locked": True})
+            out = dict(existing)
+            out["_locked"] = True
+            out["key"] = key
+            return out
+        # Promote last pre-game snapshot to locked
+        base = existing if existing else row
+        if not existing:
+            try:
+                row = _enrich_row_from_line_opens(row)
+            except Exception:
+                pass
+            base = row
+        snap = _serialize_lock_row({**base, "key": key, "_locked": True})
         snap["_locked"] = True
+        snap["_locked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        snap["_away"] = away
+        snap["_home"] = home
+        snap["_gameday"] = gd
         locks[key] = snap
         _save_board_locks(locks)
-        return _apply_locked_lean_fields(row, snap)
+        return dict(snap)
 
-    # Pre-game: if somehow locked already, keep lean fields frozen
+    # Pre-game: never overwrite an already-locked row
     if existing and existing.get("_locked"):
-        return _apply_locked_lean_fields(row, existing)
+        out = dict(existing)
+        out["_locked"] = True
+        return out
 
-    # Update pre-kickoff snapshot whenever we have a real lean (spread optional but preferred)
+    try:
+        row = _enrich_row_from_line_opens(row)
+    except Exception:
+        pass
     snap = _serialize_lock_row({**row, "key": key, "_locked": False})
     snap["_locked"] = False
-    if _row_has_spread(row) or row.get("Recommendation") not in (None, "", "—"):
-        locks[key] = snap
-        _save_board_locks(locks)
-    elif existing and _row_has_spread(existing):
-        return dict(row)  # keep prior better snapshot, show live row
-    else:
-        locks[key] = snap
-        _save_board_locks(locks)
+    snap["_away"] = away
+    snap["_home"] = home
+    snap["_gameday"] = gd
+    locks[key] = snap
+    _save_board_locks(locks)
     return row
 
 
@@ -4576,7 +4843,7 @@ with tab2:
         else:
             st.caption("No board cache yet")
     with _bb_top[2]:
-        st.caption(f"Board auto-refreshes every {BB_CACHE_TTL_SEC // 60} min, or when you click Refresh.")
+        st.caption(f"Board auto-refreshes every {BB_CACHE_TTL_SEC // 60} min, or when you click Refresh. ""Each game **locks at kickoff**. "+ ("Locks persist via **Google Sheets**." if _gsheets_enabled() else "Add Google Sheets secrets to keep locks after reboot."))
 
     # Rebuild only when user clicks Refresh (flag survives the button's single-run True pulse)
     if refresh_bb:
@@ -4734,14 +5001,25 @@ with tab2:
                     commence_raw=str(commence_raw or ""),
                 )
                 if _started_early:
-                    _lk = board_lock_key(g.get("week"), away, home, game_date)
                     _locks = _load_board_locks()
-                    if _lk in _locks and (
-                        _locks[_lk].get("_locked")
-                        or _row_has_spread(_locks[_lk])
+                    _lk = board_lock_key(g.get("week"), away, home, game_date)
+                    _hit = _find_lock_for_game(_locks, g.get("week"), away, home, game_date)
+                    if _hit is None:
+                        _hit = _locks.get(_lk)
+                    if isinstance(_hit, dict) and (
+                        _hit.get("_locked")
+                        or _hit.get("Recommendation") not in (None, "", "—")
+                        or _row_has_spread(_hit)
                     ):
-                        frozen = _enrich_row_from_line_opens(dict(_locks[_lk]))
+                        frozen = dict(_hit)
                         frozen["_locked"] = True
+                        frozen["key"] = _lk
+                        # If game started but snapshot not marked locked yet, lock it now
+                        if not frozen.get("_locked") or not _hit.get("_locked"):
+                            frozen["_locked"] = True
+                            frozen["_locked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                            _locks[_lk] = dict(frozen)
+                            _save_board_locks(_locks)
                         opportunities.append(frozen)
                         continue
                     # Recover lines from tracker so spread doesn't go blank mid-calc
