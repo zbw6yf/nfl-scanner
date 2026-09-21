@@ -1122,6 +1122,24 @@ def _gsheets_enabled() -> bool:
         return False
 
 
+def _gsheets_on_cooldown() -> bool:
+    try:
+        return float(_time.time()) < float(st.session_state.get("_gsheets_cooldown_until") or 0)
+    except Exception:
+        return False
+
+
+def _gsheets_mark_cooldown(seconds: float = 120.0, err: str = "") -> None:
+    st.session_state["_gsheets_cooldown_until"] = float(_time.time()) + float(seconds)
+    if err:
+        st.session_state["_gsheets_last_error"] = str(err)[:400]
+
+
+def _gsheets_is_quota_error(err: Any) -> bool:
+    s = str(err or "").lower()
+    return "429" in s or "quota exceeded" in s or "rate limit" in s
+
+
 def _gsheets_status() -> Dict[str, Any]:
     """Diagnostic status for the Big Board caption / Advanced tab."""
     info: Dict[str, Any] = {
@@ -1155,17 +1173,35 @@ def _gsheets_status() -> Dict[str, Any]:
         if not has_json:
             info["message"] = "Secrets found, but service_account_json / credentials are missing."
             return info
+        cached = st.session_state.get("_gsheets_status_cache")
+        cache_at = float(st.session_state.get("_gsheets_status_at") or 0)
+        if isinstance(cached, dict) and (float(_time.time()) - cache_at) < 300:
+            return dict(cached)
+        if _gsheets_on_cooldown():
+            wait = max(0, int(float(st.session_state.get("_gsheets_cooldown_until") or 0) - _time.time()))
+            info["connected"] = bool(st.session_state.get("board_locks"))
+            info["message"] = (
+                f"Google Sheets quota pause ({wait}s). Using cached session locks. "
+                f"{st.session_state.get('_gsheets_last_error') or ''}"
+            ).strip()
+            return info
+        if st.session_state.get("_gsheets_locks_fetched_at") or st.session_state.get("board_locks"):
+            info["connected"] = True
+            info["message"] = "Connected · using cached Google Sheets locks this session"
+            st.session_state["_gsheets_status_cache"] = dict(info)
+            st.session_state["_gsheets_status_at"] = float(_time.time())
+            return info
         client, ss = _gsheets_client()
         if client is None or ss is None:
             detail = st.session_state.get("_gsheets_last_error") or "unknown error"
+            if _gsheets_is_quota_error(detail):
+                _gsheets_mark_cooldown(180.0, str(detail))
             info["message"] = f"Secrets found, but connection failed — {detail}"
             return info
-        ws = _gsheets_locks_worksheet()
-        if ws is None:
-            info["message"] = "Connected to spreadsheet, but could not open/create board_locks tab."
-            return info
         info["connected"] = True
-        info["message"] = f"Connected · spreadsheet “{getattr(ss, 'title', 'ok')}” · tab “{ws.title}”"
+        info["message"] = f"Connected · spreadsheet “{getattr(ss, 'title', 'ok')}”"
+        st.session_state["_gsheets_status_cache"] = dict(info)
+        st.session_state["_gsheets_status_at"] = float(_time.time())
         return info
     except Exception as e:
         info["message"] = f"Google Sheets error: {type(e).__name__}: {e}"
@@ -1335,9 +1371,10 @@ def _gsheets_client():
             return None, None
         except Exception as e:
             email = cred_info.get("client_email", "?")
-            st.session_state["_gsheets_last_error"] = (
-                f"Could not open spreadsheet (shared with {email} as Editor?): {type(e).__name__}: {e}"
-            )
+            msg = f"Could not open spreadsheet (shared with {email} as Editor?): {type(e).__name__}: {e}"
+            st.session_state["_gsheets_last_error"] = msg
+            if _gsheets_is_quota_error(e):
+                _gsheets_mark_cooldown(180.0, msg)
             return None, None
     except Exception as e:
         try:
@@ -1350,18 +1387,19 @@ def _gsheets_client():
 
 def _gsheets_locks_worksheet():
     """Open or create the board_locks worksheet."""
+    if _gsheets_on_cooldown():
+        return None
     try:
         _, ss = _gsheets_client()
         if ss is None:
             return None
-        sec = st.secrets.get("google_sheets", {})
+        sec = _gsheets_secrets_section() or {}
         title = str(sec.get("board_locks_sheet") or sec.get("worksheet") or "board_locks")
         try:
             ws = ss.worksheet(title)
         except Exception:
             ws = ss.add_worksheet(title=title, rows=500, cols=4)
             ws.update("A1:D1", [["key", "locked", "updated_at", "payload_json"]])
-        # Ensure header
         try:
             row1 = ws.row_values(1)
             if not row1 or str(row1[0]).lower() != "key":
@@ -1369,13 +1407,17 @@ def _gsheets_locks_worksheet():
         except Exception:
             pass
         return ws
-    except Exception:
+    except Exception as e:
+        if _gsheets_is_quota_error(e):
+            _gsheets_mark_cooldown(180.0, str(e))
         return None
 
 
 def _load_board_locks_from_sheets() -> Dict[str, Dict]:
     """Load all board lock rows from Google Sheets."""
     out: Dict[str, Dict] = {}
+    if _gsheets_on_cooldown():
+        return out
     try:
         import json as _json
         ws = _gsheets_locks_worksheet()
@@ -1398,8 +1440,9 @@ def _load_board_locks_from_sheets() -> Dict[str, Dict]:
                 val = rec.get("locked")
                 data["_locked"] = str(val).lower() in ("1", "true", "yes", "y")
             out[key] = data
-    except Exception:
-        pass
+    except Exception as e:
+        if _gsheets_is_quota_error(e):
+            _gsheets_mark_cooldown(180.0, str(e))
     return out
 
 
@@ -1432,35 +1475,46 @@ def _save_board_locks_to_sheets(locks: Dict[str, Dict]) -> bool:
             # gspread update with full matrix
             ws.update(f"A1:D{len(rows)}", rows, value_input_option="RAW")
         return True
-    except Exception:
+    except Exception as e:
+        if _gsheets_is_quota_error(e):
+            _gsheets_mark_cooldown(180.0, str(e))
+        try:
+            st.session_state["_gsheets_last_error"] = f"{type(e).__name__}: {e}"
+        except Exception:
+            pass
         return False
 
 
 def _load_board_locks() -> Dict[str, Dict]:
     """
-    Priority: session → Google Sheets (permanent) → local JSON file.
-    Locked rows from Sheets always win over unlocked session copies.
+    Priority: session → Google Sheets (once per few minutes) → local JSON file.
+    Never hits Sheets on every game; that caused 429 quota errors.
     """
     locks: Dict[str, Dict] = {}
     if isinstance(st.session_state.get("board_locks"), dict):
         locks = dict(st.session_state["board_locks"])
 
-    # Google Sheets (survives Streamlit Cloud reboots)
+    last_fetch = float(st.session_state.get("_gsheets_locks_fetched_at") or 0)
+    need_sheet = (not locks) or ((float(_time.time()) - last_fetch) > 180.0)
     try:
-        if _gsheets_enabled():
+        if (
+            _gsheets_enabled()
+            and need_sheet
+            and not _gsheets_on_cooldown()
+        ):
             sheet_locks = _load_board_locks_from_sheets()
-            for k, v in sheet_locks.items():
+            st.session_state["_gsheets_locks_fetched_at"] = float(_time.time())
+            for k, v in (sheet_locks or {}).items():
                 if k not in locks:
                     locks[k] = v
                 elif v.get("_locked") and not locks[k].get("_locked"):
                     locks[k] = v
                 elif v.get("_locked") and locks[k].get("_locked"):
-                    # both locked — keep session if newer, else sheet
                     locks[k] = locks[k] if locks[k].get("_locked_at") else v
-    except Exception:
-        pass
+    except Exception as e:
+        if _gsheets_is_quota_error(e):
+            _gsheets_mark_cooldown(180.0, str(e))
 
-    # Local file fallback
     try:
         if BOARD_LOCK_PATH.exists():
             import json as _json
@@ -1487,21 +1541,38 @@ def _load_board_locks() -> Dict[str, Dict]:
     return locks
 
 
-def _save_board_locks(locks: Dict[str, Dict]) -> None:
+def _save_board_locks(locks: Dict[str, Dict], flush: bool = False) -> None:
+    """Update session immediately. Write Google Sheets only on flush (end of rebuild)."""
     st.session_state["board_locks"] = locks
-    # Permanent: Google Sheets
-    try:
-        if _gsheets_enabled():
-            _save_board_locks_to_sheets(locks)
-    except Exception:
-        pass
-    # Best-effort local file (ephemeral on Streamlit Cloud)
+    st.session_state["board_locks_dirty"] = True
     try:
         import json as _json
         clean = {str(k): _serialize_lock_row(v) if isinstance(v, dict) else v for k, v in locks.items()}
         BOARD_LOCK_PATH.write_text(_json.dumps(clean, default=str), encoding="utf-8")
     except Exception:
         pass
+    if flush:
+        _flush_board_locks_to_sheets()
+
+
+def _flush_board_locks_to_sheets() -> bool:
+    """One Sheets write for the whole slate. Safe no-op on quota / missing secrets."""
+    if not st.session_state.get("board_locks_dirty"):
+        return True
+    if not _gsheets_enabled() or _gsheets_on_cooldown():
+        return False
+    locks = st.session_state.get("board_locks") or {}
+    try:
+        ok = _save_board_locks_to_sheets(locks if isinstance(locks, dict) else {})
+        if ok:
+            st.session_state["board_locks_dirty"] = False
+            st.session_state["_gsheets_locks_fetched_at"] = float(_time.time())
+            return True
+        return False
+    except Exception as e:
+        if _gsheets_is_quota_error(e):
+            _gsheets_mark_cooldown(180.0, str(e))
+        return False
 
 
 def board_lock_key(week, away, home, gameday) -> str:
@@ -5764,6 +5835,10 @@ with tab2:
         if opportunities:
             try:
                 _upsert_signals_from_opportunities(opportunities)
+            except Exception:
+                pass
+            try:
+                _flush_board_locks_to_sheets()
             except Exception:
                 pass
             # Session cache — homepage / BYOA / reruns reuse without full rebuild
