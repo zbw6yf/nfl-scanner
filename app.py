@@ -1058,14 +1058,41 @@ def _serialize_lock_row(row: Dict) -> Dict:
 
 
 def _gsheets_secrets_section():
-    """Return the google_sheets secrets mapping, or None."""
+    """
+    Return secrets mapping for Google Sheets.
+    Accepts several layouts so Streamlit secret naming is less brittle:
+      [google_sheets] ...
+      [gsheets] ...
+      [google] ...
+      root-level spreadsheet_id + service_account_json
+    """
+    # Nested sections
+    for name in ("google_sheets", "gsheets", "google", "GoogleSheets", "sheets"):
+        try:
+            if name in st.secrets:
+                sec = st.secrets[name]
+                # st.secrets sections behave like mappings
+                if sec is not None:
+                    return sec
+        except Exception:
+            continue
+    # Root-level keys
     try:
-        if "google_sheets" in st.secrets:
-            return st.secrets["google_sheets"]
+        root_keys = list(st.secrets.keys()) if hasattr(st.secrets, "keys") else []
+    except Exception:
+        root_keys = []
+    try:
+        if (
+            "spreadsheet_id" in root_keys
+            or "service_account_json" in root_keys
+            or "sheet_id" in root_keys
+            or "private_key" in root_keys
+        ):
+            return st.secrets
     except Exception:
         pass
+    # Last resort: probe gets without KeyError
     try:
-        # Some users paste keys at the root of secrets
         if st.secrets.get("spreadsheet_id") or st.secrets.get("service_account_json"):
             return st.secrets
     except Exception:
@@ -1105,9 +1132,13 @@ def _gsheets_status() -> Dict[str, Any]:
     try:
         sec = _gsheets_secrets_section()
         if sec is None:
+            try:
+                top = ", ".join(sorted(list(st.secrets.keys()))[:12]) or "(none)"
+            except Exception:
+                top = "(unable to list)"
             info["message"] = (
-                "No [google_sheets] section in Streamlit secrets. "
-                "Add spreadsheet_id and service_account_json under [google_sheets]."
+                "No Google Sheets secrets found. Top-level secret sections/keys: "
+                f"{top}. Add a [google_sheets] block with spreadsheet_id and service_account_json."
             )
             return info
         info["secrets_present"] = True
