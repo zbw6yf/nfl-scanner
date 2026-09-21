@@ -1157,10 +1157,8 @@ def _gsheets_status() -> Dict[str, Any]:
             return info
         client, ss = _gsheets_client()
         if client is None or ss is None:
-            info["message"] = (
-                "Secrets found, but connection failed. Check: Sheet shared with service account "
-                "as Editor, Sheets + Drive APIs enabled, and private_key JSON is valid."
-            )
+            detail = st.session_state.get("_gsheets_last_error") or "unknown error"
+            info["message"] = f"Secrets found, but connection failed — {detail}"
             return info
         ws = _gsheets_locks_worksheet()
         if ws is None:
@@ -1175,62 +1173,107 @@ def _gsheets_status() -> Dict[str, Any]:
 
 
 def _gsheets_client():
-    """Return (gspread client, spreadsheet) or (None, None)."""
+    """Return (gspread client, spreadsheet) or (None, None). Stores last error in session."""
+    try:
+        st.session_state.pop("_gsheets_last_error", None)
+    except Exception:
+        pass
     try:
         import json as _json
-        import gspread
-        from google.oauth2.service_account import Credentials
+        try:
+            import gspread
+            from google.oauth2.service_account import Credentials
+        except ImportError as ie:
+            st.session_state["_gsheets_last_error"] = (
+                f"Missing package: {ie}. Ensure requirements.txt has gspread and google-auth, then reboot."
+            )
+            return None, None
 
         sec = _gsheets_secrets_section()
         if sec is None:
+            st.session_state["_gsheets_last_error"] = "No secrets section found."
             return None, None
 
         cred_info = None
-        if sec.get("service_account_json"):
-            raw = sec.get("service_account_json")
-            if isinstance(raw, str):
-                raw = raw.strip()
-                cred_info = _json.loads(raw)
-            else:
-                cred_info = dict(raw)
-        elif sec.get("credentials"):
-            raw = sec.get("credentials")
-            cred_info = _json.loads(raw) if isinstance(raw, str) else dict(raw)
-        elif sec.get("type") == "service_account" or sec.get("private_key"):
-            cred_info = {k: sec[k] for k in sec}
-            for k in ("spreadsheet_id", "sheet_id", "spreadsheet_url", "worksheet", "board_locks_sheet"):
-                cred_info.pop(k, None)
-
-        if not cred_info or not cred_info.get("private_key"):
+        try:
+            if sec.get("service_account_json"):
+                raw = sec.get("service_account_json")
+                if isinstance(raw, str):
+                    raw = raw.strip()
+                    # Strip accidental markdown fences
+                    if raw.startswith("```"):
+                        raw = raw.strip("`")
+                        if raw.lower().startswith("json"):
+                            raw = raw[4:].strip()
+                    cred_info = _json.loads(raw)
+                else:
+                    cred_info = dict(raw)
+            elif sec.get("credentials"):
+                raw = sec.get("credentials")
+                cred_info = _json.loads(raw) if isinstance(raw, str) else dict(raw)
+            elif sec.get("type") == "service_account" or sec.get("private_key"):
+                cred_info = {k: sec[k] for k in sec}
+                for k in ("spreadsheet_id", "sheet_id", "spreadsheet_url", "worksheet", "board_locks_sheet"):
+                    cred_info.pop(k, None)
+        except Exception as e:
+            st.session_state["_gsheets_last_error"] = f"Could not parse service account JSON: {type(e).__name__}: {e}"
             return None, None
 
-        # Normalize private_key newlines when JSON used escaped \n
+        if not cred_info:
+            st.session_state["_gsheets_last_error"] = "service_account_json is empty or missing."
+            return None, None
+        if not cred_info.get("private_key"):
+            st.session_state["_gsheets_last_error"] = "JSON missing private_key field."
+            return None, None
+        if not cred_info.get("client_email"):
+            st.session_state["_gsheets_last_error"] = "JSON missing client_email field."
+            return None, None
+
         pk = cred_info.get("private_key")
         if isinstance(pk, str) and "-----BEGIN" in pk:
+            # Turn escaped newlines into real ones
             cred_info["private_key"] = pk.replace(chr(92) + "n", chr(10))
 
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
-        creds = Credentials.from_service_account_info(cred_info, scopes=scopes)
-        client = gspread.authorize(creds)
+        try:
+            creds = Credentials.from_service_account_info(cred_info, scopes=scopes)
+            client = gspread.authorize(creds)
+        except Exception as e:
+            st.session_state["_gsheets_last_error"] = (
+                f"Auth failed for {cred_info.get('client_email')}: {type(e).__name__}: {e}"
+            )
+            return None, None
 
         sid = sec.get("spreadsheet_id") or sec.get("sheet_id")
-        if sid:
-            sid = str(sid).strip()
-            # Allow full URL pasted into spreadsheet_id by mistake
-            if "docs.google.com" in sid:
-                ss = client.open_by_url(sid)
+        try:
+            if sid:
+                sid = str(sid).strip().strip('"').strip("'")
+                if "docs.google.com" in sid:
+                    ss = client.open_by_url(sid)
+                else:
+                    ss = client.open_by_key(sid)
                 return client, ss
-            ss = client.open_by_key(sid)
-            return client, ss
-        if sec.get("spreadsheet_url"):
-            ss = client.open_by_url(str(sec.get("spreadsheet_url")))
-            return client, ss
+            if sec.get("spreadsheet_url"):
+                ss = client.open_by_url(str(sec.get("spreadsheet_url")))
+                return client, ss
+            st.session_state["_gsheets_last_error"] = "No spreadsheet_id or spreadsheet_url in secrets."
+            return None, None
+        except Exception as e:
+            email = cred_info.get("client_email", "?")
+            st.session_state["_gsheets_last_error"] = (
+                f"Could not open spreadsheet (shared with {email} as Editor?): {type(e).__name__}: {e}"
+            )
+            return None, None
+    except Exception as e:
+        try:
+            st.session_state["_gsheets_last_error"] = f"{type(e).__name__}: {e}"
+        except Exception:
+            pass
         return None, None
-    except Exception:
-        return None, None
+
 
 
 def _gsheets_locks_worksheet():
