@@ -1172,6 +1172,79 @@ def _gsheets_status() -> Dict[str, Any]:
         return info
 
 
+
+def _parse_service_account_json(raw: str) -> dict:
+    """
+    Parse service-account JSON from Streamlit secrets.
+    Fixes: JSONDecodeError Invalid control character (raw newlines in private_key).
+    """
+    import json as _json
+    import re as _re
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("empty service_account_json")
+
+    try:
+        return _json.loads(text)
+    except Exception:
+        pass
+
+    # Escape newlines/tabs inside private_key "..." value only
+    pattern = _re.compile(r'("private_key"\s*:\s*")([\s\S]*?)("\s*,)', _re.MULTILINE)
+
+    def _esc(m):
+        body = m.group(2)
+        body = body.replace("\r\n", "\n").replace("\r", "\n")
+        body = body.replace("\\", "\\\\")  # careful: may double-escape
+        # undo double-escaping of existing \n sequences
+        body = body.replace("\\\\n", "\\n")
+        body = body.replace("\n", "\\n").replace("\t", "\\t")
+        return m.group(1) + body + m.group(3)
+
+    fixed = pattern.sub(_esc, text, count=1)
+    try:
+        return _json.loads(fixed)
+    except Exception:
+        pass
+
+    # Rebuild from PEM + string fields
+    def grab(key: str):
+        m = _re.search(r'"' + key + r'"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+        if not m:
+            return None
+        try:
+            return _json.loads('"' + m.group(1) + '"')
+        except Exception:
+            return m.group(1)
+
+    pem_m = _re.search(r"-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----", text)
+    if not pem_m:
+        raise ValueError("Could not parse service_account_json (private_key block not found)")
+    pk = pem_m.group(0).replace("\\n", "\n")
+    if "\n" not in pk:
+        pk = pk.replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----\n")
+        pk = pk.replace("-----END PRIVATE KEY-----", "\n-----END PRIVATE KEY-----")
+    if not pk.endswith("\n"):
+        pk += "\n"
+
+    info = {
+        "type": grab("type") or "service_account",
+        "project_id": grab("project_id"),
+        "private_key_id": grab("private_key_id"),
+        "private_key": pk,
+        "client_email": grab("client_email"),
+        "client_id": grab("client_id"),
+        "auth_uri": grab("auth_uri") or "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": grab("token_uri") or "https://oauth2.googleapis.com/token",
+        "auth_provider_x509_cert_url": grab("auth_provider_x509_cert_url")
+        or "https://www.googleapis.com/oauth2/v1/certs",
+        "client_x509_cert_url": grab("client_x509_cert_url"),
+    }
+    if not info.get("client_email"):
+        raise ValueError("client_email missing from service_account_json")
+    return {k: v for k, v in info.items() if v is not None}
+
+
 def _gsheets_client():
     """Return (gspread client, spreadsheet) or (None, None). Stores last error in session."""
     try:
@@ -1200,12 +1273,11 @@ def _gsheets_client():
                 raw = sec.get("service_account_json")
                 if isinstance(raw, str):
                     raw = raw.strip()
-                    # Strip accidental markdown fences
                     if raw.startswith("```"):
                         raw = raw.strip("`")
                         if raw.lower().startswith("json"):
                             raw = raw[4:].strip()
-                    cred_info = _json.loads(raw)
+                    cred_info = _parse_service_account_json(raw)
                 else:
                     cred_info = dict(raw)
             elif sec.get("credentials"):
