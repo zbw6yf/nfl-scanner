@@ -6017,39 +6017,6 @@ with tab2:
         ]
         cols = [c for c in cols if c in display_df.columns]
 
-        st.markdown("#### Spread recommendations")
-        st.caption("Every game: estimated cover probabilities and ATS lean (Home/Away ATS).")
-        spread_cols = [
-            "Week", "Game", "Kickoff", "Spread Rec", "Spread Conf", "Spread Score",
-            "Spread", "P Home Cover", "P Away Cover", "Power Edge", "Home Power", "Away Power",
-            "Model %", "Market %", "Edge %", "EPA Edge", "Form Δ", "TZ Diff", "Signals",
-        ]
-        spread_cols = [c for c in spread_cols if c in display_df.columns]
-        spread_view = display_df.copy()
-        if "Spread Score" in spread_view.columns:
-            try:
-                spread_view["_ss"] = pd.to_numeric(spread_view["Spread Score"], errors="coerce")
-                spread_view = spread_view.sort_values("_ss", ascending=False)
-            except Exception:
-                pass
-        st.dataframe(spread_view[spread_cols], use_container_width=True, hide_index=True)
-
-        st.markdown("#### Total recommendations")
-        st.caption("Every game: estimated over/under probabilities and total lean.")
-        total_cols = [
-            "Week", "Game", "Kickoff", "Total Rec", "Total Conf", "Total Score",
-            "Total", "P Over", "P Under", "Totals Agree", "MC Over %", "Pace", "Weather", "Signals",
-        ]
-        total_cols = [c for c in total_cols if c in display_df.columns]
-        total_view = display_df.copy()
-        if "Total Score" in total_view.columns:
-            try:
-                total_view["_ts"] = pd.to_numeric(total_view["Total Score"], errors="coerce")
-                total_view = total_view.sort_values("_ts", ascending=False)
-            except Exception:
-                pass
-        st.dataframe(total_view[total_cols], use_container_width=True, hide_index=True)
-
         st.markdown("#### Top Plays of The Week")
         st.caption("Top 5 by highest Score, then highest Confidence (A → F).")
         if available_weeks:
@@ -6090,6 +6057,39 @@ with tab2:
             )
             top5 = df.head(5)
             st.dataframe(top5[cols], use_container_width=True, hide_index=True)
+
+        st.markdown("#### Spread recommendations")
+        st.caption("Every game: estimated cover probabilities and ATS lean (Home/Away ATS).")
+        spread_cols = [
+            "Week", "Game", "Kickoff", "Spread Rec", "Spread Conf", "Spread Score",
+            "Spread", "P Home Cover", "P Away Cover", "Power Edge", "Home Power", "Away Power",
+            "Model %", "Market %", "Edge %", "EPA Edge", "Form Δ", "TZ Diff", "Signals",
+        ]
+        spread_cols = [c for c in spread_cols if c in display_df.columns]
+        spread_view = display_df.copy()
+        if "Spread Score" in spread_view.columns:
+            try:
+                spread_view["_ss"] = pd.to_numeric(spread_view["Spread Score"], errors="coerce")
+                spread_view = spread_view.sort_values("_ss", ascending=False)
+            except Exception:
+                pass
+        st.dataframe(spread_view[spread_cols], use_container_width=True, hide_index=True)
+
+        st.markdown("#### Total recommendations")
+        st.caption("Every game: estimated over/under probabilities and total lean.")
+        total_cols = [
+            "Week", "Game", "Kickoff", "Total Rec", "Total Conf", "Total Score",
+            "Total", "P Over", "P Under", "Totals Agree", "MC Over %", "Pace", "Weather", "Signals",
+        ]
+        total_cols = [c for c in total_cols if c in display_df.columns]
+        total_view = display_df.copy()
+        if "Total Score" in total_view.columns:
+            try:
+                total_view["_ts"] = pd.to_numeric(total_view["Total Score"], errors="coerce")
+                total_view = total_view.sort_values("_ts", ascending=False)
+            except Exception:
+                pass
+        st.dataframe(total_view[total_cols], use_container_width=True, hide_index=True)
 
         st.markdown("#### Top Signal Summary")
         st.caption(
