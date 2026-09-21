@@ -1057,18 +1057,90 @@ def _serialize_lock_row(row: Dict) -> Dict:
 
 
 
-def _gsheets_enabled() -> bool:
-    """True when Streamlit secrets include Google service account + spreadsheet id."""
+def _gsheets_secrets_section():
+    """Return the google_sheets secrets mapping, or None."""
     try:
-        sec = st.secrets.get("google_sheets", None)
+        if "google_sheets" in st.secrets:
+            return st.secrets["google_sheets"]
+    except Exception:
+        pass
+    try:
+        # Some users paste keys at the root of secrets
+        if st.secrets.get("spreadsheet_id") or st.secrets.get("service_account_json"):
+            return st.secrets
+    except Exception:
+        pass
+    return None
+
+
+def _gsheets_enabled() -> bool:
+    """True when secrets look like they include sheet id + credentials."""
+    try:
+        sec = _gsheets_secrets_section()
         if sec is None:
             return False
-        # support both nested and flat
-        has_id = bool(sec.get("spreadsheet_id") or sec.get("sheet_id") or sec.get("spreadsheet_url"))
-        has_json = bool(sec.get("service_account_json") or sec.get("credentials") or "type" in sec)
-        return bool(has_id and (has_json or sec.get("type") == "service_account"))
+        has_id = bool(
+            sec.get("spreadsheet_id")
+            or sec.get("sheet_id")
+            or sec.get("spreadsheet_url")
+        )
+        has_json = bool(
+            sec.get("service_account_json")
+            or sec.get("credentials")
+            or sec.get("private_key")
+            or sec.get("type") == "service_account"
+        )
+        return bool(has_id and has_json)
     except Exception:
         return False
+
+
+def _gsheets_status() -> Dict[str, Any]:
+    """Diagnostic status for the Big Board caption / Advanced tab."""
+    info: Dict[str, Any] = {
+        "secrets_present": False,
+        "connected": False,
+        "message": "Google Sheets secrets not found.",
+    }
+    try:
+        sec = _gsheets_secrets_section()
+        if sec is None:
+            info["message"] = (
+                "No [google_sheets] section in Streamlit secrets. "
+                "Add spreadsheet_id and service_account_json under [google_sheets]."
+            )
+            return info
+        info["secrets_present"] = True
+        has_id = bool(sec.get("spreadsheet_id") or sec.get("sheet_id") or sec.get("spreadsheet_url"))
+        has_json = bool(
+            sec.get("service_account_json")
+            or sec.get("credentials")
+            or sec.get("private_key")
+            or sec.get("type") == "service_account"
+        )
+        if not has_id:
+            info["message"] = "Secrets found, but spreadsheet_id (or spreadsheet_url) is missing."
+            return info
+        if not has_json:
+            info["message"] = "Secrets found, but service_account_json / credentials are missing."
+            return info
+        client, ss = _gsheets_client()
+        if client is None or ss is None:
+            info["message"] = (
+                "Secrets found, but connection failed. Check: Sheet shared with service account "
+                "as Editor, Sheets + Drive APIs enabled, and private_key JSON is valid."
+            )
+            return info
+        ws = _gsheets_locks_worksheet()
+        if ws is None:
+            info["message"] = "Connected to spreadsheet, but could not open/create board_locks tab."
+            return info
+        info["connected"] = True
+        info["message"] = f"Connected · spreadsheet “{getattr(ss, 'title', 'ok')}” · tab “{ws.title}”"
+        return info
+    except Exception as e:
+        info["message"] = f"Google Sheets error: {type(e).__name__}: {e}"
+        return info
 
 
 def _gsheets_client():
@@ -1078,22 +1150,33 @@ def _gsheets_client():
         import gspread
         from google.oauth2.service_account import Credentials
 
-        sec = st.secrets["google_sheets"]
-        # Credentials: full JSON string OR the whole [google_sheets] block is the SA dict
+        sec = _gsheets_secrets_section()
+        if sec is None:
+            return None, None
+
         cred_info = None
         if sec.get("service_account_json"):
             raw = sec.get("service_account_json")
-            cred_info = _json.loads(raw) if isinstance(raw, str) else dict(raw)
+            if isinstance(raw, str):
+                raw = raw.strip()
+                cred_info = _json.loads(raw)
+            else:
+                cred_info = dict(raw)
         elif sec.get("credentials"):
             raw = sec.get("credentials")
             cred_info = _json.loads(raw) if isinstance(raw, str) else dict(raw)
-        elif sec.get("type") == "service_account":
-            cred_info = dict(sec)
-            # remove non-credential keys
+        elif sec.get("type") == "service_account" or sec.get("private_key"):
+            cred_info = {k: sec[k] for k in sec}
             for k in ("spreadsheet_id", "sheet_id", "spreadsheet_url", "worksheet", "board_locks_sheet"):
                 cred_info.pop(k, None)
-        if not cred_info:
+
+        if not cred_info or not cred_info.get("private_key"):
             return None, None
+
+        # Normalize private_key newlines when JSON used escaped \n
+        pk = cred_info.get("private_key")
+        if isinstance(pk, str) and "-----BEGIN" in pk:
+            cred_info["private_key"] = pk.replace(chr(92) + "n", chr(10))
 
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
@@ -1103,13 +1186,18 @@ def _gsheets_client():
         client = gspread.authorize(creds)
 
         sid = sec.get("spreadsheet_id") or sec.get("sheet_id")
-        if not sid and sec.get("spreadsheet_url"):
-            client_open = client.open_by_url(str(sec.get("spreadsheet_url")))
-            return client, client_open
-        if not sid:
-            return None, None
-        ss = client.open_by_key(str(sid))
-        return client, ss
+        if sid:
+            sid = str(sid).strip()
+            # Allow full URL pasted into spreadsheet_id by mistake
+            if "docs.google.com" in sid:
+                ss = client.open_by_url(sid)
+                return client, ss
+            ss = client.open_by_key(sid)
+            return client, ss
+        if sec.get("spreadsheet_url"):
+            ss = client.open_by_url(str(sec.get("spreadsheet_url")))
+            return client, ss
+        return None, None
     except Exception:
         return None, None
 
@@ -4843,7 +4931,17 @@ with tab2:
         else:
             st.caption("No board cache yet")
     with _bb_top[2]:
-        st.caption(f"Board auto-refreshes every {BB_CACHE_TTL_SEC // 60} min, or when you click Refresh. ""Each game **locks at kickoff**. "+ ("Locks persist via **Google Sheets**." if _gsheets_enabled() else "Add Google Sheets secrets to keep locks after reboot."))
+        _gs = _gsheets_status()
+        _lock_note = (
+            f"Locks persist via **Google Sheets** — {_gs.get('message')}"
+            if _gs.get("connected")
+            else f"Kickoff locks are on, but Sheets is not connected yet — {_gs.get('message')}"
+        )
+        st.caption(
+            f"Board auto-refreshes every {BB_CACHE_TTL_SEC // 60} min, or when you click Refresh. "
+            f"Each game **locks at kickoff**. {_lock_note}"
+        )
+
 
     # Rebuild only when user clicks Refresh (flag survives the button's single-run True pulse)
     if refresh_bb:
