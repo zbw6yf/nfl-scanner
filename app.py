@@ -4001,16 +4001,36 @@ def _potd_lock_path() -> Path:
 
 
 def _load_potd_locks() -> Dict[str, Any]:
-    if "potd_locks" in st.session_state and isinstance(st.session_state.get("potd_locks"), dict):
-        return st.session_state["potd_locks"]
     locks: Dict[str, Any] = {}
+    if "potd_locks" in st.session_state and isinstance(st.session_state.get("potd_locks"), dict):
+        locks = dict(st.session_state["potd_locks"])
     try:
         p = _potd_lock_path()
         if p.exists():
             import json as _json
             raw = _json.loads(p.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
-                locks = raw
+                for k, v in raw.items():
+                    if k not in locks:
+                        locks[k] = v
+                    elif isinstance(v, dict) and v.get("_locked") and not (
+                        isinstance(locks.get(k), dict) and locks[k].get("_locked")
+                    ):
+                        locks[k] = v
+    except Exception:
+        pass
+    # Permanent copy lives in board_locks / Google Sheets as __potd_week_N
+    try:
+        bl = st.session_state.get("board_locks")
+        if isinstance(bl, dict):
+            for k, v in bl.items():
+                if not str(k).startswith("__potd_") or not isinstance(v, dict):
+                    continue
+                wk = str(k).replace("__potd_", "")
+                if wk not in locks:
+                    locks[wk] = v
+                elif v.get("_locked") and not locks[wk].get("_locked"):
+                    locks[wk] = v
     except Exception:
         pass
     st.session_state["potd_locks"] = locks
@@ -4022,6 +4042,16 @@ def _save_potd_locks(locks: Dict[str, Any]) -> None:
     try:
         import json as _json
         _potd_lock_path().write_text(_json.dumps(locks, default=str), encoding="utf-8")
+    except Exception:
+        pass
+    # Mirror into board_locks so Google Sheets flush keeps POTD after reboot
+    try:
+        bl = dict(st.session_state.get("board_locks") or {})
+        for k, v in (locks or {}).items():
+            if isinstance(v, dict):
+                bl[f"__potd_{k}"] = dict(v)
+        st.session_state["board_locks"] = bl
+        st.session_state["board_locks_dirty"] = True
     except Exception:
         pass
 
@@ -4050,12 +4080,30 @@ def _week_first_game_started(week: int, schedules: Optional[pd.DataFrame] = None
                     continue
             except Exception:
                 continue
+            if o.get("_locked"):
+                return True
             if game_has_started(
                 kickoff=str(o.get("Kickoff") or ""),
                 gameday=str(o.get("_gameday") or o.get("Kickoff") or "")[:10],
                 commence_raw=str(o.get("_commence_raw") or ""),
             ):
                 return True
+        # 2b) Locked board rows for this week already prove kickoff happened
+        try:
+            for k, v in (st.session_state.get("board_locks") or {}).items():
+                if not isinstance(v, dict) or not v.get("_locked"):
+                    continue
+                if str(k).startswith("__potd_"):
+                    continue
+                try:
+                    wk = v.get("Week")
+                    if wk is not None and int(float(str(wk).replace("Week", "").strip())) == week:
+                        return True
+                except Exception:
+                    if str(k).startswith(f"{week}_"):
+                        return True
+        except Exception:
+            pass
         # 3) Embedded schedule fallback
         try:
             for row in EMBEDDED_2026_SCHEDULE:
@@ -4623,11 +4671,34 @@ def _pick_top_play(opportunities: list) -> Optional[Dict]:
 
 
 def _potd_from_board_cache(week: Optional[int] = None, opps: Optional[list] = None) -> Optional[Dict]:
-    """Derive Play of the Day from Big Board rows (session or explicit list)."""
+    """Derive Play of the Day from Big Board rows. After first kickoff, never replace a saved snapshot."""
     if opps is None:
         opps = st.session_state.get("bb_opportunities")
+    week_started = False
+    key = None
+    existing = None
+    if week is not None:
+        try:
+            wk = int(week)
+            key = f"week_{wk}"
+            week_started = bool(_week_first_game_started(wk))
+            locks = _load_potd_locks()
+            existing = locks.get(key) if isinstance(locks.get(key), dict) else None
+            # If the week has started and we already have a card, freeze it and stop
+            if week_started and existing and existing.get("Game"):
+                snap = dict(existing)
+                snap["_locked"] = True
+                snap["_week"] = wk
+                locks[key] = snap
+                _save_potd_locks(locks)
+                st.session_state["bb_play_of_day"] = dict(snap)
+                return dict(snap)
+        except Exception:
+            week_started = False
+
     if not isinstance(opps, list) or not opps:
-        return None
+        return dict(existing) if isinstance(existing, dict) and existing.get("Game") else None
+
     week_rows = []
     if week is not None:
         try:
@@ -4637,7 +4708,6 @@ def _potd_from_board_cache(week: Optional[int] = None, opps: Optional[list] = No
                     w = o.get("Week")
                     if w is None or str(w) in ("—", "nan", "None", ""):
                         continue
-                    # Accept 2, 2.0, "2", "Week 2"
                     ws = str(w).replace("Week", "").replace("week", "").strip()
                     if int(float(ws)) == wk:
                         week_rows.append(o)
@@ -4648,25 +4718,32 @@ def _potd_from_board_cache(week: Optional[int] = None, opps: Optional[list] = No
     rows = week_rows if week_rows else list(opps)
     pick = _pick_top_play(rows)
     if not pick:
-        return None
+        return dict(existing) if isinstance(existing, dict) and existing.get("Game") else None
     pick = dict(pick)
+    if week_started:
+        pick["_locked"] = True
+        pick["_locked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     st.session_state["bb_play_of_day"] = pick
-    # Persist unlocked snapshot so Homepage works after tab switch / light refresh
     try:
-        if week is not None and not pick.get("_locked"):
+        if week is not None:
             locks = _load_potd_locks()
             key = f"week_{int(week)}"
             existing = locks.get(key) if isinstance(locks.get(key), dict) else None
-            if not (existing and existing.get("_locked")):
-                snap = {
-                    k: (v if isinstance(v, (str, int, float, bool, type(None))) else str(v))
-                    for k, v in pick.items()
-                    if not str(k).startswith("_features")
-                }
-                snap["_locked"] = False
-                snap["_week"] = int(week)
-                locks[key] = snap
-                _save_potd_locks(locks)
+            if existing and existing.get("_locked"):
+                st.session_state["bb_play_of_day"] = dict(existing)
+                return dict(existing)
+            snap = {
+                k: (v if isinstance(v, (str, int, float, bool, type(None))) else str(v))
+                for k, v in pick.items()
+                if not str(k).startswith("_features")
+            }
+            snap["_locked"] = bool(week_started)
+            snap["_week"] = int(week)
+            if week_started:
+                snap["_locked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            locks[key] = snap
+            _save_potd_locks(locks)
+            pick["_locked"] = bool(week_started)
     except Exception:
         pass
     return pick
@@ -4786,21 +4863,34 @@ with tab1:
     if feature_enabled("today_card"):
         cur_wk = current_nfl_week() or 1
         potd = None
+        week_started = False
+        try:
+            week_started = bool(_week_first_game_started(int(cur_wk)))
+        except Exception:
+            week_started = False
         # 1) Locked Play of the Day for this week (after first kickoff)
         try:
             _locks = _load_potd_locks()
             _lk = _locks.get(f"week_{int(cur_wk)}")
-            if isinstance(_lk, dict) and _lk.get("_locked") and _lk.get("Game"):
-                potd = dict(_lk)
-                potd["_locked"] = True
-                try:
-                    potd = _enrich_potd_lines(potd, api_key or "")
-                except Exception:
-                    pass
+            if isinstance(_lk, dict) and _lk.get("Game"):
+                # Week already underway: freeze whatever snapshot we have and never re-pick
+                if week_started or _lk.get("_locked"):
+                    potd = dict(_lk)
+                    potd["_locked"] = True
+                    if not _lk.get("_locked"):
+                        _lk["_locked"] = True
+                        _lk["_locked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        _locks[f"week_{int(cur_wk)}"] = _lk
+                        _save_potd_locks(_locks)
+                    try:
+                        potd = _enrich_potd_lines(potd, api_key or "")
+                    except Exception:
+                        pass
+                    potd["_locked"] = True
         except Exception:
             potd = None
-        # 2) Unlocked snapshot from last board build (disk + session)
-        if potd is None:
+        # 2) Pre-kickoff only: unlocked snapshot can still update
+        if potd is None and not week_started:
             try:
                 _locks = _load_potd_locks()
                 _lk = _locks.get(f"week_{int(cur_wk)}")
@@ -4812,7 +4902,7 @@ with tab1:
                         pass
             except Exception:
                 pass
-        # 3) Highest confidence + score from loaded Big Board (session)
+        # 3) Live board pick — only before first kickoff, or to create the first lock
         if potd is None:
             try:
                 _opps = st.session_state.get("bb_opportunities") or opportunities
@@ -4822,22 +4912,23 @@ with tab1:
                         potd = _enrich_potd_lines(dict(potd), api_key or "")
                     except Exception:
                         pass
+                    if week_started:
+                        potd["_locked"] = True
             except Exception:
                 potd = None
-        # 3) Session pick set when board refreshed
+        # 4) Session pick (pre-kickoff only unless already locked)
         if potd is None and st.session_state.get("bb_play_of_day"):
             try:
-                potd = dict(st.session_state.get("bb_play_of_day") or {})
-                if potd.get("Game"):
+                _sess = dict(st.session_state.get("bb_play_of_day") or {})
+                if _sess.get("Game") and (not week_started or _sess.get("_locked")):
+                    potd = _sess
                     try:
                         potd = _enrich_potd_lines(potd, api_key or "")
                     except Exception:
                         pass
-                else:
-                    potd = None
             except Exception:
                 potd = None
-        # 4) Last resort: full builder (only if board rows exist)
+        # 5) Last resort builder (will lock inside if week started)
         if potd is None and st.session_state.get("bb_opportunities"):
             try:
                 with st.spinner("Selecting Play Of The Day..."):
@@ -4845,8 +4936,11 @@ with tab1:
                         int(cur_wk), api_key or "", n_simulations=n_simulations, form_window=form_window
                     )
             except Exception:
-                potd = _potd_from_board_cache(int(cur_wk))
-        locked = bool(potd and potd.get("_locked"))
+                if not week_started:
+                    potd = _potd_from_board_cache(int(cur_wk))
+        locked = bool(potd and (potd.get("_locked") or week_started))
+        if potd is not None and locked:
+            potd["_locked"] = True
         lock_note = " · Locked for the week" if locked else " · Updates until the first kickoff of the week"
         st.markdown(
             f"""
