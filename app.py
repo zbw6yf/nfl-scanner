@@ -943,7 +943,7 @@ _BOARD_LOCK_FIELDS = (
     # Identity / schedule
     "Week", "Game", "Kickoff", "Roof", "Weather",
     # Primary lean
-    "Recommendation", "Confidence", "Score", "Signals",
+    "Recommendation", "Confidence", "Score", "Signals", "Injury",
     # Spread market
     "Spread Rec", "Spread Conf", "Spread Score",
     "P Home Cover", "P Away Cover", "Power Edge", "Home Power", "Away Power",
@@ -3177,6 +3177,232 @@ def load_nfl_injury_report() -> pd.DataFrame:
     return pd.DataFrame(columns=cols)
 
 
+_OUT_STATUSES = {
+    "out", "doubtful", "ir", "injured reserve", "injured-reserve",
+    "pup", "nfi", "suspended", "dnp",
+}
+_Q_STATUSES = {"questionable", "q", "gtd", "game time decision"}
+_QB_POS = {"QB", "QUARTERBACK"}
+_WR_POS = {"WR", "WIDE RECEIVER"}
+_OL_POS = {"T", "OT", "LT", "RT", "G", "OG", "C", "OL", "TACKLE", "GUARD", "CENTER"}
+_RB_POS = {"RB", "HB", "FB", "RUNNING BACK"}
+
+
+def _injury_status_bucket(status: str) -> str:
+    s = str(status or "").strip().lower()
+    if s in _OUT_STATUSES or s.startswith("out") or "injured reserve" in s:
+        return "out"
+    if s in _Q_STATUSES or s.startswith("question"):
+        return "q"
+    return "other"
+
+
+def team_key_injury_flags(inj_df: Optional[pd.DataFrame], team_abbr: str) -> Dict[str, Any]:
+    """
+    Key-player availability for a team from the injury report.
+    Healthy starters are usually absent from the report, so an Out/Doubtful QB
+    is treated as the starter unless another QB is listed as Questionable (backup-out case).
+    """
+    out: Dict[str, Any] = {
+        "qb_out": False,
+        "qb_q": False,
+        "wr_out": 0,
+        "ol_out": 0,
+        "rb_out": False,
+        "labels": [],
+    }
+    if inj_df is None or getattr(inj_df, "empty", True) or not team_abbr:
+        return out
+    t = str(team_abbr).upper().replace("JAC", "JAX").replace("LAR", "LA")
+    df = inj_df.copy()
+    mask = pd.Series([False] * len(df), index=df.index)
+    if "Team Abbr" in df.columns:
+        mask = mask | df["Team Abbr"].astype(str).str.upper().isin([t, team_abbr.upper()])
+    if "Team" in df.columns:
+        try:
+            fn = str(full_name(t) or "").upper()
+            if fn:
+                mask = mask | df["Team"].astype(str).str.upper().str.contains(fn[:8], na=False)
+        except Exception:
+            pass
+    sub = df[mask]
+    if sub.empty:
+        return out
+
+    qbs = []
+    for _, r in sub.iterrows():
+        pos = str(r.get("Position") or "").upper().strip()
+        bucket = _injury_status_bucket(r.get("Game Status"))
+        player = str(r.get("Player") or "—").strip()
+        if pos in _QB_POS:
+            qbs.append((player, bucket))
+        elif pos in _WR_POS and bucket == "out":
+            out["wr_out"] += 1
+            out["labels"].append(f"{t} WR OUT ({player})")
+        elif pos in _OL_POS and bucket == "out":
+            out["ol_out"] += 1
+            out["labels"].append(f"{t} OL OUT ({player})")
+        elif pos in _RB_POS and bucket == "out":
+            out["rb_out"] = True
+            out["labels"].append(f"{t} RB OUT ({player})")
+
+    if qbs:
+        hard = [p for p, b in qbs if b == "out"]
+        qs = [p for p, b in qbs if b == "q"]
+        # Starter-out: only Out QB(s), no Questionable QB listed
+        if hard and not qs:
+            out["qb_out"] = True
+            out["labels"].append(f"{t} QB OUT ({hard[0]})")
+        elif qs and hard:
+            # Mixed: treat as backup out + starter questionable
+            out["qb_q"] = True
+            out["labels"].append(f"{t} QB Questionable ({qs[0]}); backup OUT")
+        elif qs:
+            out["qb_q"] = True
+            out["labels"].append(f"{t} QB Questionable ({qs[0]})")
+    return out
+
+
+def apply_injury_overrides(
+    home: str,
+    away: str,
+    inj_df: Optional[pd.DataFrame],
+    p_home_cover: float,
+    p_over: float,
+    spread_rec: str,
+    total_rec: str,
+    spread_score: float,
+    total_mkt_score: float,
+    signals: list,
+) -> Dict[str, Any]:
+    """
+    Hard override from injuries:
+      - Starting QB Out/Doubtful: pass that team's ATS lean; fade the other side;
+        nudge totals toward Under.
+      - WR/OL/RB Out: pass thin ATS leans for that offense; small Under nudge.
+      - Questionable QB: do not flip the pick; caller should cap confidence.
+    """
+    h = team_key_injury_flags(inj_df, home)
+    a = team_key_injury_flags(inj_df, away)
+    notes = list(h.get("labels") or []) + list(a.get("labels") or [])
+    for n in notes:
+        if n and n not in signals:
+            signals.append(n)
+
+    p_h = float(p_home_cover)
+    p_o = float(p_over)
+    s_rec = str(spread_rec)
+    t_rec = str(total_rec)
+    s_score = float(spread_score)
+    t_score = float(total_mkt_score)
+    cap_spread = None  # e.g. "C"
+
+    # --- QB Out ---
+    if h["qb_out"] and not a["qb_out"]:
+        p_h = max(0.08, p_h - 0.07)
+        p_o = max(0.08, p_o - 0.045)
+        if s_rec == "Home ATS":
+            s_rec = "No strong lean"
+            s_score *= 0.35
+            signals.append("Injury override: pass Home ATS (QB out)")
+        elif s_rec == "Away ATS":
+            s_score += 1.8
+            signals.append("Injury fade: Away ATS vs opponent QB out")
+    elif a["qb_out"] and not h["qb_out"]:
+        p_h = min(0.92, p_h + 0.07)
+        p_o = max(0.08, p_o - 0.045)
+        if s_rec == "Away ATS":
+            s_rec = "No strong lean"
+            s_score *= 0.35
+            signals.append("Injury override: pass Away ATS (QB out)")
+        elif s_rec == "Home ATS":
+            s_score += 1.8
+            signals.append("Injury fade: Home ATS vs opponent QB out")
+    elif h["qb_out"] and a["qb_out"]:
+        s_rec = "No strong lean"
+        s_score *= 0.3
+        p_o = max(0.08, p_o - 0.06)
+        signals.append("Injury override: both QBs out — pass ATS, lean Under")
+
+    # Questionable QB on the recommended side → cap confidence
+    if h["qb_q"] and s_rec == "Home ATS":
+        cap_spread = "C"
+        signals.append("QB Questionable (home) — confidence capped")
+    if a["qb_q"] and s_rec == "Away ATS":
+        cap_spread = "C"
+        signals.append("QB Questionable (away) — confidence capped")
+
+    # Skill-position / OL: pass thin leans for that offense
+    def _thin_pass(rec_side: str, wr_n: int, ol_n: int, rb: bool, side_name: str) -> str:
+        nonlocal s_score, p_o
+        if wr_n <= 0 and ol_n < 2 and not rb:
+            return rec_side
+        p_o = max(0.08, p_o - 0.015 * max(wr_n, 1 if (ol_n >= 2 or rb) else 0))
+        if rec_side == side_name:
+            signals.append(f"Injury override: pass {side_name} (skill/OL out)")
+            s_score *= 0.5
+            return "No strong lean"
+        return rec_side
+
+    s_rec = _thin_pass(s_rec, int(h["wr_out"]), int(h["ol_out"]), bool(h["rb_out"]), "Home ATS")
+    s_rec = _thin_pass(s_rec, int(a["wr_out"]), int(a["ol_out"]), bool(a["rb_out"]), "Away ATS")
+
+    # Totals: if we pushed under enough, refresh total rec
+    p_u = 1.0 - p_o
+    if h["qb_out"] or a["qb_out"]:
+        if p_u >= p_o and t_rec != "Under":
+            t_rec = "Under" if (p_u - 0.5) >= 0.008 else t_rec
+            if t_rec == "Under":
+                t_score = max(t_score, (p_u - 0.5) * 100.0 + 1.0)
+                signals.append("Injury override: totals toward Under (QB out)")
+        elif t_rec == "Over" and (h["qb_out"] or a["qb_out"]):
+            t_rec = "No strong lean"
+            t_score *= 0.4
+            signals.append("Injury override: pass Over (QB out)")
+
+    p_away = 1.0 - p_h
+    # If we passed injured-side ATS but the other side is now clearly better, allow fade rec
+    if s_rec == "No strong lean":
+        ats_edge = max(p_h, p_away) - 0.5
+        if ats_edge >= 0.04:
+            if (h["qb_out"] and not a["qb_out"] and p_away >= p_h):
+                s_rec = "Away ATS"
+                s_score = ats_edge * 100.0 + 1.0
+                signals.append("Injury fade restored: Away ATS")
+            elif (a["qb_out"] and not h["qb_out"] and p_h >= p_away):
+                s_rec = "Home ATS"
+                s_score = ats_edge * 100.0 + 1.0
+                signals.append("Injury fade restored: Home ATS")
+
+    label = " • ".join(notes) if notes else ""
+    return {
+        "p_home_cover": p_h,
+        "p_away_cover": 1.0 - p_h,
+        "p_over": p_o,
+        "p_under": 1.0 - p_o,
+        "spread_rec": s_rec,
+        "total_rec": t_rec,
+        "spread_score": s_score,
+        "total_mkt_score": t_score,
+        "cap_spread_conf": cap_spread,
+        "injury_label": label,
+        "signals": signals,
+        "home_flags": h,
+        "away_flags": a,
+    }
+
+
+def _cap_confidence_grade(grade: str, cap: Optional[str]) -> str:
+    if not cap:
+        return grade
+    order = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
+    g = str(grade or "F")[:1].upper()
+    c = str(cap)[:1].upper()
+    if order.get(g, 9) < order.get(c, 9):
+        return c
+    return g
+
+
 
 
 # ESPN numeric team IDs (injury scrapers)
@@ -5380,6 +5606,16 @@ with tab2:
                 team_success = pd.DataFrame()
         except Exception:
             team_success = pd.DataFrame()
+        inj_df = None
+        try:
+            inj_df = st.session_state.get("injuries_df")
+            if inj_df is None or (isinstance(inj_df, pd.DataFrame) and inj_df.empty):
+                inj_df = load_nfl_injury_report()
+                if inj_df is not None and not getattr(inj_df, "empty", True):
+                    st.session_state["injuries_df"] = inj_df
+                    st.session_state["injuries_ready"] = True
+        except Exception:
+            inj_df = st.session_state.get("injuries_df")
         for g in upcoming:
             try:
                 home = g["home"]
@@ -5773,6 +6009,39 @@ with tab2:
                 except Exception:
                     pass
 
+                # Injury / QB availability hard override
+                _inj_cap = None
+                _inj_label = ""
+                try:
+                    _inj = apply_injury_overrides(
+                        home, away, inj_df,
+                        p_home_cover, p_over,
+                        spread_rec, total_rec,
+                        spread_score, total_mkt_score,
+                        signals,
+                    )
+                    p_home_cover = float(_inj["p_home_cover"])
+                    p_away_cover = float(_inj["p_away_cover"])
+                    p_over = float(_inj["p_over"])
+                    p_under = float(_inj["p_under"])
+                    spread_rec = str(_inj["spread_rec"])
+                    total_rec = str(_inj["total_rec"])
+                    spread_score = float(_inj["spread_score"])
+                    total_mkt_score = float(_inj["total_mkt_score"])
+                    signals = list(_inj.get("signals") or signals)
+                    _inj_cap = _inj.get("cap_spread_conf")
+                    _inj_label = str(_inj.get("injury_label") or "")
+                    ats_prob = max(p_home_cover, p_away_cover)
+                    ats_edge = ats_prob - 0.5
+                    tot_prob = max(p_over, p_under)
+                    tot_edge = tot_prob - 0.5
+                    if spread_rec != "No strong lean" and ats_edge < SPREAD_MIN:
+                        spread_rec = "No strong lean"
+                    if total_rec != "No strong lean" and tot_edge < TOTAL_MIN:
+                        total_rec = "No strong lean"
+                except Exception as _inj_err:
+                    skipped.append(f"Injury override {away}@{home}: {_inj_err}")
+                    _inj_cap = None
                 # Primary (POTD / legacy columns) = stronger market with a real lean
                 if spread_rec != "No strong lean" and (
                     total_rec == "No strong lean" or ats_edge >= tot_edge
@@ -5875,9 +6144,12 @@ with tab2:
                         side_prob=side_prob,
                     ),
                     "Spread Rec": spread_rec,
-                    "Spread Conf": confidence_grade(
-                        spread_rec, spread_score, ml_home, mc, edge_pct, len(signals), agree,
-                        side_prob=ats_prob,
+                    "Spread Conf": _cap_confidence_grade(
+                        confidence_grade(
+                            spread_rec, spread_score, ml_home, mc, edge_pct, len(signals), agree,
+                            side_prob=ats_prob,
+                        ),
+                        _inj_cap,
                     ),
                     "Spread Score": round(float(spread_score), 2),
                     "P Home Cover": f"{p_home_cover*100:.1f}%",
@@ -5896,6 +6168,7 @@ with tab2:
                     "Total Score": round(float(total_mkt_score), 2),
                     "P Over": f"{p_over*100:.1f}%",
                     "P Under": f"{p_under*100:.1f}%",
+                    "Injury": _inj_label or "—",
                     "Signals": " • ".join(signals) if signals else "—",
                     "Score": round(total_score, 2),
                     # hidden numeric helpers for tracker
@@ -6107,7 +6380,7 @@ with tab2:
             "Spread Rec", "Spread Conf", "Spread Score",
             "Total Rec", "Total Conf", "Total Score",
             "Spread", "Total", "P Home Cover", "P Away Cover", "P Over", "P Under",
-            "EPA Edge", "Form Δ", "Signals",
+            "EPA Edge", "Form Δ", "Injury", "Signals",
         ]
         cols = [c for c in cols if c in display_df.columns]
 
@@ -6157,7 +6430,7 @@ with tab2:
         spread_cols = [
             "Week", "Game", "Kickoff", "Spread Rec", "Spread Conf", "Spread Score",
             "Spread", "P Home Cover", "P Away Cover", "Power Edge", "Home Power", "Away Power",
-            "Model %", "Market %", "Edge %", "EPA Edge", "Form Δ", "TZ Diff", "Signals",
+            "Model %", "Market %", "Edge %", "EPA Edge", "Form Δ", "TZ Diff", "Injury", "Signals",
         ]
         spread_cols = [c for c in spread_cols if c in display_df.columns]
         spread_view = display_df.copy()
@@ -6173,7 +6446,7 @@ with tab2:
         st.caption("Every game: estimated over/under probabilities and total lean.")
         total_cols = [
             "Week", "Game", "Kickoff", "Total Rec", "Total Conf", "Total Score",
-            "Total", "P Over", "P Under", "Totals Agree", "MC Over %", "Pace", "Weather", "Signals",
+            "Total", "P Over", "P Under", "Totals Agree", "MC Over %", "Pace", "Weather", "Injury", "Signals",
         ]
         total_cols = [c for c in total_cols if c in display_df.columns]
         total_view = display_df.copy()
