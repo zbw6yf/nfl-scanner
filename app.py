@@ -2621,9 +2621,11 @@ def confidence_grade(
     injury_penalty: float = 0.0,
 ) -> str:
     """
-    Multi-factor confidence grade.
-    Uses side probability, market edge, signal count, model–MC agreement,
-    and optional injury penalty.  A = strong consensus edge; F = no lean.
+    Multi-factor confidence grade built for *actionable* A/B picks.
+
+    A/B require independent agreement (model + MC, and preferably rule signals
+    or a clear market edge). Soft edges without agreement stay C/D/F so the
+    Top 5 is not flooded with coin-flips.
     """
     rec_n = str(rec or "").strip()
     if rec_n in ("No strong lean", "—", "-", "", "None", "nan"):
@@ -2648,10 +2650,25 @@ def confidence_grade(
     n_sig = max(0, int(n_signals or 0))
     agree_f = float(agree or 0.0)
 
-    # --- scored components ---
+    # MC side alone (for dual-model check)
+    try:
+        if rec_n == "Home ATS":
+            mc_edge = float(mc.get("home_cover_prob", 0.5)) - 0.5
+        elif rec_n == "Away ATS":
+            mc_edge = (1.0 - float(mc.get("home_cover_prob", 0.5))) - 0.5
+        elif rec_n == "Over":
+            mc_edge = float(mc.get("over_prob", 0.5)) - 0.5
+        else:
+            mc_edge = float(mc.get("under_prob", 0.5)) - 0.5
+    except Exception:
+        mc_edge = 0.0
+    dual_agree = (edge > 0.0 and mc_edge > 0.0) or (edge < 0.0 and mc_edge < 0.0)
+    # Both models meaningfully on same side
+    strong_dual = dual_agree and edge >= 0.03 and mc_edge >= 0.02
+
     score = 0.0
 
-    # Probability edge past 50%
+    # Probability edge
     if edge >= 0.10:
         score += 4.0
     elif edge >= 0.07:
@@ -2660,32 +2677,44 @@ def confidence_grade(
         score += 2.0
     elif edge >= 0.025:
         score += 1.0
+    elif edge >= 0.012:
+        score += 0.4
 
-    # Model–MC agreement
-    score += min(2.0, agree_f * 1.25)
-
-    # Supporting rule signals
-    score += min(1.5, n_sig * 0.25)
-
-    # Market edge (model vs implied)
-    if edge_abs >= 4.0:
+    # Independent agreement (ML ↔ MC)
+    if strong_dual:
+        score += 2.5
+    elif dual_agree and agree_f > 0:
         score += 1.5
+    elif agree_f > 0:
+        score += 0.75
+
+    # Rule / situational signals
+    if n_sig >= 4:
+        score += 1.75
+    elif n_sig >= 2:
+        score += 1.0
+    elif n_sig >= 1:
+        score += 0.4
+
+    # Market disagreement (model sees value)
+    if edge_abs >= 4.0:
+        score += 1.75
     elif edge_abs >= 2.5:
         score += 1.0
     elif edge_abs >= 1.5:
         score += 0.5
 
-    # Injury drag (caller can pass 0–2+)
     score -= max(0.0, float(injury_penalty or 0.0))
 
-    # Graded bands — always have a letter; A/B reserved for real edges + support
-    if score >= 6.0 and edge >= 0.04 and (agree_f > 0 or n_sig >= 2):
+    # A/B gates: need edge + at least one form of independent support
+    has_support = strong_dual or (agree_f > 0 and n_sig >= 2) or (edge_abs >= 2.5 and n_sig >= 1)
+    if score >= 6.5 and edge >= 0.045 and has_support:
         return "A"
-    if score >= 4.5 and edge >= 0.025:
+    if score >= 5.0 and edge >= 0.028 and (has_support or dual_agree):
         return "B"
-    if score >= 3.0:
+    if score >= 3.25:
         return "C"
-    if score >= 1.5 or edge >= 0.01:
+    if score >= 1.5 or edge >= 0.012:
         return "D"
     return "F"
 
@@ -4802,10 +4831,17 @@ def build_play_of_the_day(
                 for _s in (tot_env.get("signals") or []):
                     if _s and _s not in signals:
                         signals.append(str(_s))
-                agree = 1.5 if (
-                    (ml_home >= 0.52 and mc["home_cover_prob"] >= 0.52)
-                    or (ml_home <= 0.48 and mc["home_cover_prob"] <= 0.48)
-                ) else 0.0
+                # Richer agreement: direction match + closeness of ML vs MC
+                _ml = float(ml_home)
+                _mc = float(mc["home_cover_prob"])
+                if (_ml >= 0.52 and _mc >= 0.52) or (_ml <= 0.48 and _mc <= 0.48):
+                    agree = 1.5
+                    if abs(_ml - _mc) <= 0.04:
+                        agree = 2.0  # models nearly identical on side
+                elif (_ml - 0.5) * (_mc - 0.5) > 0:
+                    agree = 0.75  # same direction, weak magnitude
+                else:
+                    agree = 0.0
                 ats_side = "Home ATS" if p_home_cover >= p_away_cover else "Away ATS"
                 ats_prob = max(p_home_cover, p_away_cover)
                 tot_side = "Over" if p_over >= p_under else "Under"
@@ -6014,10 +6050,17 @@ with tab2:
                     totals_agree = 0.45
 
                 # Model / sim agreement on ATS side
-                agree = 1.5 if (
-                    (ml_home >= 0.52 and mc["home_cover_prob"] >= 0.52)
-                    or (ml_home <= 0.48 and mc["home_cover_prob"] <= 0.48)
-                ) else 0.0
+                # Richer agreement: direction match + closeness of ML vs MC
+                _ml = float(ml_home)
+                _mc = float(mc["home_cover_prob"])
+                if (_ml >= 0.52 and _mc >= 0.52) or (_ml <= 0.48 and _mc <= 0.48):
+                    agree = 1.5
+                    if abs(_ml - _mc) <= 0.04:
+                        agree = 2.0  # models nearly identical on side
+                elif (_ml - 0.5) * (_mc - 0.5) > 0:
+                    agree = 0.75  # same direction, weak magnitude
+                else:
+                    agree = 0.0
 
                 ats_side = "Home ATS" if p_home_cover >= p_away_cover else "Away ATS"
                 ats_prob = max(p_home_cover, p_away_cover)
@@ -6431,7 +6474,7 @@ with tab2:
         cols = [c for c in cols if c in display_df.columns]
 
         st.markdown("#### Top Plays of The Week")
-        st.caption("Top 5 by highest Score, then highest Confidence (A → F).")
+        st.caption("Top 5 by highest Confidence (A → F), then highest Score.")
         if available_weeks:
             cur_wk = current_nfl_week()
             default_lab = week_choices[1] if len(week_choices) > 1 else week_choices[0]
@@ -6455,10 +6498,10 @@ with tab2:
                     .map(lambda x: _conf_rank.get(x, 9))
                 )
                 week_df = (
-                    week_df.sort_values(["Score", "_cr"], ascending=[False, True])
+                    week_df.sort_values(["_cr", "Score"], ascending=[True, False])
                     .head(5)
                 )
-                st.markdown(f"**{selected_label}** — top {len(week_df)} plays")
+                st.markdown(f"**{selected_label}** — top {len(week_df)} by Confidence, then Score")
                 st.dataframe(week_df[cols], use_container_width=True, hide_index=True)
             except Exception:
                 top5 = df.head(5)
