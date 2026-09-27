@@ -2678,14 +2678,14 @@ def confidence_grade(
     # Injury drag (caller can pass 0–2+)
     score -= max(0.0, float(injury_penalty or 0.0))
 
-    # Require a real lean and some support for A/B
-    if score >= 6.5 and edge >= 0.045 and (agree_f > 0 or n_sig >= 3):
+    # Graded bands — always have a letter; A/B reserved for real edges + support
+    if score >= 6.0 and edge >= 0.04 and (agree_f > 0 or n_sig >= 2):
         return "A"
-    if score >= 5.0 and edge >= 0.03:
+    if score >= 4.5 and edge >= 0.025:
         return "B"
-    if score >= 3.5:
+    if score >= 3.0:
         return "C"
-    if score >= 2.0:
+    if score >= 1.5 or edge >= 0.01:
         return "D"
     return "F"
 
@@ -4811,25 +4811,16 @@ def build_play_of_the_day(
                 tot_side = "Over" if p_over >= p_under else "Under"
                 tot_prob = max(p_over, p_under)
                 ats_edge, tot_edge = ats_prob - 0.5, tot_prob - 0.5
-                # Stricter gates: fewer, higher-quality leans
-                SPREAD_MIN, TOTAL_MIN = 0.035, 0.025
-                MIN_SIGNALS_FOR_LEAN = 2
+                # Always pick a side. Confidence grade filters actionability.
+                # Soft floors only block near coin-flips from becoming "strong" context.
+                SPREAD_SOFT, TOTAL_SOFT = 0.008, 0.008   # ~50.8% — still assign side
+                SPREAD_STRONG, TOTAL_STRONG = 0.035, 0.025  # used only for score boost
 
-                spread_ok = (
-                    ats_edge >= SPREAD_MIN
-                    and (len(signals) >= MIN_SIGNALS_FOR_LEAN or agree > 0)
-                )
-                total_ok = (
-                    tot_edge >= TOTAL_MIN
-                    and (len(signals) >= MIN_SIGNALS_FOR_LEAN or totals_agree >= 0.6)
-                )
-
-                if spread_ok and (not total_ok or ats_edge >= tot_edge):
-                    rec, side_prob = ats_side, ats_prob
-                elif total_ok:
+                # Default: always ATS side (home or away cover)
+                rec, side_prob = ats_side, ats_prob
+                # Prefer totals only when clearly stronger than ATS
+                if tot_edge >= TOTAL_SOFT and tot_edge > ats_edge + 0.01:
                     rec, side_prob = tot_side, tot_prob
-                else:
-                    rec, side_prob = "No strong lean", max(ats_prob, tot_prob)
                 context_bonus = min(3.0, float(rule_score) * 0.18)
                 total_score = (float(side_prob) - 0.5) * 100.0 + context_bonus
                 if agree > 0 and rec in ("Home ATS", "Away ATS"):
@@ -6036,31 +6027,15 @@ with tab2:
                 tot_prob = max(p_over, p_under)
                 tot_edge = tot_prob - 0.5
 
-                # Stricter gates: fewer, higher-quality leans
-                SPREAD_MIN = 0.035
-                TOTAL_MIN = 0.025
-                MIN_SIGNALS_FOR_LEAN = 2
+                # Always assign ATS + totals sides. Confidence (not silence) ranks quality.
+                SPREAD_MIN = 0.008   # soft floor only; near-coinflip still gets a side
+                TOTAL_MIN = 0.008
                 context_bonus = min(3.0, float(rule_score) * 0.18)
 
-                spread_rec = (
-                    ats_side
-                    if (
-                        ats_edge >= SPREAD_MIN
-                        and (len(signals) >= MIN_SIGNALS_FOR_LEAN or agree > 0)
-                    )
-                    else "No strong lean"
-                )
-                total_rec = (
-                    tot_side
-                    if (
-                        tot_edge >= TOTAL_MIN
-                        and (
-                            len(signals) >= MIN_SIGNALS_FOR_LEAN
-                            or totals_agree >= 0.6
-                        )
-                    )
-                    else "No strong lean"
-                )
+                # Always pick the higher-probability ATS side
+                spread_rec = ats_side if ats_edge >= SPREAD_MIN else ats_side
+                # Always pick the higher-probability totals side
+                total_rec = tot_side if tot_edge >= TOTAL_MIN else tot_side
 
                 spread_score = (float(ats_prob) - 0.5) * 100.0 + context_bonus * 0.5
                 if spread_rec == "Home ATS" and power_edge > 5:
@@ -6106,23 +6081,23 @@ with tab2:
                     ats_edge = ats_prob - 0.5
                     tot_prob = max(p_over, p_under)
                     tot_edge = tot_prob - 0.5
-                    if spread_rec != "No strong lean" and ats_edge < SPREAD_MIN:
-                        spread_rec = "No strong lean"
-                    if total_rec != "No strong lean" and tot_edge < TOTAL_MIN:
-                        total_rec = "No strong lean"
+                    # Keep assigned sides after injury adjustments; confidence will reflect strength
+                    # (do not wipe to "No strong lean" solely on soft edge floors)
                 except Exception as _inj_err:
                     skipped.append(f"Injury override {away}@{home}: {_inj_err}")
                     _inj_cap = None
                 # Primary (POTD / legacy columns) = stronger market with a real lean
-                if spread_rec != "No strong lean" and (
-                    total_rec == "No strong lean" or ats_edge >= tot_edge
+                # Primary pick is always ATS; totals only if clearly stronger.
+                # After injury overrides, spread_rec may be wiped — still force a side.
+                if tot_edge > ats_edge + 0.015 and total_rec not in (
+                    "No strong lean", "—", "", "None", "nan"
                 ):
-                    rec, side_prob, total_score = spread_rec, ats_prob, spread_score
-                elif total_rec != "No strong lean":
                     rec, side_prob, total_score = total_rec, tot_prob, total_mkt_score
+                elif spread_rec not in ("No strong lean", "—", "", "None", "nan"):
+                    rec, side_prob, total_score = spread_rec, ats_prob, spread_score
                 else:
-                    rec, side_prob = "No strong lean", max(ats_prob, tot_prob)
-                    total_score = (float(side_prob) - 0.5) * 100.0 + context_bonus * 0.5
+                    # Injury wiped ATS lean — still pick higher-prob side for display
+                    rec, side_prob, total_score = ats_side, ats_prob, spread_score
 
                 signals.append(
                     f"Power edge {power_edge:+.1f} (H {pw.get('home_total', 0):.0f} vs A {pw.get('away_total', 0):.0f})"
