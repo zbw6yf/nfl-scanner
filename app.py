@@ -3484,6 +3484,83 @@ ESPN_TEAM_IDS = {
     "NYJ": 20, "PHI": 21, "PIT": 23, "SF": 25, "SEA": 26, "TB": 27, "TEN": 10, "WAS": 28,
 }
 
+
+def _confidence_track_record() -> pd.DataFrame:
+    """
+    Graded hit rate by confidence letter from signal history.
+    Returns columns: Confidence, Record, Win %, N
+    """
+    try:
+        hist = _load_signal_history()
+    except Exception:
+        return pd.DataFrame()
+    if hist is None or getattr(hist, "empty", True):
+        return pd.DataFrame()
+    if "result" not in hist.columns or "confidence" not in hist.columns:
+        return pd.DataFrame()
+    graded = hist[hist["result"].astype(str).isin(["Correct", "Incorrect"])].copy()
+    if graded.empty:
+        return pd.DataFrame()
+    graded["confidence"] = graded["confidence"].astype(str).str.upper().str[:1]
+    conf_order = ["A", "B", "C", "D", "F"]
+    rows = []
+    for conf in conf_order:
+        sub = graded[graded["confidence"] == conf]
+        if sub.empty:
+            continue
+        wins = int((sub["result"] == "Correct").sum())
+        losses = int((sub["result"] == "Incorrect").sum())
+        total = wins + losses
+        rows.append({
+            "Confidence": conf,
+            "Record": f"{wins}-{losses}",
+            "Win %": f"{(wins / total):.0%}" if total else "—",
+            "N": total,
+        })
+    ow = int((graded["result"] == "Correct").sum())
+    ol = int((graded["result"] == "Incorrect").sum())
+    if ow + ol:
+        rows.append({
+            "Confidence": "ALL",
+            "Record": f"{ow}-{ol}",
+            "Win %": f"{ow / (ow + ol):.0%}",
+            "N": ow + ol,
+        })
+    return pd.DataFrame(rows)
+
+
+def _rank_top_plays(df: pd.DataFrame, n: int = 5, grades: Optional[List[str]] = None) -> pd.DataFrame:
+    """
+    Rank plays by Confidence (A best), then Score.
+    If grades is set (e.g. ["A","B"]), only those letters are kept.
+    Falls back to next grades only when strict filter is empty so the panel
+    is never blank early in the week.
+    """
+    if df is None or getattr(df, "empty", True):
+        return pd.DataFrame()
+    out = df.copy()
+    conf_rank = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
+    out["_letter"] = out["Confidence"].astype(str).str.upper().str[:1]
+    out["_cr"] = out["_letter"].map(lambda x: conf_rank.get(x, 9))
+    try:
+        out["_score_n"] = pd.to_numeric(out.get("Score"), errors="coerce").fillna(0.0)
+    except Exception:
+        out["_score_n"] = 0.0
+
+    preferred = [g.upper() for g in (grades or ["A", "B"])]
+    strict = out[out["_letter"].isin(preferred)]
+    if strict.empty:
+        # Soft fallback: take best available so UI isn't empty
+        ranked = out.sort_values(["_cr", "_score_n"], ascending=[True, False]).head(n)
+        ranked.attrs["fallback"] = True
+        return ranked
+    ranked = strict.sort_values(["_cr", "_score_n"], ascending=[True, False]).head(n)
+    ranked.attrs["fallback"] = False
+    return ranked
+
+
+
+
 def _normalize_team_abbr(t: str) -> str:
     t = str(t or "").strip().upper()
     aliases = {
@@ -4962,8 +5039,11 @@ def _pick_top_play(opportunities: list) -> Optional[Dict]:
     def sort_key(o):
         rec, conf, score = _best_lean_fields(o)
         lean_penalty = 0 if rec.strip() not in no_lean else 1
-        conf_n = conf_rank.get(str(conf).upper()[:1], 9)
-        return (lean_penalty, conf_n, -float(score or 0))
+        letter = str(conf).upper()[:1]
+        conf_n = conf_rank.get(letter, 9)
+        # Prefer A/B strongly for Play of the Day
+        ab_penalty = 0 if letter in ("A", "B") else 1
+        return (lean_penalty, ab_penalty, conf_n, -float(score or 0))
 
     ranked = sorted(opportunities, key=sort_key)
     top = dict(ranked[0])
@@ -6473,8 +6553,50 @@ with tab2:
         ]
         cols = [c for c in cols if c in display_df.columns]
 
+        st.markdown("#### Model track record")
+        st.caption(
+            "Graded results from Signal History (Correct vs Incorrect). "
+            "This is how confidence earns trust over time."
+        )
+        try:
+            _tr = _confidence_track_record()
+            if _tr is not None and not _tr.empty:
+                _c1, _c2 = st.columns([2, 3])
+                with _c1:
+                    st.dataframe(_tr, use_container_width=True, hide_index=True)
+                with _c2:
+                    _ab = _tr[_tr["Confidence"].isin(["A", "B"])]
+                    if not _ab.empty:
+                        _aw = 0
+                        _al = 0
+                        for _, _r in _ab.iterrows():
+                            try:
+                                _w, _l = str(_r["Record"]).split("-")
+                                _aw += int(_w)
+                                _al += int(_l)
+                            except Exception:
+                                pass
+                        if _aw + _al:
+                            st.metric(
+                                "A+B combined",
+                                f"{_aw}-{_al}",
+                                delta=f"{_aw / (_aw + _al):.0%} win rate",
+                            )
+                    st.caption(
+                        "Promote **A/B** only. C/D stay on the full board for transparency."
+                    )
+            else:
+                st.info(
+                    "No graded results yet. As games finish, hit rate by confidence will appear here."
+                )
+        except Exception:
+            pass
+
         st.markdown("#### Top Plays of The Week")
-        st.caption("Top 5 by highest Confidence (A → F), then highest Score.")
+        st.caption(
+            "Up to 5 plays graded **A or B only**, ranked by Confidence then Score. "
+            "If fewer than 5 A/B exist this week, only those are shown (quality over quantity)."
+        )
         if available_weeks:
             cur_wk = current_nfl_week()
             default_lab = week_choices[1] if len(week_choices) > 1 else week_choices[0]
@@ -6491,21 +6613,33 @@ with tab2:
             )
             try:
                 wk = int(selected_label.replace("Week ", ""))
-                _conf_rank = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
                 week_df = df[df["_Week_num"] == wk].copy()
-                week_df["_cr"] = (
-                    week_df["Confidence"].astype(str).str.upper().str[:1]
-                    .map(lambda x: _conf_rank.get(x, 9))
-                )
-                week_df = (
-                    week_df.sort_values(["_cr", "Score"], ascending=[True, False])
-                    .head(5)
-                )
-                st.markdown(f"**{selected_label}** — top {len(week_df)} by Confidence, then Score")
-                st.dataframe(week_df[cols], use_container_width=True, hide_index=True)
+                top_df = _rank_top_plays(week_df, n=5, grades=["A", "B"])
+                used_fallback = bool(getattr(top_df, "attrs", {}).get("fallback"))
+                if top_df is None or top_df.empty:
+                    st.warning(
+                        f"No A/B plays for {selected_label} yet. "
+                        "Check the full board below for C/D leans."
+                    )
+                else:
+                    if used_fallback:
+                        st.caption(
+                            "No A/B this week — showing best available grades so the panel isn’t empty."
+                        )
+                        label_extra = "best available"
+                    else:
+                        label_extra = "A/B only"
+                    st.markdown(
+                        f"**{selected_label}** — {len(top_df)} play(s) ({label_extra}), "
+                        "Confidence → Score"
+                    )
+                    show_cols = [c for c in cols if c in top_df.columns]
+                    st.dataframe(top_df[show_cols], use_container_width=True, hide_index=True)
             except Exception:
-                top5 = df.head(5)
-                st.dataframe(top5[cols], use_container_width=True, hide_index=True)
+                top5 = _rank_top_plays(df, n=5, grades=["A", "B"])
+                if top5 is not None and not top5.empty:
+                    show_cols = [c for c in cols if c in top5.columns]
+                    st.dataframe(top5[show_cols], use_container_width=True, hide_index=True)
         else:
             st.warning(
                 "Could not resolve NFL week numbers from the schedule. "
