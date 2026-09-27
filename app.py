@@ -2618,10 +2618,12 @@ def confidence_grade(
     n_signals: int,
     agree: float,
     side_prob: Optional[float] = None,
+    injury_penalty: float = 0.0,
 ) -> str:
     """
-    Confidence from estimated side probability and model/sim agreement.
-    A = clear probability edge with agreement; F = no lean / near coin-flip.
+    Multi-factor confidence grade.
+    Uses side probability, market edge, signal count, model–MC agreement,
+    and optional injury penalty.  A = strong consensus edge; F = no lean.
     """
     rec_n = str(rec or "").strip()
     if rec_n in ("No strong lean", "—", "-", "", "None", "nan"):
@@ -2629,21 +2631,61 @@ def confidence_grade(
 
     if side_prob is None:
         if rec_n in ("Home ATS", "Away ATS"):
-            side_prob = mc.get("home_cover_prob", 0.5) if rec_n == "Home ATS" else (1.0 - mc.get("home_cover_prob", 0.5))
+            side_prob = (
+                mc.get("home_cover_prob", 0.5)
+                if rec_n == "Home ATS"
+                else (1.0 - mc.get("home_cover_prob", 0.5))
+            )
         else:
-            side_prob = mc.get("over_prob", 0.5) if rec_n == "Over" else mc.get("under_prob", 0.5)
+            side_prob = (
+                mc.get("over_prob", 0.5)
+                if rec_n == "Over"
+                else mc.get("under_prob", 0.5)
+            )
 
     edge = max(0.0, float(side_prob) - 0.5)
-    edge_abs = abs(edge_pct) if edge_pct is not None else 0.0
+    edge_abs = abs(float(edge_pct)) if edge_pct is not None else 0.0
+    n_sig = max(0, int(n_signals or 0))
+    agree_f = float(agree or 0.0)
 
-    # Probability-first bands (tied to how far past 50%)
-    if edge >= 0.10 and agree > 0:
+    # --- scored components ---
+    score = 0.0
+
+    # Probability edge past 50%
+    if edge >= 0.10:
+        score += 4.0
+    elif edge >= 0.07:
+        score += 3.0
+    elif edge >= 0.045:
+        score += 2.0
+    elif edge >= 0.025:
+        score += 1.0
+
+    # Model–MC agreement
+    score += min(2.0, agree_f * 1.25)
+
+    # Supporting rule signals
+    score += min(1.5, n_sig * 0.25)
+
+    # Market edge (model vs implied)
+    if edge_abs >= 4.0:
+        score += 1.5
+    elif edge_abs >= 2.5:
+        score += 1.0
+    elif edge_abs >= 1.5:
+        score += 0.5
+
+    # Injury drag (caller can pass 0–2+)
+    score -= max(0.0, float(injury_penalty or 0.0))
+
+    # Require a real lean and some support for A/B
+    if score >= 6.5 and edge >= 0.045 and (agree_f > 0 or n_sig >= 3):
         return "A"
-    if edge >= 0.07:
+    if score >= 5.0 and edge >= 0.03:
         return "B"
-    if edge >= 0.04:
+    if score >= 3.5:
         return "C"
-    if edge >= 0.015:
+    if score >= 2.0:
         return "D"
     return "F"
 
@@ -4769,9 +4811,19 @@ def build_play_of_the_day(
                 tot_side = "Over" if p_over >= p_under else "Under"
                 tot_prob = max(p_over, p_under)
                 ats_edge, tot_edge = ats_prob - 0.5, tot_prob - 0.5
-                SPREAD_MIN, TOTAL_MIN = 0.015, 0.008
-                spread_ok = ats_edge >= SPREAD_MIN
-                total_ok = tot_edge >= TOTAL_MIN
+                # Stricter gates: fewer, higher-quality leans
+                SPREAD_MIN, TOTAL_MIN = 0.035, 0.025
+                MIN_SIGNALS_FOR_LEAN = 2
+
+                spread_ok = (
+                    ats_edge >= SPREAD_MIN
+                    and (len(signals) >= MIN_SIGNALS_FOR_LEAN or agree > 0)
+                )
+                total_ok = (
+                    tot_edge >= TOTAL_MIN
+                    and (len(signals) >= MIN_SIGNALS_FOR_LEAN or totals_agree >= 0.6)
+                )
+
                 if spread_ok and (not total_ok or ats_edge >= tot_edge):
                     rec, side_prob = ats_side, ats_prob
                 elif total_ok:
@@ -5984,12 +6036,31 @@ with tab2:
                 tot_prob = max(p_over, p_under)
                 tot_edge = tot_prob - 0.5
 
-                SPREAD_MIN = 0.015
-                TOTAL_MIN = 0.008
+                # Stricter gates: fewer, higher-quality leans
+                SPREAD_MIN = 0.035
+                TOTAL_MIN = 0.025
+                MIN_SIGNALS_FOR_LEAN = 2
                 context_bonus = min(3.0, float(rule_score) * 0.18)
 
-                spread_rec = ats_side if ats_edge >= SPREAD_MIN else "No strong lean"
-                total_rec = tot_side if tot_edge >= TOTAL_MIN else "No strong lean"
+                spread_rec = (
+                    ats_side
+                    if (
+                        ats_edge >= SPREAD_MIN
+                        and (len(signals) >= MIN_SIGNALS_FOR_LEAN or agree > 0)
+                    )
+                    else "No strong lean"
+                )
+                total_rec = (
+                    tot_side
+                    if (
+                        tot_edge >= TOTAL_MIN
+                        and (
+                            len(signals) >= MIN_SIGNALS_FOR_LEAN
+                            or totals_agree >= 0.6
+                        )
+                    )
+                    else "No strong lean"
+                )
 
                 spread_score = (float(ats_prob) - 0.5) * 100.0 + context_bonus * 0.5
                 if spread_rec == "Home ATS" and power_edge > 5:
@@ -7733,6 +7804,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
 
 
