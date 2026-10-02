@@ -3559,6 +3559,176 @@ def _rank_top_plays(df: pd.DataFrame, n: int = 5, grades: Optional[List[str]] = 
     return ranked
 
 
+def build_why_this_pick(row) -> str:
+    """
+    One-line explanation of why the model leans a side.
+    Uses fields already on the board row (works for live + locked rows).
+    """
+    try:
+        if hasattr(row, "to_dict"):
+            r = row.to_dict()
+        elif isinstance(row, dict):
+            r = row
+        else:
+            r = dict(row)
+    except Exception:
+        r = {}
+
+    parts = []
+    rec = str(r.get("Recommendation") or r.get("Spread Rec") or "").strip()
+
+    def _pct(val):
+        try:
+            if val is None:
+                return None
+            if isinstance(val, float) and pd.isna(val):
+                return None
+            s = str(val).replace("%", "").strip()
+            if s in ("", "—", "-", "None", "nan"):
+                return None
+            return float(s)
+        except Exception:
+            return None
+
+    ml = _pct(r.get("ML Home %"))
+    mc = _pct(r.get("MC Home %"))
+    if ml is not None and mc is not None:
+        if (ml >= 52 and mc >= 52) or (ml <= 48 and mc <= 48):
+            parts.append("ML + MC agree")
+        elif (ml - 50) * (mc - 50) > 0:
+            parts.append("ML + MC lean same side")
+        else:
+            parts.append("ML / MC split")
+
+    try:
+        epa_raw = r.get("EPA Edge")
+        if epa_raw is not None and str(epa_raw) not in ("", "—", "-", "None", "nan"):
+            epa = float(str(epa_raw).replace("+", ""))
+            if abs(epa) >= 0.04:
+                parts.append(f"EPA edge {epa:+.3f}")
+            elif abs(epa) >= 0.02:
+                parts.append(f"EPA {epa:+.3f}")
+    except Exception:
+        pass
+
+    try:
+        form_raw = r.get("Form Δ")
+        if form_raw is not None and str(form_raw) not in ("", "—", "-", "None", "nan"):
+            form = float(str(form_raw).replace("+", ""))
+            if abs(form) >= 3:
+                parts.append(f"Form Δ {form:+.1f}")
+    except Exception:
+        pass
+
+    try:
+        edge_raw = r.get("Edge %")
+        if edge_raw is not None and str(edge_raw) not in ("", "—", "-", "None", "nan"):
+            edge = float(str(edge_raw).replace("+", "").replace("%", ""))
+            if abs(edge) >= 2.0:
+                parts.append(f"Market edge {edge:+.1f}%")
+    except Exception:
+        pass
+
+    try:
+        open_s = r.get("Open Spread")
+        cur_s = r.get("Curr Spread")
+        if open_s not in (None, "", "—") and cur_s not in (None, "", "—"):
+            o = float(str(open_s).replace("+", ""))
+            c = float(str(cur_s).replace("+", ""))
+            moved = c - o
+            if rec == "Home ATS" and moved <= -0.5:
+                parts.append("line moved toward us")
+            elif rec == "Away ATS" and moved >= 0.5:
+                parts.append("line moved toward us")
+            elif abs(moved) >= 1.0:
+                parts.append(f"line move {moved:+.1f}")
+    except Exception:
+        pass
+
+    inj = str(r.get("Injury") or "")
+    sig = str(r.get("Signals") or "")
+    blob = (inj + " " + sig).lower()
+    if "qb out" in blob or "quarterback out" in blob:
+        parts.append("QB out flagged")
+    elif "qb questionable" in blob or "questionable (qb" in blob:
+        parts.append("QB questionable")
+    elif inj.strip() in ("", "—", "-", "None") and "injury" not in blob:
+        parts.append("no key injury flag")
+    elif inj.strip() and inj.strip() not in ("—", "-"):
+        short = inj.strip()
+        if len(short) > 40:
+            short = short[:37] + "…"
+        parts.append(short)
+
+    try:
+        pw = r.get("Power Edge")
+        if pw is not None and str(pw) not in ("", "—", "-", "None", "nan"):
+            pwf = float(str(pw).replace("+", ""))
+            if abs(pwf) >= 5:
+                parts.append(f"Power {pwf:+.0f}")
+    except Exception:
+        pass
+
+    if str(r.get("Div") or "").strip().lower() in ("yes", "y", "true", "1"):
+        parts.append("divisional")
+
+    if not parts:
+        if sig and sig not in ("—", "-", "None"):
+            bits = [b.strip() for b in sig.replace("•", "|").split("|") if b.strip()]
+            parts = bits[:3]
+        else:
+            parts = ["limited supporting signals"]
+
+    seen = set()
+    uniq = []
+    for p in parts:
+        k = p.lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(p)
+    return " · ".join(uniq[:6])
+
+
+def _style_confidence_frame(df: pd.DataFrame):
+    """A/B green, C neutral, D/F muted; Recommendation column emphasized."""
+    frame = df.copy()
+    conf_cols = [c for c in ("Confidence", "Spread Conf", "Total Conf") if c in frame.columns]
+    rec_cols = [c for c in ("Recommendation", "Spread Rec", "Total Rec") if c in frame.columns]
+
+    def _conf_color(val):
+        letter = str(val or "").strip().upper()[:1]
+        if letter in ("A", "B"):
+            return "background-color: #14532d; color: #bbf7d0; font-weight: 700;"
+        if letter == "C":
+            return "background-color: #1e293b; color: #e2e8f0; font-weight: 600;"
+        if letter in ("D", "F"):
+            return "background-color: #0f172a; color: #64748b; font-weight: 500;"
+        return ""
+
+    def _rec_style(val):
+        s = str(val or "").strip()
+        if s in ("No strong lean", "—", "-", "", "None", "nan"):
+            return "color: #64748b; font-weight: 500;"
+        return "color: #f8fafc; font-weight: 800;"
+
+    styler = frame.style
+    for c in conf_cols:
+        styler = styler.map(_conf_color, subset=[c])
+    for c in rec_cols:
+        styler = styler.map(_rec_style, subset=[c])
+    return styler
+
+
+def _ensure_why_column(frame: pd.DataFrame) -> pd.DataFrame:
+    f = frame.copy()
+    if f.empty:
+        f["Why this pick"] = []
+        return f
+    f["Why this pick"] = f.apply(build_why_this_pick, axis=1)
+    return f
+
+
+
 
 
 def _normalize_team_abbr(t: str) -> str:
@@ -6544,8 +6714,11 @@ with tab2:
         df = _force_conf_align(df)
 
         # Shared column list for Top Plays
+        display_df = _ensure_why_column(display_df)
+        df = _ensure_why_column(df)
+
         cols = [
-            "Week", "Game", "Kickoff", "Recommendation", "Confidence", "Score",
+            "Week", "Game", "Kickoff", "Recommendation", "Confidence", "Why this pick", "Score",
             "Spread Rec", "Spread Conf", "Spread Score",
             "Total Rec", "Total Conf", "Total Score",
             "Spread", "Total", "P Home Cover", "P Away Cover", "P Over", "P Under",
@@ -6633,37 +6806,90 @@ with tab2:
                         f"**{selected_label}** — {len(top_df)} play(s) ({label_extra}), "
                         "Confidence → Score"
                     )
+                    top_df = _ensure_why_column(top_df)
                     show_cols = [c for c in cols if c in top_df.columns]
-                    st.dataframe(top_df[show_cols], use_container_width=True, hide_index=True)
+                    try:
+                        st.dataframe(
+                            _style_confidence_frame(top_df[show_cols]),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    except Exception:
+                        st.dataframe(top_df[show_cols], use_container_width=True, hide_index=True)
+                    for _i, (_idx, _row) in enumerate(top_df.iterrows()):
+                        _game = str(_row.get("Game") or f"Play {_i+1}")
+                        _rec = str(_row.get("Recommendation") or "—")
+                        _conf = str(_row.get("Confidence") or "F")
+                        _why = str(_row.get("Why this pick") or build_why_this_pick(_row))
+                        _sig = str(_row.get("Signals") or "—")
+                        with st.expander(
+                            f"{_conf} · {_rec} · {_game}",
+                            expanded=(_i == 0 and str(_conf).upper()[:1] in ("A", "B")),
+                        ):
+                            st.markdown(f"**Why this pick:** {_why}")
+                            if _sig and _sig not in ("—", "-"):
+                                st.caption(f"Signals: {_sig}")
             except Exception:
                 top5 = _rank_top_plays(df, n=5, grades=["A", "B"])
                 if top5 is not None and not top5.empty:
+                    top5 = _ensure_why_column(top5)
                     show_cols = [c for c in cols if c in top5.columns]
-                    st.dataframe(top5[show_cols], use_container_width=True, hide_index=True)
+                    try:
+                        st.dataframe(
+                            _style_confidence_frame(top5[show_cols]),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    except Exception:
+                        st.dataframe(top5[show_cols], use_container_width=True, hide_index=True)
         else:
             st.warning(
                 "Could not resolve NFL week numbers from the schedule. "
                 "Showing overall Top 5 instead."
             )
-            top5 = df.head(5)
-            st.dataframe(top5[cols], use_container_width=True, hide_index=True)
+            top5 = _ensure_why_column(df.head(5))
+            try:
+                st.dataframe(
+                    _style_confidence_frame(top5[cols]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            except Exception:
+                st.dataframe(top5[cols], use_container_width=True, hide_index=True)
 
         st.markdown("#### Spread recommendations")
         st.caption("Every game: estimated cover probabilities and ATS lean (Home/Away ATS).")
         spread_cols = [
-            "Week", "Game", "Kickoff", "Spread Rec", "Spread Conf", "Spread Score",
+            "Week", "Game", "Kickoff", "Spread Rec", "Spread Conf", "Why this pick", "Spread Score",
             "Spread", "P Home Cover", "P Away Cover", "Power Edge", "Home Power", "Away Power",
             "Model %", "Market %", "Edge %", "EPA Edge", "Form Δ", "TZ Diff", "Injury", "Signals",
         ]
-        spread_cols = [c for c in spread_cols if c in display_df.columns]
-        spread_view = display_df.copy()
+        spread_view = _ensure_why_column(display_df.copy())
+        try:
+            def _why_spread(row):
+                r = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+                if str(r.get("Spread Rec") or "") not in ("No strong lean", "—", "", "None"):
+                    r = dict(r)
+                    r["Recommendation"] = r.get("Spread Rec")
+                return build_why_this_pick(r)
+            spread_view["Why this pick"] = spread_view.apply(_why_spread, axis=1)
+        except Exception:
+            pass
+        spread_cols = [c for c in spread_cols if c in spread_view.columns]
         if "Spread Score" in spread_view.columns:
             try:
                 spread_view["_ss"] = pd.to_numeric(spread_view["Spread Score"], errors="coerce")
                 spread_view = spread_view.sort_values("_ss", ascending=False)
             except Exception:
                 pass
-        st.dataframe(spread_view[spread_cols], use_container_width=True, hide_index=True)
+        try:
+            st.dataframe(
+                _style_confidence_frame(spread_view[spread_cols]),
+                use_container_width=True,
+                hide_index=True,
+            )
+        except Exception:
+            st.dataframe(spread_view[spread_cols], use_container_width=True, hide_index=True)
 
         st.markdown("#### Total recommendations")
         st.caption("Every game: estimated over/under probabilities and total lean.")
@@ -6679,7 +6905,14 @@ with tab2:
                 total_view = total_view.sort_values("_ts", ascending=False)
             except Exception:
                 pass
-        st.dataframe(total_view[total_cols], use_container_width=True, hide_index=True)
+        try:
+            st.dataframe(
+                _style_confidence_frame(total_view[total_cols]),
+                use_container_width=True,
+                hide_index=True,
+            )
+        except Exception:
+            st.dataframe(total_view[total_cols], use_container_width=True, hide_index=True)
 
         st.markdown("#### Top Signal Summary")
         st.caption(
