@@ -3731,6 +3731,123 @@ def _ensure_why_column(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 
+def _build_week_snapshot_payload(opps, snap_week: int):
+    """Return (rows A/B sorted, share_text, n_a, n_b) for Week Snapshot card."""
+    conf_rank = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
+    rows = []
+    for o in opps or []:
+        try:
+            w = int(float(str(o.get("Week") or 0).replace("Week", "").strip() or 0))
+        except Exception:
+            continue
+        if w != int(snap_week):
+            continue
+        conf = str(o.get("Confidence") or "F").strip().upper()[:1]
+        if conf not in ("A", "B"):
+            continue
+        try:
+            score = float(o.get("Score") or 0)
+        except Exception:
+            score = 0.0
+        why = str(o.get("Why this pick") or "")
+        if not why or why in ("—", "-", "None"):
+            try:
+                why = build_why_this_pick(o)
+            except Exception:
+                why = ""
+        rows.append({
+            "conf": conf,
+            "score": score,
+            "rec": str(o.get("Recommendation") or "—"),
+            "game": str(o.get("Game") or "—"),
+            "kickoff": str(o.get("Kickoff") or ""),
+            "spread": str(o.get("Spread") or o.get("_spread") or "—"),
+            "total": str(o.get("Total") or o.get("_total") or "—"),
+            "why": why,
+            "signals": str(o.get("Signals") or "—"),
+            "edge": str(o.get("Edge %") or "—"),
+        })
+    rows.sort(key=lambda r: (conf_rank.get(r["conf"], 9), -r["score"]))
+    n_a = sum(1 for r in rows if r["conf"] == "A")
+    n_b = sum(1 for r in rows if r["conf"] == "B")
+    lines = [
+        f"TAIL ME Sports — Week {snap_week} Snapshot",
+        f"{len(rows)} A/B play(s): {n_a} A · {n_b} B",
+        "",
+    ]
+    if rows:
+        for r in rows[:8]:
+            line_bit = r["spread"] if r["rec"] in ("Home ATS", "Away ATS") else r["total"]
+            lines.append(
+                f"• [{r['conf']}] {r['rec']} — {r['game']} (line {line_bit}, score {r['score']:.1f})"
+            )
+            if r["why"] and r["why"] not in ("—", "-"):
+                lines.append(f"    Why: {r['why'][:140]}")
+    else:
+        lines.append("• No A/B plays locked in for this week yet.")
+    lines.extend(["", "Research only — not betting advice."])
+    return rows, "\n".join(lines), n_a, n_b
+
+
+def _week_snapshot_card_html(snap_week: int, rows, n_a: int, n_b: int) -> str:
+    """HTML share card for Advanced → Week Snapshot."""
+    n_ab = len(rows)
+    play_blocks = []
+    for r in rows[:8]:
+        border = "#22c55e" if r["conf"] == "A" else "#86efac"
+        conf_c = "#bbf7d0" if r["conf"] == "A" else "#86efac"
+        line_bit = r["spread"] if r["rec"] in ("Home ATS", "Away ATS") else r["total"]
+        edge = r.get("edge") or "—"
+        edge_bit = f" · Edge {edge}" if edge not in ("—", "", "None") else ""
+        why = r.get("why") or ""
+        if why and why not in ("—", "-"):
+            why_html = (
+                f'<div style="color:#94a3b8;font-size:0.82rem;margin-top:0.2rem;">'
+                f"{why[:120]}</div>"
+            )
+        else:
+            why_html = ""
+        play_blocks.append(
+            f'<div style="border-left:3px solid {border};padding:0.55rem 0.75rem;'
+            f'margin:0.45rem 0;background:rgba(15,23,42,0.65);border-radius:0 8px 8px 0;">'
+            f'<div style="font-weight:800;color:#f8fafc;">'
+            f'<span style="color:{conf_c};">{r["conf"]}</span> · {r["rec"]} · {r["game"]}'
+            f"</div>"
+            f'<div style="color:#cbd5e1;font-size:0.88rem;margin-top:0.15rem;">'
+            f"Line {line_bit} · Score {r['score']:.1f}{edge_bit}</div>"
+            f"{why_html}</div>"
+        )
+    if not play_blocks:
+        plays_html = (
+            '<div style="color:#94a3b8;padding:0.75rem 0;">No <strong>A/B</strong> plays '
+            "for this week yet. Refresh the Big Board or check lower-confidence leans there.</div>"
+        )
+    else:
+        plays_html = "".join(play_blocks)
+    return (
+        '<div style="max-width:560px;border-radius:16px;border:1px solid rgba(56,189,248,0.35);'
+        "background:linear-gradient(160deg,#0b1220 0%,#0f172a 55%,#052e16 140%);"
+        'padding:1.15rem 1.25rem;box-shadow:0 12px 40px rgba(0,0,0,0.45);'
+        'font-family:system-ui,-apple-system,sans-serif;">'
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:0.75rem;">'
+        "<div>"
+        '<div style="color:#38bdf8;font-size:0.72rem;font-weight:700;letter-spacing:0.14em;'
+        'text-transform:uppercase;">TAIL ME Sports</div>'
+        f'<div style="color:#f8fafc;font-size:1.35rem;font-weight:800;margin-top:0.2rem;">'
+        f"Week {snap_week} Snapshot</div></div>"
+        '<div style="text-align:right;">'
+        f'<div style="color:#bbf7d0;font-size:1.6rem;font-weight:800;line-height:1;">{n_ab}</div>'
+        '<div style="color:#86efac;font-size:0.75rem;font-weight:600;">A/B plays</div></div></div>'
+        f'<div style="color:#94a3b8;font-size:0.85rem;margin:0.55rem 0 0.75rem 0;">'
+        f"{n_a} A · {n_b} B · ranked by confidence then score</div>"
+        f"{plays_html}"
+        '<div style="margin-top:0.85rem;padding-top:0.65rem;border-top:1px solid rgba(148,163,184,0.25);'
+        'color:#64748b;font-size:0.72rem;">Research only — not betting advice · tailme</div></div>'
+    )
+
+
+
+
 def _normalize_team_abbr(t: str) -> str:
     t = str(t or "").strip().upper()
     aliases = {
@@ -7708,15 +7825,84 @@ Over/under probabilities are taken from simulated totals vs the market line (wit
 
 with tab9:
     st.subheader("Advanced")
-    st.caption("Less frequently used tools — props, bankroll tracking, and historical backtests.")
+    st.caption("Week snapshot, props, bankroll tracking, signal history, and historical backtests.")
     adv = st.radio(
         "Section",
-        options=["Signal History", "Bankroll & CLV", "Backtest", "Player Props"],
+        options=["Week Snapshot", "Signal History", "Bankroll & CLV", "Backtest", "Player Props"],
         horizontal=True,
         key="advanced_section",
     )
     st.markdown("---")
-    if adv == "Player Props":
+
+    if adv == "Week Snapshot":
+        st.markdown("##### Week Snapshot / Share Card")
+        st.caption(
+            "Shareable summary of this week’s **A/B** plays — copy for Discord, X, email, or group chats. "
+            "Research only, not betting advice."
+        )
+        opps = st.session_state.get("bb_opportunities") or []
+        if not opps:
+            st.info(
+                "No Big Board data yet. Open the **Big Board** tab, click **Refresh board**, "
+                "then return here to build a snapshot."
+            )
+        else:
+            week_nums = []
+            for o in opps:
+                try:
+                    w = o.get("Week")
+                    if w is not None and str(w).strip() not in ("", "—", "None"):
+                        week_nums.append(int(float(str(w).replace("Week", "").strip())))
+                except Exception:
+                    pass
+            week_nums = sorted(set(week_nums))
+            cur = current_nfl_week()
+            default_idx = 0
+            if week_nums:
+                if cur is not None and int(cur) in week_nums:
+                    default_idx = week_nums.index(int(cur))
+                else:
+                    default_idx = len(week_nums) - 1
+                snap_week = st.selectbox(
+                    "Week",
+                    options=week_nums,
+                    index=default_idx,
+                    format_func=lambda w: f"Week {w}",
+                    key="snapshot_week_select",
+                )
+            else:
+                snap_week = int(cur or 1)
+                st.caption(f"Using week {snap_week}")
+
+            rows, share_text, n_a, n_b = _build_week_snapshot_payload(opps, int(snap_week))
+            st.markdown(
+                _week_snapshot_card_html(int(snap_week), rows, n_a, n_b),
+                unsafe_allow_html=True,
+            )
+            st.markdown("##### Copy / share text")
+            st.text_area(
+                "Share text",
+                value=share_text,
+                height=min(280, 90 + 30 * max(1, len(rows))),
+                key="week_snapshot_share_text",
+                label_visibility="collapsed",
+            )
+            st.download_button(
+                label="Download snapshot (.txt)",
+                data=share_text.encode("utf-8"),
+                file_name=f"tailme_week_{int(snap_week)}_snapshot.txt",
+                mime="text/plain",
+                key="week_snapshot_download",
+            )
+            st.caption(
+                "Tip: screenshot the card for Stories/Instagram, or paste the text into Discord / X / chats."
+            )
+            m1, m2, m3 = st.columns(3)
+            m1.metric("A plays", n_a)
+            m2.metric("B plays", n_b)
+            m3.metric("Total A/B", n_a + n_b)
+
+    elif adv == "Player Props":
         st.markdown("##### Player Props")
         if require_pro("require_pro_for_props"):
             render_upgrade_cta("Player Props is a Pro feature.")
